@@ -64,11 +64,16 @@ def test_events_registered() -> None:
         if meta is not None:
             registered[meta.id] = meta
 
-    assert set(registered) == {"startup", "shutdown", "status", "dump_events"}, sorted(registered)
+    assert set(registered) == {
+        "startup", "shutdown", "config_change", "status", "dump_events", "watch",
+    }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"
     assert registered["shutdown"].event_type == "lifecycle"
+    assert registered["config_change"].event_type == "lifecycle"
     assert registered["status"].event_type == "plugin_entry"
     assert registered["dump_events"].event_type == "plugin_entry"
+    # 常驻观测轮询必须是 timer，不能是 entry——entry 只在被调用时跑
+    assert registered["watch"].event_type == "timer"
 
 
 def test_source_constant_is_plugin_id() -> None:

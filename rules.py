@@ -132,7 +132,10 @@ def evaluate_delete(command: str, *, agent: str = "", session: str = "",
         agent=agent,
         session=session,
         ts=ts,
-        coalesce_key=f"{RULE_DELETE}|{session}|{agent}",
+        # 合并粒度按规则区分：删除类每次都是独立的危险动作，只合并"同一条命令重复出现"，
+        # 不能按会话合并——那会让用户在一分钟内漏掉好几次不同的删除。
+        # 实测依据：真实转录里一分钟内有 4 条不同 rm，按会话合并只会播 1 条。
+        coalesce_key=f"{RULE_DELETE}|{session}|{agent}|{matched}|{_fingerprint(command)}",
     )
 
 
@@ -184,7 +187,9 @@ def evaluate_failure(*, status_code: Any = None, error_message: str = "",
         agent=agent,
         session=session,
         ts=ts,
-        coalesce_key=f"{RULE_FAILURE}|{session}|{agent}",
+        # 失败类按 会话+状态码 合并：网关每个请求都记一行，同一会话连续 503
+        # 不合并就会刷屏。这与删除类刻意不同。
+        coalesce_key=f"{RULE_FAILURE}|{session}|{agent}|{matched}",
     )
 
 
@@ -200,8 +205,15 @@ def evaluate_transcript_error(event: UnifiedEvent) -> RuleHit | None:
         agent=event.agent,
         session=event.session,
         ts=event.ts,
-        coalesce_key=f"{RULE_FAILURE}|{event.session}|{event.agent}",
+        coalesce_key=f"{RULE_FAILURE}|{event.session}|{event.agent}|transcript-error",
     )
+
+
+def _fingerprint(text: str) -> str:
+    """命令的短指纹，用于"同一条命令重复出现才合并"。"""
+    import hashlib
+
+    return hashlib.sha1(" ".join(str(text).split()).encode("utf-8")).hexdigest()[:12]
 
 
 def _clip(text: str, limit: int = 80) -> str:

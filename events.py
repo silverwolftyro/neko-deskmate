@@ -51,6 +51,11 @@ class UnifiedEvent(BaseModel):
     sidechain: bool = Field(default=False, description="是否来自子代理（isSidechain）")
     # source_type —— 出问题时能回溯到是哪种记录产生的，否则只能瞎猜
     source_type: str = Field(default="", description="产生该事件的源记录 type")
+    # command —— summary 被截到 80 字，删除类规则需要完整命令才不漏判；
+    #            只对 Bash 的 tool_use 填充，且不进出日志（红线：不记录会话文本）
+    command: str | None = Field(default=None, description="Bash 工具调用的完整命令，仅 tool_use 有")
+    # status_code —— 失败类规则要按状态码定严重度，不能从 summary 文本反解析
+    status_code: int | None = Field(default=None, description="网关请求的 HTTP 状态码")
 
 
 # ── 时间 ───────────────────────────────────────────────────────────────────
@@ -98,6 +103,14 @@ def _tool_summary(tool_name: str, tool_input: Any) -> str:
         if isinstance(value, str) and value.strip():
             return f"{tool_name}: {_clip(value)}"
     return tool_name
+
+
+def _full_command(tool_name: str, tool_input: Any) -> str | None:
+    """取出未经截断的完整命令。只有 Bash 有；其他工具返回 None。"""
+    if tool_name != "Bash" or not isinstance(tool_input, dict):
+        return None
+    command = tool_input.get("command")
+    return command if isinstance(command, str) and command.strip() else None
 
 
 # ── Claude Code 转录解析 ───────────────────────────────────────────────────
@@ -158,6 +171,8 @@ def parse_transcript_line(line: str) -> list[UnifiedEvent]:
                 event=EVENT_TOOL_USE,
                 tool=name or None,
                 summary=_tool_summary(name, block.get("input")),
+                # 完整命令单独放一份：summary 截断后规则会漏判长命令里的 rm
+                command=_full_command(name, block.get("input")),
                 **common,
             ))
 
@@ -217,6 +232,7 @@ def parse_gateway_row(row: dict[str, Any]) -> UnifiedEvent | None:
         ts=to_iso_utc(row.get("created_at")),
         sidechain=False,
         source_type="proxy_request_logs",
+        status_code=status,
     )
 
 

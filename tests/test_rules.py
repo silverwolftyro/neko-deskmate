@@ -92,7 +92,9 @@ def test_evaluate_delete_returns_hit() -> None:
     assert hit.rule == RULE_DELETE
     assert hit.severity == SEVERITY_CRITICAL
     assert hit.matched == "rm"
-    assert hit.coalesce_key == "delete|s1|claude-code"
+    # 合并键里带命令指纹：同一条命令重复出现才合并，不同命令必须各自播
+    assert hit.coalesce_key.startswith("delete|s1|claude-code|rm|")
+    assert len(hit.coalesce_key.rsplit("|", 1)[-1]) == 12
     assert "build/" in hit.summary
 
 
@@ -165,19 +167,39 @@ def test_transcript_non_error_yields_nothing() -> None:
 def test_coalescer_suppresses_within_window() -> None:
     coalescer = Coalescer(window_seconds=60.0)
     first = evaluate_delete("rm -rf a", session="s1")
-    second = evaluate_delete("rm -rf b", session="s1")
+    same_again = evaluate_delete("rm -rf a", session="s1")
     assert coalescer.offer(first, now=1000.0) is first
-    assert coalescer.offer(second, now=1010.0) is None   # 窗口内，合并
-    assert coalescer.offer(second, now=1061.0) is second  # 出窗，放行
+    assert coalescer.offer(same_again, now=1010.0) is None   # 同一条命令，窗口内合并
+    assert coalescer.offer(same_again, now=1061.0) is same_again  # 出窗，放行
+
+
+def test_distinct_deletions_are_not_swallowed() -> None:
+    """同一会话里不同的删除必须各自播——按会话合并会让用户一分钟内漏掉多次删除。"""
+    coalescer = Coalescer(window_seconds=60.0)
+    a = evaluate_delete("rm -rf a", session="s1")
+    b = evaluate_delete("rm -rf b", session="s1")
+    assert coalescer.offer(a, now=1000.0) is a
+    assert coalescer.offer(b, now=1001.0) is b
 
 
 def test_coalescer_keys_by_session() -> None:
     """不同会话的同类事件不该互相吞掉。"""
     coalescer = Coalescer(window_seconds=60.0)
     a = evaluate_delete("rm -rf a", session="s1")
-    b = evaluate_delete("rm -rf b", session="s2")
+    b = evaluate_delete("rm -rf a", session="s2")
     assert coalescer.offer(a, now=1000.0) is a
     assert coalescer.offer(b, now=1001.0) is b
+
+
+def test_failure_coalesces_by_session_and_status() -> None:
+    """失败类按 会话+状态码 合并：网关每请求都记一行，不合并会刷屏。"""
+    coalescer = Coalescer(window_seconds=60.0)
+    first = evaluate_failure(status_code=503, error_message="overloaded", session="s1")
+    second = evaluate_failure(status_code=503, error_message="overloaded again", session="s1")
+    other_status = evaluate_failure(status_code=500, error_message="boom", session="s1")
+    assert coalescer.offer(first, now=1000.0) is first
+    assert coalescer.offer(second, now=1001.0) is None      # 同会话同状态，合并
+    assert coalescer.offer(other_status, now=1002.0) is other_status  # 状态不同，放行
 
 
 def test_evaluate_event_rules_for_error_only() -> None:

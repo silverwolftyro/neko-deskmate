@@ -20,6 +20,7 @@ L0 规则层 → SDK 播报 → 审批中继 → 零 key 行为。
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -32,18 +33,31 @@ from plugin.sdk.plugin import (
     lifecycle,
     neko_plugin,
     plugin_entry,
+    timer_interval,
     tr,
 )
 
+from .adapters import ClaudeCodeAdapter, GatewayAdapter
+from .broadcast import Broadcaster
 from .events import UnifiedEvent
+from .rules import (
+    Coalescer,
+    RuleHit,
+    evaluate_delete,
+    evaluate_failure,
+    evaluate_transcript_error,
+)
 
 # 聊天里显示的来源标签。红线 1：source 必须显式传，不能用默认空串。
 SOURCE = "agent_deskmate"
 
-STAGE = "M0-lite-2"
+STAGE = "M0-lite-4"
 
 # dump_events 读转录时往回扫的字节数。转录单文件可到数 MB，全量倒进来没意义。
 TRANSCRIPT_TAIL_BYTES = 65536
+
+# 单轮最多播几条，防止适配器积压后一次刷屏。
+MAX_BROADCAST_PER_TICK = 5
 
 
 class StatusReply(BaseModel):
@@ -73,6 +87,15 @@ def _expand(path_value: object) -> Path:
     return Path(os.path.expanduser(os.path.expandvars(text)))
 
 
+def _to_number(value: object, default: float) -> float:
+    """配置里的数值容错转换；坏值退回默认，不让观测循环崩。"""
+    try:
+        result = float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return result if result == result else default
+
+
 @neko_plugin
 class AgentDeskmatePlugin(NekoPluginBase):
 
@@ -81,6 +104,10 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self.file_logger = self.enable_file_logging(log_level="INFO")
         self.logger = self.file_logger
         self._started_at: float | None = None
+        self._watch_paths: dict[str, str] | None = None
+        self._transcript_adapter: ClaudeCodeAdapter | None = None
+        self._gateway_adapter: GatewayAdapter | None = None
+        self._broadcaster: Broadcaster | None = None
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     # startup 用 async def、shutdown 用 def，刻意对齐官方 memo_reminder 的写法：
@@ -110,6 +137,16 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._started_at = None
         return Ok({"status": "shutdown"})
 
+    @lifecycle(id="config_change")
+    def on_config_change(self, **_):
+        """配置改了就让下一轮重新读路径与合并窗口，不等重启。"""
+        self._watch_paths = None
+        self._transcript_adapter = None
+        self._gateway_adapter = None
+        self._broadcaster = None
+        self.logger.info("配置已变更，观测适配器将在下一轮重建")
+        return Ok({"status": "reloaded"})
+
     # ── 配置 ───────────────────────────────────────────────────────────────
 
     async def _watch_config(self) -> dict[str, str]:
@@ -126,6 +163,109 @@ class AgentDeskmatePlugin(NekoPluginBase):
             return {}
         section = watch.get("watch", {})
         return section if isinstance(section, dict) else {}
+
+    # ── 观测轮询（M0-lite-4 的常驻部分） ──────────────────────────────────
+
+    def _ensure_watchers(self, section: dict[str, str]) -> Broadcaster | None:
+        """按当前配置建好适配器与播报器。配置没给路径就返回 None（不猜默认值）。"""
+        if self._broadcaster is not None:
+            return self._broadcaster
+
+        projects_dir = _expand(section.get("claude_projects_dir"))
+        db_path = _expand(section.get("cc_switch_db"))
+        if not projects_dir.is_dir() and not db_path.is_file():
+            self.logger.warning(
+                "两个观测源都不可用（transcript={} gateway={}），本轮跳过",
+                projects_dir or "未配置", db_path or "未配置",
+            )
+            return None
+
+        coalesce_seconds = _to_number(section.get("coalesce_seconds"), 60.0)
+        self._transcript_adapter = ClaudeCodeAdapter(projects_dir) if projects_dir.is_dir() else None
+        self._gateway_adapter = GatewayAdapter(db_path) if db_path.is_file() else None
+        self._broadcaster = Broadcaster(
+            self.push_message, self.logger, source=SOURCE,
+            coalescer=Coalescer(window_seconds=coalesce_seconds),
+        )
+        self.logger.info(
+            "观测适配器就绪 transcript={} gateway={} 合并窗口={}s",
+            projects_dir, db_path, coalesce_seconds,
+        )
+        return self._broadcaster
+
+    def _poll_once(self, section: dict[str, str]) -> list[str]:
+        """扫一轮观测源 → 跑规则 → 播报。同步函数，由 timer 丢进线程执行。
+
+        返回本轮播报结果列表，便于测试与入口观察。
+        """
+        broadcaster = self._ensure_watchers(section)
+        if broadcaster is None:
+            return []
+
+        events: list[UnifiedEvent] = []
+        if self._transcript_adapter is not None:
+            events.extend(self._transcript_adapter.poll())
+        if self._gateway_adapter is not None:
+            events.extend(self._gateway_adapter.poll())
+
+        outcomes: list[str] = []
+        for event in events:
+            for hit in self._hits_for(event):
+                outcomes.append(broadcaster.broadcast(hit))
+                if len(outcomes) >= MAX_BROADCAST_PER_TICK:
+                    self.logger.info("本轮播报已达上限 {} 条，余下留待下一轮",
+                                     MAX_BROADCAST_PER_TICK)
+                    return outcomes
+        return outcomes
+
+    @staticmethod
+    def _hits_for(event: UnifiedEvent) -> list[RuleHit]:
+        """一个事件跑当前阶段所有规则。
+
+        删除类用完整命令判（summary 被截断，会漏掉长命令里的 rm）；
+        失败类按真实状态码定严重度，不从 summary 文本反解析。
+        """
+        hits: list[RuleHit] = []
+
+        if event.event == "tool_use" and event.command:
+            hit = evaluate_delete(
+                event.command,
+                agent=event.agent, session=event.session, ts=event.ts,
+            )
+            if hit is not None:
+                hits.append(hit)
+
+        elif event.event == "error":
+            if event.source_type == "proxy_request_logs":
+                hit = evaluate_failure(
+                    status_code=event.status_code,
+                    error_message=event.summary,
+                    agent=event.agent, session=event.session, ts=event.ts,
+                )
+            else:
+                hit = evaluate_transcript_error(event)
+            if hit is not None:
+                hits.append(hit)
+
+        return hits
+
+    @timer_interval(id="watch", seconds=3)
+    async def watch_tick(self, **_):
+        """每 3 秒扫一次观测源。
+
+        ``seconds`` 必须是整数字面量，不能写 ``seconds=WATCH_SECONDS``——
+        ``neko-plugin check`` 对装饰器做 AST 静态分析（``_decorator_keyword_literal``），
+        只认字面量，写常量名会直接报 error。所以这里写死 3，
+        要改间隔就改这一行，别抽常量。
+
+        handler 必须 async def（同步的每次 tick 都会报错，见 runtime-model.md）。
+        阻塞的 I/O 丢进线程；push_message 是普通调用，任何线程都能用。
+        """
+        try:
+            section = await self._watch_config()
+            await asyncio.to_thread(self._poll_once, section)
+        except Exception as exc:  # noqa: BLE001  一轮失败不能杀死 timer
+            self.logger.warning("观测轮询异常（{}）：{}", type(exc).__name__, exc)
 
     # ── 入口 ───────────────────────────────────────────────────────────────
 
