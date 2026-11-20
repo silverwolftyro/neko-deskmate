@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "N.E.K.O: check agent_deskmate",
+      "type": "shell",
+      "command": "uv run neko-plugin check agent_deskmate",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: sync agent_deskmate",
+      "type": "shell",
+      "command": "uv run neko-plugin sync agent_deskmate --clean",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: check -r agent_deskmate",
+      "type": "shell",
+      "command": "uv run neko-plugin check -r agent_deskmate",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: build agent_deskmate",
+      "type": "shell",
+      "command": "uv run neko-plugin build agent_deskmate",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

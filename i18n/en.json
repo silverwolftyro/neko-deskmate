@@ -1,0 +1,10 @@
+{
+  "plugin.name": "Neko Deskmate",
+  "plugin.description": "Watches your local coding agents: broadcasts and explains when approval, completion, failure or a stall happens, and lets you approve or reject inside N.E.K.O.",
+
+  "entry.status.name": "Plugin Status",
+  "entry.status.description": "Returns the plugin's own runtime state: whether it is running, for how long, which M0-lite stage it is at, and whether the observation adapters are ready. Used to confirm the plugin really loaded; observes no agent.",
+
+  "entry.dump_events.name": "Dump Recent Events",
+  "entry.dump_events.description": "Reads the observation sources once and returns the most recent N unified events, to confirm the parsing is correct."
+}

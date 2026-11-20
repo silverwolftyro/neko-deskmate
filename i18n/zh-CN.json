@@ -1,0 +1,10 @@
+{
+  "plugin.name": "同桌猫",
+  "plugin.description": "替你看着本机的编码 Agent：需要审批、完成、出错、卡住时播报与解释，并在 N.E.K.O 里完成同意/拒绝。",
+
+  "entry.status.name": "插件状态",
+  "entry.status.description": "返回同桌猫自身的运行状态：是否在跑、跑了多久、处于哪个 M0-lite 阶段、观测适配器是否就绪。用于确认插件真的加载成功了，不观测任何 Agent。",
+
+  "entry.dump_events.name": "导出最近事件",
+  "entry.dump_events.description": "读一次观测源，返回最近 N 条统一事件，用于确认解析是否正确。"
+}

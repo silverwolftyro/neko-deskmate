@@ -1,0 +1,28 @@
+# 同桌猫（agent_deskmate）出厂默认配置
+#
+# 宿主会把这些默认值写进用户配置副本（<用户数据>/plugins/agent_deskmate/config/），
+# 用户在插件管理器里改的是那份副本，不是这个文件。所以这里只放"出厂默认值"。
+#
+# 约定：每个键都必须被代码真正读取，并且有一个"改了它行为就变"的测试。
+# 不要制造清单里声明、代码里零命中 的死配置键。
+
+[plugin_runtime]
+enabled = true
+# 手动启动：首次安装不自动跑，等用户在插件管理器里单独批准（决策 D2）。
+auto_start = false
+
+[agent_deskmate]
+# L0 规则层：同一事件在该秒数内合并成一条播报（防刷屏）。
+coalesce_seconds = 60
+
+# 停滞判定：同一会话超过该分钟数没有新事件且未结束，报一次。
+stall_minutes = 10
+
+# ── 观测源路径 ────────────────────────────────────────────────────────────
+# 代码里不写死绝对路径（AGENTS.md 硬约束 6），只 expanduser / expandvars。
+# 改了这两项就改变插件看哪里；换机器或换 Agent 安装位置时只动这里。
+[agent_deskmate.watch]
+# Claude Code 转录目录（**/*.jsonl，一行一条记录）
+claude_projects_dir = "~/.claude/projects"
+# cc-switch 网关账本（SQLite，proxy_request_logs 表，只读打开）
+cc_switch_db = "~/.cc-switch/cc-switch.db"
