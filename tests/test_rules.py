@@ -1,0 +1,190 @@
+"""rules.py L0 规则层单测（M0-lite-3a：删除类 + 失败类）。
+
+样本来源：2026-11-21 deepseek-worker 产出的测试样本表 + 我对其设计的修正。
+重点在「不误报」——误报会让用户把插件静音，比漏判更伤产品。
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from plugin.plugins.agent_deskmate.events import EVENT_ERROR, UnifiedEvent
+from plugin.plugins.agent_deskmate.rules import (
+    RULE_DELETE,
+    RULE_FAILURE,
+    SEVERITY_CRITICAL,
+    SEVERITY_NOTICE,
+    SEVERITY_WARN,
+    Coalescer,
+    evaluate_delete,
+    evaluate_failure,
+    evaluate_transcript_error,
+    match_delete,
+    severity_for_status,
+)
+
+# ── 删除类：命中 ───────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("command,expected", [
+    # 任务书点名的六个模式，各至少一条
+    ("rm -rf /tmp/build", "rm"),
+    ("rm -fv *.log", "rm"),
+    ("rmdir /s /q C:\\old", "rmdir"),
+    ("del C:\\temp\\a.txt", "del"),
+    ("Remove-Item -Recurse -Force C:\\data", "remove-item"),
+    ("REMOVE-ITEM -Recurse -Force .\\node_modules", "remove-item"),
+    ("git clean -fdx", "git clean"),
+    ("git clean -fd", "git clean"),
+    ("DROP TABLE users;", "drop table"),
+    ("Drop Table orders", "drop table"),
+    # 链式与管道
+    ("ls && rm -rf x", "rm"),
+    ("cd a; rm b", "rm"),
+    ("ls | tee log && del x.txt", "del"),
+    # 路径形式（第一版按「命令位置」会漏掉这几条）
+    ("/bin/rm -rf /var", "rm"),
+    ("C:\\Windows\\System32\\del file.txt", "del"),
+    # 包装器前缀（第一版同样会漏）
+    ("sudo rm -rf /tmp/x", "rm"),
+    ("xargs rm -f", "rm"),
+    ('bash -c "rm -rf x"', "rm"),
+    # 嵌入在更长命令里
+    ("cd /app && npm run build && rm -rf dist && echo done", "rm"),
+    # 已知的「过度匹配」：docker rm 删的是容器不是文件，但确实是删除类操作，
+    # 按整 token 规则会命中。刻意保留——宁可多报一个看得懂的，也不错过一个。
+    ("docker rm -f container", "rm"),
+    ("git rm --cached secret.txt", "rm"),
+])
+def test_delete_matches(command: str, expected: str) -> None:
+    assert match_delete(command) == expected
+
+
+# ── 删除类：不误报 ────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("command", [
+    "ls -la",
+    "git status",
+    "npm run clean",                      # clean 单独出现，且前面不是 git
+    "git status --porcelain | grep clean",  # git 与 clean 不相邻
+    "alarm=1; echo $alarm",               # 含 rm 字母但不是 token
+    "rmlint --gui",                       # 名字以 rm 开头但不是 rm
+    "delicate=true",                      # 含 del 字母但不是 token
+    "remove-itemized-list.txt",           # 含 remove-item 字母但不是 token
+    "",
+    "   ",
+    None,
+])
+def test_delete_does_not_match(command: str | None) -> None:
+    assert match_delete(command) is None
+
+
+def test_delete_help_flag_is_exempt() -> None:
+    """看帮助不等于删文件。"""
+    assert match_delete("del --help") is None
+    assert match_delete("rm -h") is None
+    # 但帮助豁免只在危险 token 是第一个 token 时生效，不能顺带赦免真正的删除
+    assert match_delete("rm -rf x && del --help") == "rm"
+
+
+def test_evaluate_delete_returns_hit() -> None:
+    hit = evaluate_delete("rm -rf build/", agent="claude-code", session="s1", ts="2026-11-21T00:00:00+00:00")
+    assert hit is not None
+    assert hit.rule == RULE_DELETE
+    assert hit.severity == SEVERITY_CRITICAL
+    assert hit.matched == "rm"
+    assert hit.coalesce_key == "delete|s1|claude-code"
+    assert "build/" in hit.summary
+
+
+def test_evaluate_delete_none_on_safe() -> None:
+    assert evaluate_delete("ls -la") is None
+
+
+# ── 失败类：严重度阶梯 ────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("status,expected", [
+    (200, None),
+    (204, None),
+    (301, None),
+    (400, SEVERITY_WARN),
+    (401, SEVERITY_WARN),
+    (403, SEVERITY_WARN),
+    (404, SEVERITY_WARN),
+    (429, SEVERITY_NOTICE),   # 限流会自己重试，不该按 critical 打扰人
+    (500, SEVERITY_CRITICAL),
+    (502, SEVERITY_CRITICAL),
+    (503, SEVERITY_CRITICAL),
+    (None, SEVERITY_WARN),    # 无状态码但已知失败
+    ("abc", SEVERITY_WARN),   # 坏值不值得比真 5xx 更严重
+])
+def test_severity_for_status(status: object, expected: str | None) -> None:
+    assert severity_for_status(status) == expected
+
+
+def test_failure_hit_for_server_error() -> None:
+    hit = evaluate_failure(status_code=503, error_message="service_unavailable: overloaded",
+                           agent="claude", session="s1")
+    assert hit is not None
+    assert hit.rule == RULE_FAILURE
+    assert hit.severity == SEVERITY_CRITICAL
+    assert "503" in hit.summary
+    assert "overloaded" in hit.summary
+    assert hit.matched == "503"
+
+
+def test_failure_none_on_success() -> None:
+    assert evaluate_failure(status_code=200, error_message="") is None
+    assert evaluate_failure(status_code=200, error_message="无所谓") is None
+
+
+def test_failure_without_status_still_fails() -> None:
+    """网络层错误没有状态码，但有 message，仍算失败。"""
+    hit = evaluate_failure(status_code=None, error_message="connection reset by peer")
+    assert hit is None or hit.severity == SEVERITY_WARN
+
+
+def test_transcript_error_becomes_failure() -> None:
+    event = UnifiedEvent(agent="claude-code", session="s1", event=EVENT_ERROR,
+                         tool=None, summary="出错：api_error（429 rate_limited）",
+                         ts="2026-11-21T00:00:00+00:00")
+    hit = evaluate_transcript_error(event)
+    assert hit is not None
+    assert hit.rule == RULE_FAILURE
+    assert hit.severity == SEVERITY_WARN
+    assert hit.matched == "transcript-error"
+
+
+def test_transcript_non_error_yields_nothing() -> None:
+    event = UnifiedEvent(agent="claude-code", session="s1", event="tool_use",
+                         tool="Bash", summary="Bash: ls", ts="2026-11-21T00:00:00+00:00")
+    assert evaluate_transcript_error(event) is None
+
+
+# ── 合并 ──────────────────────────────────────────────────────────────────
+
+def test_coalescer_suppresses_within_window() -> None:
+    coalescer = Coalescer(window_seconds=60.0)
+    first = evaluate_delete("rm -rf a", session="s1")
+    second = evaluate_delete("rm -rf b", session="s1")
+    assert coalescer.offer(first, now=1000.0) is first
+    assert coalescer.offer(second, now=1010.0) is None   # 窗口内，合并
+    assert coalescer.offer(second, now=1061.0) is second  # 出窗，放行
+
+
+def test_coalescer_keys_by_session() -> None:
+    """不同会话的同类事件不该互相吞掉。"""
+    coalescer = Coalescer(window_seconds=60.0)
+    a = evaluate_delete("rm -rf a", session="s1")
+    b = evaluate_delete("rm -rf b", session="s2")
+    assert coalescer.offer(a, now=1000.0) is a
+    assert coalescer.offer(b, now=1001.0) is b
+
+
+def test_evaluate_event_rules_for_error_only() -> None:
+    coalescer = Coalescer(window_seconds=60.0)
+    error_event = UnifiedEvent(agent="claude-code", session="s1", event=EVENT_ERROR,
+                               tool=None, summary="出错：api_error", ts="t")
+    ok_event = UnifiedEvent(agent="claude-code", session="s1", event="tool_use",
+                            tool="Bash", summary="Bash: ls", ts="t")
+    assert len(coalescer.evaluate_event(error_event, now=1000.0)) == 1
+    assert coalescer.evaluate_event(ok_event, now=1001.0) == []

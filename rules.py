@@ -1,0 +1,239 @@
+"""L0 规则层：零 key 可用的固定公式判定（M0-lite-3a）。
+
+只做两类：**删除类**与**失败类**。这两类不依赖模型、不依赖 key，
+所以无 key 时照样能报——这正是零 key 策略里"装得上、看得见规则级红灯"的那部分。
+
+判定方式（2026-11-21 定，含一次设计返工）：
+第一版按「命令位置」匹配（开头或 `; && || |` 换行 `(` `$(` 之后），
+实测会**漏掉** `sudo rm`、`xargs rm`、`bash -c "rm -rf x"`、`/bin/rm`、`C:\\...\\del`
+——这些前面是空格、引号或路径分隔符，都不在分隔符集合里。
+改成**整 token 匹配 + 取 basename**：引号内的 `rm` 也会命中，
+于是 `echo "rm -rf 是危险操作"` 会误报。这个交换是刻意的：
+误报在 summary 里一眼可辨（用户能看到那是 echo），漏判却是隐形的。
+
+严重度阶梯（失败类，我来定）：
+  critical  status >= 500      服务端在崩，全线不可用
+  warn      400 <= status < 500 客户端/配置问题，范围有限
+  notice    status == 429       限流，Agent 会自己重试
+  warn      无 status / 坏值 / 转录 error
+`info` 不产生规则命中，预留给非失败的一般状态变化。
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from .events import UnifiedEvent
+
+SEVERITY_INFO = "info"
+SEVERITY_NOTICE = "notice"
+SEVERITY_WARN = "warn"
+SEVERITY_CRITICAL = "critical"
+SEVERITIES = (SEVERITY_INFO, SEVERITY_NOTICE, SEVERITY_WARN, SEVERITY_CRITICAL)
+
+RULE_DELETE = "delete"
+RULE_FAILURE = "failure"
+
+# 任务书点名的六个模式。大小写不敏感（PowerShell 本身不敏感）。
+DELETE_TOKENS = frozenset({"rm", "rmdir", "del", "remove-item"})
+DELETE_PAIRS = (("git", "clean"), ("drop", "table"))
+# 看帮助不等于真删文件；只在危险 token 是命令本身第一个 token 时豁免。
+HELP_FLAGS = frozenset({"--help", "-h", "/?", "-?"})
+
+# 分词：先按 shell 命令分隔符切成「简单命令」，再按空白与括号等切 token。
+# 必须分段：否则 `rm -rf x && del --help` 里后面那个 --help 会把前面的真删除一起赦免了。
+_SIMPLE_SPLIT = re.compile(r"[;|&\n]+")
+_SEPARATORS = re.compile(r"[\s;|&()<>]+")
+
+
+class RuleHit(BaseModel):
+    """一条规则命中的结果。coalesce_key 相同的命中在窗口内合并。"""
+
+    rule: str = Field(description="规则名：delete / failure")
+    severity: str = Field(description="info / notice / warn / critical")
+    summary: str = Field(description="给人看的一行描述")
+    matched: str = Field(description="具体命中了什么，如 rm / git clean / 429")
+    agent: str = Field(default="", description="来源 Agent")
+    session: str = Field(default="", description="会话标识")
+    ts: str = Field(default="", description="ISO8601 UTC")
+    coalesce_key: str = Field(default="", description="合并键；相同则在窗口内只报一次")
+
+
+# ── 分词 ──────────────────────────────────────────────────────────────────
+
+def _tokens(command: str) -> list[str]:
+    return [t for t in _SEPARATORS.split(command or "") if t]
+
+
+def _simple_commands(command: str) -> list[list[str]]:
+    """按 `;` `|` `&` 换行切段，每段再切 token。段内判定互不影响。"""
+    commands = []
+    for part in _SIMPLE_SPLIT.split(command or ""):
+        tokens = [_normalise(t) for t in _tokens(part)]
+        if tokens:
+            commands.append(tokens)
+    return commands
+
+
+def _normalise(token: str) -> str:
+    """去引号、转小写。引号留着会让 `"rm` 匹配不上。"""
+    return token.strip("\"'`").lower()
+
+
+def _basename(token: str) -> str:
+    """`/bin/rm` → `rm`，`C:\\Windows\\System32\\del` → `del`。"""
+    for sep in ("/", "\\"):
+        if sep in token:
+            token = token.rsplit(sep, 1)[-1]
+    return token
+
+
+# ── 删除类 ────────────────────────────────────────────────────────────────
+
+def match_delete(command: str) -> str | None:
+    """返回命中的危险 token 名，未命中返回 None。纯函数。
+
+    按简单命令逐段判：段内第一个 token 是危险命令且带帮助 flag → 这段只是看帮助，跳过；
+    其余任何位置出现危险 token（sudo/xargs 前缀、引号内、路径形式）都算命中。
+    """
+    for tokens in _simple_commands(command):
+        for left, right in DELETE_PAIRS:
+            for i in range(len(tokens) - 1):
+                if tokens[i] == left and tokens[i + 1] == right:
+                    return f"{left} {right}"
+
+        if _basename(tokens[0]) in DELETE_TOKENS:
+            if any(t in HELP_FLAGS for t in tokens[1:]):
+                continue  # 这一段只是 `del --help` 这类看帮助
+            return _basename(tokens[0])
+
+        for token in tokens:
+            name = _basename(token)
+            if name in DELETE_TOKENS:
+                return name
+    return None
+
+
+def evaluate_delete(command: str, *, agent: str = "", session: str = "",
+                    ts: str = "") -> RuleHit | None:
+    """对一个 Bash 命令判删除类。纯函数，不碰 I/O。"""
+    matched = match_delete(command)
+    if matched is None:
+        return None
+    return RuleHit(
+        rule=RULE_DELETE,
+        severity=SEVERITY_CRITICAL,
+        summary=f"删除类操作：{_clip(command)}",
+        matched=matched,
+        agent=agent,
+        session=session,
+        ts=ts,
+        coalesce_key=f"{RULE_DELETE}|{session}|{agent}",
+    )
+
+
+# ── 失败类 ────────────────────────────────────────────────────────────────
+
+def _to_int(value: Any) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def severity_for_status(status_code: Any) -> str | None:
+    """把 HTTP 状态码映射成严重度；2xx/3xx 返回 None（不算失败）。"""
+    status = _to_int(status_code)
+    if status is None:
+        return SEVERITY_WARN  # 无状态码但已知失败
+    if status >= 500:
+        return SEVERITY_CRITICAL
+    if status == 429:
+        return SEVERITY_NOTICE
+    if status >= 400:
+        return SEVERITY_WARN
+    return None
+
+
+def evaluate_failure(*, status_code: Any = None, error_message: str = "",
+                     agent: str = "", session: str = "", ts: str = "") -> RuleHit | None:
+    """对一个网关请求判失败类。纯函数。
+
+    ``status_code`` 为 None 但给了 ``error_message`` 也算失败（网络层错误没有状态码）。
+    """
+    severity = severity_for_status(status_code)
+    if severity is None:
+        return None  # 2xx/3xx 不是失败；有 message 但状态正常也不算失败
+    message = str(error_message or "").strip()
+    status = _to_int(status_code)
+    matched = str(status) if status is not None else "no-status"
+    summary = "请求失败"
+    if status is not None:
+        summary += f"（状态 {status}）"
+    if message:
+        summary += f"：{_clip(message, 60)}"
+    return RuleHit(
+        rule=RULE_FAILURE,
+        severity=severity,
+        summary=summary,
+        matched=matched,
+        agent=agent,
+        session=session,
+        ts=ts,
+        coalesce_key=f"{RULE_FAILURE}|{session}|{agent}",
+    )
+
+
+def evaluate_transcript_error(event: UnifiedEvent) -> RuleHit | None:
+    """转录里的 error 事件 → 失败类。纯函数。"""
+    if event.event != "error":
+        return None
+    return RuleHit(
+        rule=RULE_FAILURE,
+        severity=SEVERITY_WARN,
+        summary=f"转录报错：{_clip(event.summary, 80)}",
+        matched="transcript-error",
+        agent=event.agent,
+        session=event.session,
+        ts=event.ts,
+        coalesce_key=f"{RULE_FAILURE}|{event.session}|{event.agent}",
+    )
+
+
+def _clip(text: str, limit: int = 80) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# ── 合并 ──────────────────────────────────────────────────────────────────
+
+class Coalescer:
+    """同一 coalesce_key 在窗口内只放行第一条，避免刷屏。"""
+
+    def __init__(self, window_seconds: float = 60.0) -> None:
+        self.window_seconds = float(window_seconds)
+        self._last: dict[str, float] = {}
+
+    def offer(self, hit: RuleHit, now: float | None = None) -> RuleHit | None:
+        """窗口内重复返回 None（被合并），否则原样返回并记账。"""
+        moment = time.monotonic() if now is None else float(now)
+        previous = self._last.get(hit.coalesce_key)
+        if previous is not None and moment - previous < self.window_seconds:
+            return None
+        self._last[hit.coalesce_key] = moment
+        return hit
+
+    def evaluate_event(self, event: UnifiedEvent, now: float | None = None) -> list[RuleHit]:
+        """对一个统一事件跑当前阶段所有规则，返回未被合并的命中。"""
+        hits: list[RuleHit] = []
+        if event.event == "error":
+            candidate = evaluate_transcript_error(event)
+            if candidate is not None:
+                kept = self.offer(candidate, now)
+                if kept is not None:
+                    hits.append(kept)
+        return hits
