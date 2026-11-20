@@ -83,9 +83,15 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._started_at: float | None = None
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
+    # startup 用 async def、shutdown 用 def，刻意对齐官方 memo_reminder 的写法：
+    # 真机（Steam 版）日志里见过官方 app_launcher 报
+    #   TypeError: object Ok can't be used in 'await' expression
+    # 而它的 lifecycle 是同步 def 返回 Ok。本机源码树与 Steam 版不同版本，
+    # 无法读 Steam 的 host（mypyc 编译成 .pyd），所以按最接近的样板对齐，
+    # 剩下的靠真机验收确认。
 
     @lifecycle(id="startup")
-    def on_startup(self, **_):
+    async def on_startup(self, **_):
         self._started_at = time.time()
         self.logger.info(
             "同桌猫启动 plugin_id={} source={} stage={}",
