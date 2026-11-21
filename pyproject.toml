@@ -2,3 +2,20 @@
 name = "agent_deskmate"
 version = "0.1.0"
 dependencies = []
+
+# 打包白名单。写成显式 allow-list 而不是靠"默认全带"：
+# 默认全带的意思是"以后任何新文件都会静默进包"，包括误放进来的临时文件。
+# 但 allow-list 反过来有它自己的坑——新文件不在名单里就会被**静默丢掉**，
+# 症状是"装好的插件少个文件"，极难查。所以 tests/test_packaging.py 盯着
+# 一条不变式：源码树里每一个该发布的文件都必须命中这里至少一条。
+[tool.neko.build]
+include = [
+  "*.py",
+  "*.json",
+  "*.toml",
+  "*.md",
+  ".gitignore",
+  "i18n/*",
+  "adapters/*",
+  "tests/*",
+]

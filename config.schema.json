@@ -1,0 +1,381 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "This schema only shapes the settings form in the plugin manager. It is NOT a validation boundary: every value is still parsed and clamped by the plugin code at runtime, so an out-of-range, missing or malformed value degrades gracefully instead of stopping the plugin from loading.",
+  "type": "object",
+  "properties": {
+    "plugin_runtime": {
+      "type": "object",
+      "title": "Runtime settings",
+      "description": "Plugin enablement and automatic startup.",
+      "x-title-i18n": {
+        "en": "Runtime settings",
+        "zh-CN": "运行设置"
+      },
+      "x-description-i18n": {
+        "en": "Plugin enablement and automatic startup.",
+        "zh-CN": "插件的启用与自动启动。"
+      },
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "title": "Enable plugin",
+          "description": "When off, the plugin does not run at all.",
+          "x-title-i18n": {
+            "en": "Enable plugin",
+            "zh-CN": "启用插件"
+          },
+          "x-description-i18n": {
+            "en": "When off, the plugin does not run at all.",
+            "zh-CN": "关闭后插件完全不再运行。"
+          },
+          "default": true
+        },
+        "auto_start": {
+          "type": "boolean",
+          "title": "Start automatically",
+          "description": "Run automatically when the plugin system starts, without starting it by hand each time.",
+          "x-title-i18n": {
+            "en": "Start automatically",
+            "zh-CN": "自动启动"
+          },
+          "x-description-i18n": {
+            "en": "Run automatically when the plugin system starts, without starting it by hand each time.",
+            "zh-CN": "插件系统启动时自动运行，不用每次手动点启动。"
+          },
+          "default": false
+        }
+      }
+    },
+    "agent_deskmate": {
+      "type": "object",
+      "title": "Neko Deskmate",
+      "description": "Settings for observation, broadcasts and approvals.",
+      "x-title-i18n": {
+        "en": "Neko Deskmate",
+        "zh-CN": "同桌猫"
+      },
+      "x-description-i18n": {
+        "en": "Settings for observation, broadcasts and approvals.",
+        "zh-CN": "观测、播报与审批的相关设置。"
+      },
+      "properties": {
+        "coalesce_seconds": {
+          "type": "integer",
+          "title": "Broadcast merge window (seconds)",
+          "description": "The same event is announced only once within this window, to avoid flooding the chat.",
+          "x-title-i18n": {
+            "en": "Broadcast merge window (seconds)",
+            "zh-CN": "播报合并间隔（秒）"
+          },
+          "x-description-i18n": {
+            "en": "The same event is announced only once within this window, to avoid flooding the chat.",
+            "zh-CN": "同一件事在这个时间内只播一次，防止刷屏。"
+          },
+          "default": 60,
+          "minimum": 1,
+          "maximum": 3600
+        },
+        "log_commands": {
+          "type": "boolean",
+          "title": "Keep command text in logs",
+          "description": "When off, logs keep only the command length and its first few characters. Either way, secrets are masked before anything is written.",
+          "x-title-i18n": {
+            "en": "Keep command text in logs",
+            "zh-CN": "日志里保留命令原文"
+          },
+          "x-description-i18n": {
+            "en": "When off, logs keep only the command length and its first few characters. Either way, secrets are masked before anything is written.",
+            "zh-CN": "关闭后日志只记命令长度和前几十个字；两种情况都会先给敏感信息打码。"
+          },
+          "default": true
+        },
+        "stall_minutes": {
+          "type": "integer",
+          "title": "Stall reminder threshold (minutes)",
+          "description": "Remind once when one session has shown no new activity for this long.",
+          "x-title-i18n": {
+            "en": "Stall reminder threshold (minutes)",
+            "zh-CN": "停滞提醒阈值（分钟）"
+          },
+          "x-description-i18n": {
+            "en": "Remind once when one session has shown no new activity for this long.",
+            "zh-CN": "同一个会话超过这么久没有新动静，就提醒一次。"
+          },
+          "default": 10,
+          "minimum": 1,
+          "maximum": 1440
+        },
+        "watch": {
+          "type": "object",
+          "title": "Observation sources",
+          "description": "Where the plugin reads session records from. Supports ~ and environment variables.",
+          "x-title-i18n": {
+            "en": "Observation sources",
+            "zh-CN": "观测位置"
+          },
+          "x-description-i18n": {
+            "en": "Where the plugin reads session records from. Supports ~ and environment variables.",
+            "zh-CN": "插件从哪里读会话记录。支持 ~ 和环境变量。"
+          },
+          "properties": {
+            "claude_projects_dir": {
+              "type": "string",
+              "title": "Claude Code records directory",
+              "description": "Directory that holds the session records, as jsonl files.",
+              "x-title-i18n": {
+                "en": "Claude Code records directory",
+                "zh-CN": "Claude Code 记录目录"
+              },
+              "x-description-i18n": {
+                "en": "Directory that holds the session records, as jsonl files.",
+                "zh-CN": "存放会话记录的目录，里面是 jsonl 文件。"
+              },
+              "default": "~/.claude/projects"
+            },
+            "cc_switch_db": {
+              "type": "string",
+              "title": "Gateway ledger file",
+              "description": "The cc-switch database file. Opened read-only.",
+              "x-title-i18n": {
+                "en": "Gateway ledger file",
+                "zh-CN": "网关账本文件"
+              },
+              "x-description-i18n": {
+                "en": "The cc-switch database file. Opened read-only.",
+                "zh-CN": "cc-switch 的数据库文件，只读打开。"
+              },
+              "default": "~/.cc-switch/cc-switch.db"
+            }
+          }
+        },
+        "mine": {
+          "type": "object",
+          "title": "Sessions you started",
+          "description": "Sessions you started yourself inside these directories. This decides how broadcasts are worded; if nothing is declared, everything is treated as unknown.",
+          "x-title-i18n": {
+            "en": "Sessions you started",
+            "zh-CN": "自己开的会话"
+          },
+          "x-description-i18n": {
+            "en": "Sessions you started yourself inside these directories. This decides how broadcasts are worded; if nothing is declared, everything is treated as unknown.",
+            "zh-CN": "你亲自在这些目录下开过的会话。用来决定播报怎么说；不声明就全部按未知处理。"
+          },
+          "properties": {
+            "roots": {
+              "type": "array",
+              "title": "Directory list",
+              "description": "One directory per entry. Sessions inside them are announced as started by you.",
+              "x-title-i18n": {
+                "en": "Directory list",
+                "zh-CN": "目录列表"
+              },
+              "x-description-i18n": {
+                "en": "One directory per entry. Sessions inside them are announced as started by you.",
+                "zh-CN": "每项一个目录。落在里面的会话，播报会说「你自己开的」。"
+              },
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "approval": {
+          "type": "object",
+          "title": "Approvals",
+          "description": "How you are asked, and how decisions are made, when permission is needed.",
+          "x-title-i18n": {
+            "en": "Approvals",
+            "zh-CN": "审批"
+          },
+          "x-description-i18n": {
+            "en": "How you are asked, and how decisions are made, when permission is needed.",
+            "zh-CN": "需要权限时怎么问你怎么决定。"
+          },
+          "properties": {
+            "port": {
+              "type": "integer",
+              "title": "Local service port",
+              "description": "Listens on this machine only. After changing it, re-install the approval link once from the authorization entry.",
+              "x-title-i18n": {
+                "en": "Local service port",
+                "zh-CN": "本地服务端口"
+              },
+              "x-description-i18n": {
+                "en": "Listens on this machine only. After changing it, re-install the approval link once from the authorization entry.",
+                "zh-CN": "只听本机。改完之后要去授权入口重装一次审批连接。"
+              },
+              "default": 48921,
+              "minimum": 1024,
+              "maximum": 65535
+            },
+            "timeout_mark_expired": {
+              "type": "integer",
+              "title": "Time to wait for a decision (seconds)",
+              "description": "Past this time with no decision, the request counts as undecided; the plugin never decides for you. Must be below 600.",
+              "x-title-i18n": {
+                "en": "Time to wait for a decision (seconds)",
+                "zh-CN": "等待决定的时间（秒）"
+              },
+              "x-description-i18n": {
+                "en": "Past this time with no decision, the request counts as undecided; the plugin never decides for you. Must be below 600.",
+                "zh-CN": "超过这个时间没有人决定，这条就视为未决定——插件不替你决定。必须小于 600。"
+              },
+              "default": 570,
+              "minimum": 1,
+              "maximum": 599
+            },
+            "retention_seconds": {
+              "type": "integer",
+              "title": "Record retention (seconds)",
+              "description": "How long expired approval records are kept, so they can still be looked up afterwards.",
+              "x-title-i18n": {
+                "en": "Record retention (seconds)",
+                "zh-CN": "记录保留时长（秒）"
+              },
+              "x-description-i18n": {
+                "en": "How long expired approval records are kept, so they can still be looked up afterwards.",
+                "zh-CN": "过期的审批记录保留多久，供事后查。"
+              },
+              "default": 3600,
+              "minimum": 60,
+              "maximum": 86400
+            },
+            "ai_judgement": {
+              "type": "boolean",
+              "title": "Enable model suggestions",
+              "description": "After turning this on you also need to fill in the model settings below and confirm once in the authorization entry. Without that confirmation no suggestion is shown.",
+              "x-title-i18n": {
+                "en": "Enable model suggestions",
+                "zh-CN": "启用模型建议"
+              },
+              "x-description-i18n": {
+                "en": "After turning this on you also need to fill in the model settings below and confirm once in the authorization entry. Without that confirmation no suggestion is shown.",
+                "zh-CN": "打开后还要填好下面的模型信息，并且去授权入口确认一次；不确认的话建议不会出现。"
+              },
+              "default": false
+            },
+            "auto_decide": {
+              "type": "string",
+              "title": "Auto-approval scope",
+              "description": "Off: you decide every time. Low risk only: low-risk actions may be approved automatically, high-risk ones still need you every time, and nothing is ever refused automatically.",
+              "x-title-i18n": {
+                "en": "Auto-approval scope",
+                "zh-CN": "自动放行范围"
+              },
+              "x-description-i18n": {
+                "en": "Off: you decide every time. Low risk only: low-risk actions may be approved automatically, high-risk ones still need you every time, and nothing is ever refused automatically.",
+                "zh-CN": "关闭：每次都由你点。仅低风险：低风险动作可以自动放行，高风险仍然每次都要你点，任何时候都不会自动拒绝。"
+              },
+              "default": "off",
+              "enum": ["off", "low_risk_only"]
+            },
+            "auto_decide_max_severity": {
+              "type": "string",
+              "title": "Highest risk allowed for auto-approval",
+              "description": "Four levels from low to high. Even the top level does not auto-approve high-risk actions; that layer is not governed by this option.",
+              "x-title-i18n": {
+                "en": "Highest risk allowed for auto-approval",
+                "zh-CN": "自动放行的风险上限"
+              },
+              "x-description-i18n": {
+                "en": "Four levels from low to high. Even the top level does not auto-approve high-risk actions; that layer is not governed by this option.",
+                "zh-CN": "从低到高四档。开到最高也不会自动放行高风险动作——那一层不归这个选项管。"
+              },
+              "default": "notice",
+              "enum": ["info", "notice", "warn", "critical"]
+            },
+            "api_key": {
+              "type": "string",
+              "title": "API key",
+              "description": "Key used to call the model. Empty means no model is connected. It is never shown in logs, cards or any echo.",
+              "x-title-i18n": {
+                "en": "API key",
+                "zh-CN": "接口密钥"
+              },
+              "x-description-i18n": {
+                "en": "Key used to call the model. Empty means no model is connected. It is never shown in logs, cards or any echo.",
+                "zh-CN": "调用模型用的密钥。留空表示不接入模型。不会显示在日志、卡片或任何回显里。"
+              },
+              "default": "",
+              "writeOnly": true
+            }
+          }
+        },
+        "model": {
+          "type": "object",
+          "title": "Model",
+          "description": "Which model to connect. The model only advises; it never decides for you.",
+          "x-title-i18n": {
+            "en": "Model",
+            "zh-CN": "模型"
+          },
+          "x-description-i18n": {
+            "en": "Which model to connect. The model only advises; it never decides for you.",
+            "zh-CN": "接入哪个模型。模型只给建议，永远不替你决定。"
+          },
+          "properties": {
+            "protocol": {
+              "type": "string",
+              "title": "Interface type",
+              "description": "Two request formats. Pick the one your provider expects.",
+              "x-title-i18n": {
+                "en": "Interface type",
+                "zh-CN": "接口类型"
+              },
+              "x-description-i18n": {
+                "en": "Two request formats. Pick the one your provider expects.",
+                "zh-CN": "两种请求格式，按你用的服务商要求选。"
+              },
+              "default": "openai",
+              "enum": ["openai", "anthropic"]
+            },
+            "base_url": {
+              "type": "string",
+              "title": "Interface address",
+              "description": "Root address of the service, without a trailing path.",
+              "x-title-i18n": {
+                "en": "Interface address",
+                "zh-CN": "接口地址"
+              },
+              "x-description-i18n": {
+                "en": "Root address of the service, without a trailing path.",
+                "zh-CN": "服务的根地址，末尾不要带路径。"
+              },
+              "default": "https://api.deepseek.com"
+            },
+            "api_key": {
+              "type": "string",
+              "title": "API key",
+              "description": "The same key as in the approval section; this one takes precedence. It is never shown in logs, cards or any echo.",
+              "x-title-i18n": {
+                "en": "API key",
+                "zh-CN": "接口密钥"
+              },
+              "x-description-i18n": {
+                "en": "The same key as in the approval section; this one takes precedence. It is never shown in logs, cards or any echo.",
+                "zh-CN": "与审批那一栏填的是同一个东西，这里优先。不会显示在日志、卡片或任何回显里。"
+              },
+              "default": "",
+              "writeOnly": true
+            },
+            "model": {
+              "type": "string",
+              "title": "Model name",
+              "description": "Name of the model to call.",
+              "x-title-i18n": {
+                "en": "Model name",
+                "zh-CN": "模型名称"
+              },
+              "x-description-i18n": {
+                "en": "Name of the model to call.",
+                "zh-CN": "要调用的模型名。"
+              },
+              "default": "deepseek-chat"
+            }
+          }
+        }
+      }
+    }
+  }
+}

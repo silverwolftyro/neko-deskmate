@@ -168,3 +168,14 @@ uv run neko-plugin check agent_deskmate
 
 `passive = true` 会让 Agent 看不到本插件（决策 D2：只监听，不参与任务分派）；
 它不阻止进程启动，也不阻止播报——`push_message` 是出口，不是入口。
+
+## 设置表单（config.schema.json）
+
+`config.schema.json` 描述插件管理器里那张设置表单：每个字段的中英文标题、
+一句话说明、类型、取值范围与默认值，密钥字段标 `writeOnly`（永不回显）。
+
+它**只影响表单展示，不是校验边界**——真正的兜底全在代码里
+（`_to_bool` / `_to_number` / `effective_max_severity` 等运行时函数）。
+手改配置文件的用户根本不过这张表单，所以坏值、缺值、越界值都必须由代码接住。
+`tests/test_config_schema.py` 盯着：schema 与 `config.example.toml` 字段一一对应、
+enum 取值与代码常量一致、给用户看的文字里不出现配置键名。
