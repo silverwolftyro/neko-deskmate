@@ -67,7 +67,7 @@ def test_events_registered() -> None:
     assert set(registered) == {
         "startup", "shutdown", "config_change", "status", "dump_events", "scan_now",
         "watch", "approval", "approval_decide", "approval_explain",
-        "pending_list", "audit_list",
+        "approval_authorize", "pending_list", "audit_list",
     }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"
     assert registered["shutdown"].event_type == "lifecycle"
@@ -78,6 +78,8 @@ def test_events_registered() -> None:
     # M0-lite-5：审批卡片按钮的落点，必须是 plugin_entry（@ui.action 叠加在它上面）
     assert registered["approval_decide"].event_type == "plugin_entry"
     assert registered["approval_explain"].event_type == "plugin_entry"
+    # 授权入口：L1/L2 唯一的开启路径，同样靠 @ui.action 承接卡片按钮
+    assert registered["approval_authorize"].event_type == "plugin_entry"
     # 5a：审批待办与审计两个查询入口
     assert registered["pending_list"].event_type == "plugin_entry"
     assert registered["audit_list"].event_type == "plugin_entry"

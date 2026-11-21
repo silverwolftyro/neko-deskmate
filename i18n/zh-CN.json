@@ -11,8 +11,10 @@
   "entry.approval_decide.description": "审批卡片的按钮落点：把用户点的「允许 / 拒绝」回填给正在等待的 Claude Code。正常不会手动调用它。",
   "entry.approval_explain.name": "这是什么",
   "entry.approval_explain.description": "解释这条审批请求是什么、L0 规则对它有什么判断。不接模型，只说规则层能讲准的事实。",
+  "entry.approval_authorize.name": "授权确认",
+  "entry.approval_authorize.description": "L1/L2 的授权入口：弹出授权文案让用户确认（含「模型判断可能出错，决定由你授权并承担后果」）。用户点「确认授权」后才写入授权记录并写进审计；插件永不会自行调用它。",
   "entry.pending_list.name": "审批待办",
   "entry.pending_list.description": "返回未决与已了结（未清理）的审批：会话、命令、建立时间、状态、decided_by。过期不删，保留一段时间供事后查。",
   "entry.audit_list.name": "审批审计",
-  "entry.audit_list.description": "返回每次审批决定的审计：时间、命令、决定、decided_by（user/ai/expired）、模型、理由。附带纯文本便于导出。"
+  "entry.audit_list.description": "返回每次审批决定的审计：时间、命令、决定、decided_by（user/ai/expired/host_timeout）、模型、理由，以及 L2 生效时的授权溯源；授权确认本身也各占一条。附带纯文本便于导出。"
 }

@@ -14,10 +14,16 @@
 删除类/危险写**永远不进 L2**，无论阈值怎么设。
 
 到期（``timeout_mark_expired``，默认 570s = hook 600s 前 30s）时：
-用户没点 → 若 L2 门控通过且有判断后端，则 AI 决定（``decided_by="ai"``）；
-否则只把 pending 标成 ``expired``，**不发任何 decision**——用 503 + 无 decision
-的响应体告诉宿主"插件没有决定"。真正拦住这次调用的是宿主自己的策略
-（``hooks.json`` 里的 ``onFailure:"block"``），不是我们的判断。
+用户没点 → **只把 pending 标成 ``expired``**——不拒绝、不回填、不记成"已拒绝"，
+响应体里不得出现任何 decision。用 503 + 无 decision 的响应体告诉宿主"插件没有
+决定"；真正拦住这次调用的是宿主自己的策略（``hooks.json`` 里的
+``onFailure:"block"``）。文案只写「宿主已自行处理，本插件未做判断」。
+
+**L2 自动放行的时机是事件发生的那一刻，不是等到期。** 四条全中才自动 allow：
+用户已在 ``approval_authorize`` 确认授权文案、配置里 L1/L2 全开、风险 ≤ 阈值、
+判断后端就绪。自动放行后立刻发一条 blind 通知 + 写一条含授权人/规则/模型/理由的
+审计。其余情况一律不自动决定——**包括后端说 deny**（永不 auto-deny）、后端异常、
+没授权、没 key。没接后端时也不自己拍一个，把请求留给用户，走到期。
 
 这是三条红线里第 2 条的执行体：**审批交互只能走 create_card + data-neko-action**。
 
@@ -58,23 +64,48 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-# 决策取值。只有用户点按钮才能产生这两个值。
+# 决策取值。只有用户点按钮、或 L2 在用户显式授权下自动放行，才能产生这两个值。
 APPROVE_ALLOW = "allow"
 APPROVE_DENY = "deny"
 DECISIONS = (APPROVE_ALLOW, APPROVE_DENY)
 
 # decided_by 的取值。
-DECIDED_BY_USER = "user"              # 用户点了 → 回填
-DECIDED_BY_EXPIRED = "expired"        # 我们先到期 → **不回填**
+DECIDED_BY_USER = "user"                # 用户点了 → 回填
+DECIDED_BY_EXPIRED = "expired"          # 我们先到期 → **不回填、不记成拒绝**
 DECIDED_BY_HOST_TIMEOUT = "host_timeout"  # 连接被宿主断开 → **不回填**
-DECIDED_BY_AI = "ai"                  # L2 自动决定 → 回填，但必须可审计
-# 下面这个只在用户显式打开 auto_deny_on_timeout 时才可能出现。
-# 默认配置下永远走不到；开着的时候必须在日志和卡片上都注明是配置干的。
-DECIDED_BY_CONFIG = "config"
+DECIDED_BY_AI = "ai"                    # L2 自动放行 → 回填，但必须可审计
+# 只出现在 kind="authorization" 的审计行上：那是"谁确认了授权"，
+# 不是一次审批决定。决定类的 decided_by 永远只有上面四个值。
+DECIDED_BY_AUTHORIZATION = "authorization"
+
+# ── 显式授权（规格 §2 硬规则 2） ────────────────────────────────────────────
+# ai_judgement / auto_decide 只能由用户写配置打开；但**光写配置还不够**——
+# 首次开启前必须先让用户确认授权文案。确认记录写进审计（时间、范围、授权版本）。
+# 插件没有任何方法能在运行期自行打开授权。
+
+AUTHORIZATION_VERSION = 1
+AUTH_SCOPE_ADVICE = "ai_judgement"
+AUTH_SCOPE_AUTO = "auto_decide"
+AUTH_SCOPES = (AUTH_SCOPE_ADVICE, AUTH_SCOPE_AUTO)
+
+AUTHORIZATION_TITLE = "同桌猫 · 授权确认"
+# 授权文案。必须包含"模型判断可能出错"与"决定由你授权并承担后果"——
+# 这是用户签字前该看到的话，测试逐句盯着。
+AUTHORIZATION_TEXT = (
+    "开启后，插件会把「命令原文、工作目录、命中的 L0 规则、会话标识」"
+    "交给你的配置里指定的模型，由它给出建议（ai_judgement），"
+    "或在你授权的低风险动作上替你放行（auto_decide）。"
+)
+AUTHORIZATION_HEADLINE = "模型判断可能出错，决定由你授权并承担后果"
+AUTHORIZATION_FOOTER = (
+    "插件不会在运行时自行开启以上任何一项；想关闭只需把配置改回 "
+    "false / off。确认记录会写进审批审计（含时间、范围、授权版本）。"
+)
 
 HOOK_PATH = "/hook/permission"
 MAX_BODY_BYTES = 256 * 1024
@@ -127,17 +158,23 @@ def assess_risk(tool_name: str, tool_input: Any) -> tuple[str, str]:
 
 def auto_decide_gate(*, rule: str, severity: str, ai_judgement: bool,
                      has_key: bool, auto_decide: str,
-                     max_severity: str) -> tuple[bool, str]:
+                     max_severity: str,
+                     authorized_scopes: tuple[str, ...] = ()) -> tuple[bool, str]:
     """L2 门控。返回 ``(是否放行, 原因)``。纯函数，便于单测。
 
-    四条全中才放行，缺任何一条都给出**具体原因**——原因要能写进审计，
-    不能只回一个 False 让人猜。
+    五条全中才放行，缺任何一条都给出**具体原因**——原因要能写进审计，
+    不能只回一个 False 让人猜。授权检查排在 ai_judgement 之后、key 之前：
+    配置说"要开"只是意愿，用户在授权入口签了字才算数。
     """
     if auto_decide != AUTO_LOW_RISK_ONLY:
         return False, f"auto_decide={auto_decide!r} 未开启"
     if not ai_judgement:
         # 不能跳级：没开 L1 就没有解释能力，此时的自动决定是黑箱代办。
         return False, "ai_judgement 未开启（L2 必须建立在 L1 之上）"
+    if AUTH_SCOPE_ADVICE not in authorized_scopes:
+        return False, "未确认 ai_judgement 授权（见 approval_authorize）"
+    if AUTH_SCOPE_AUTO not in authorized_scopes:
+        return False, "未确认 auto_decide 授权（见 approval_authorize）"
     if not has_key:
         return False, "未配置 api_key（没 key 不判断）"
     if rule in L2_EXCLUDED_RULES:
@@ -147,10 +184,17 @@ def auto_decide_gate(*, rule: str, severity: str, ai_judgement: bool,
     return True, "L2 门控通过"
 
 
-def advice_state(*, ai_judgement: bool, has_key: bool, backend_ready: bool) -> str:
-    """卡片上"建议"那块显示成什么样。三种状态，都不许假装成功。"""
+def advice_state(*, ai_judgement: bool, has_key: bool, backend_ready: bool,
+                 authorized: bool = True) -> str:
+    """卡片上"建议"那块显示成什么样。四种状态，都不许假装成功。
+
+    ``authorized`` 单独一档：配置开了但用户没签字时，卡片必须说"未确认授权"，
+    不能显示成"没有 key"——那是两件事，混起来用户不知道该去哪补。
+    """
     if not ai_judgement:
         return "disabled"
+    if not authorized:
+        return "unauthorized"
     if not has_key:
         return "no_key"
     if not backend_ready:
@@ -160,6 +204,7 @@ def advice_state(*, ai_judgement: bool, has_key: bool, backend_ready: bool) -> s
 
 ADVICE_TEXT = {
     "disabled": "未开启 AI 建议（ai_judgement = false）",
+    "unauthorized": "未确认授权，无法给出建议（调 approval_authorize 确认）",
     "no_key": "未配置 key，无法给出建议",
     "pending_backend": "已配置 key，建议能力待接入（5b）",
 }
@@ -183,6 +228,9 @@ class PendingApproval:
 
     ``decided_by`` 为 None 表示还没决定（pending）；有值表示已了结。
     了结不等于删除——记录按 ``retention_seconds`` 保留，供事后查。
+
+    ``auto`` 为 True 表示这条是 L2 在用户授权下自动放行的：它**不该弹卡片**
+    （自动放行还要人点就失去意义），只要一条 blind 通知 + 一条审计。
     """
 
     def __init__(self, request: ApprovalRequest) -> None:
@@ -198,6 +246,14 @@ class PendingApproval:
         # L2 决定时填。
         self.judge_model: str = ""
         self.judge_reason: str = ""
+        # 生效中的授权（"v1:ai_judgement,auto_decide by=user"）——L2 审计要能
+        # 追溯到"是谁授权的"，不能只写"AI 决定的"。
+        self.authorization: str = ""
+        # L2 自动放行标记 + 通知是否已发。
+        self.auto = False
+        self.auto_announced = False
+        # 已经进内存的审计行。投递失败时要把它改成最终状态（见 note_host_timeout）。
+        self.audit_entry: AuditRecord | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -210,7 +266,7 @@ class PendingApproval:
         return self.decided_by is not None
 
     def needs_card(self) -> bool:
-        return self.card_id is None
+        return self.card_id is None and not self.auto
 
     def needs_announce(self) -> bool:
         return self.card_id is not None and self.settled() and not self.card_announced
@@ -230,6 +286,7 @@ class PendingApproval:
             "rule": self.rule,
             "decision": self.decision,
             "decided_by": self.decided_by,
+            "auto": self.auto,
         }
 
 
@@ -285,7 +342,12 @@ def _port_in_use(port: int) -> bool:
 
 
 def hook_response(behavior: str, *, message: str = "") -> dict:
-    """按官方 schema 组装回填体。只有用户（或显式开 auto_deny 时的配置）能走到这。"""
+    """按官方 schema 组装回填体。
+
+    ``message`` / ``interrupt`` 是 **deny 专属字段**（官方文档：deny 可带
+    message/interrupt；allow 只带 updatedInput）。给 allow 挂 message 不但是
+    无用信息，还是 schema 外的字段——L2 自动放行的说明走通知与审计，不回填。
+    """
     decision: dict[str, Any] = {
         "behavior": behavior,
         "updatedInput": {},
@@ -309,14 +371,15 @@ def no_decision_response(*, reason: str, timeout_seconds: float) -> dict:
 
     配 503 一起用。宿主看到非 2xx 且 ``onFailure:"block"`` 已配置，
     就会按它自己的失败策略处理（拦住这次调用）——那是宿主的决定，不是我们的。
+    文案只写「宿主已自行处理，本插件未做判断」，不许出现"拒绝"字样。
     """
     return {
         "ok": False,
         "submitted": False,
         "reason": reason,
         "message": (
-            f"同桌猫：{timeout_seconds:g} 秒内无人决定，插件不代你决定。"
-            "本次调用交由宿主按 onFailure 策略处理。"
+            f"同桌猫：{timeout_seconds:g} 秒内无人决定。"
+            "宿主已自行处理本次调用，本插件未做判断。"
         ),
     }
 
@@ -326,15 +389,19 @@ def no_decision_response(*, reason: str, timeout_seconds: float) -> dict:
 ACTION_APPROVE = "deskmate_approve"
 ACTION_DENY = "deskmate_deny"
 ACTION_EXPLAIN = "deskmate_explain"
-# 承载这三个按钮的入口 id。
+ACTION_AUTH_CONFIRM = "deskmate_authorize_confirm"
+ACTION_AUTH_CANCEL = "deskmate_authorize_cancel"
+# 承载这四个按钮的入口 id。
 ENTRY_DECIDE = "approval_decide"
 ENTRY_EXPLAIN = "approval_explain"
+ENTRY_AUTHORIZE = "approval_authorize"
 
 CARD_CSS = (
     "section { padding: 12px; font-size: 13px; }"
     "strong { display: block; margin-bottom: 6px; }"
     "p { margin: 4px 0; }"
     ".loc { color: #888; font-size: 12px; }"
+    ".risk { color: #c0392b; font-size: 13px; margin: 6px 0; }"
     ".hint { color: #aaa; font-size: 12px; margin-top: 8px; }"
     "button { margin: 8px 8px 0 0; padding: 6px 18px; }"
 )
@@ -356,18 +423,20 @@ def _minutes(seconds: float) -> str:
 def build_card_html(*, subject: str, tool_summary: str, session_id: str,
                     working_directory: str | None, timeout_seconds: float,
                     advice_state: str = "disabled",
-                    suggestion: str = "", reason: str = "", basis: str = "") -> str:
+                    suggestion: str = "", reason: str = "", basis: str = "",
+                    risk: str = DEFAULT_RISK_SEVERITY, rule: str = "") -> str:
     """审批卡片的 HTML。纯函数——卡片文案是验收项，必须能单测。
 
-    四块内容（规格 §4）：标题/来源/命令/会话与 cwd、建议+理由+依据、三个按钮、
-    超时说明。``subject`` 由调用方用归因语法生成（``describe_actor``），
+    五块内容（规格 §4 + §2 硬规则 3）：标题/来源/命令、**高风险红条**、
+    会话与 cwd、建议+理由+依据、三个按钮、超时说明。
+    ``subject`` 由调用方用归因语法生成（``describe_actor``），
     这样播报和卡片说的是同一套话。
     """
     location = f"会话 {session_id or '未知'}"
     if working_directory:
         location += f" @ {working_directory}"
 
-    # 建议块：没 key / 没开开关时降级成一行说明，不编内容。
+    # 建议块：没 key / 没签字 / 没开开关时降级成一行说明，不编内容。
     if advice_state == "ready":
         advice_lines = [
             f"<p><strong>建议：{_escape(suggestion)}</strong></p>",
@@ -377,15 +446,26 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
     else:
         advice_lines = [f"<strong>{_escape(ADVICE_TEXT[advice_state])}</strong>"]
 
+    # 高风险永远呈现（规格 §2 硬规则 3）：标红 + 明说任何配置都不会让它自动放行。
+    # 判据用规则命中**或** severity——两条独立，任一成立就要红。
+    high_risk = (rule in L2_EXCLUDED_RULES
+                 or SEVERITY_ORDER.get(risk, 0) >= SEVERITY_ORDER["critical"])
+    risk_html = (
+        '<p class="risk"><strong>高风险动作：任何配置都不会让它自动放行，'
+        "必须由你亲自点允许或拒绝。</strong></p>"
+        if high_risk else ""
+    )
+
     return (
         "<section>"
         "<strong>同桌猫 · 审批请求</strong>"
         f"<p>{_escape(subject)} 请求执行：{_escape(tool_summary)}</p>"
-        f"<p class=\"loc\">{_escape(location)}</p>"
+        + risk_html
+        + f"<p class=\"loc\">{_escape(location)}</p>"
         + "".join(advice_lines)
         + f"<p class=\"hint\">允许后 Claude Code 继续执行；拒绝则中止这次调用"
           f"（不掐掉整个回合）。{_minutes(timeout_seconds)}后无人决定，"
-          "宿主会自行拦截，届时这条视为未决定——插件不代你判断。</p>"
+          "宿主会自行处理，届时这条视为未决定——插件不代你判断。</p>"
           f"<button data-neko-action=\"{ACTION_APPROVE}\">允许</button>"
           f"<button data-neko-action=\"{ACTION_DENY}\">拒绝</button>"
           f"<button data-neko-action=\"{ACTION_EXPLAIN}\">这是什么</button>"
@@ -451,25 +531,102 @@ def build_card_actions(request_id: str) -> dict[str, dict[str, Any]]:
     }
 
 
+def build_authorize_actions(scopes: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    """授权卡的两个按钮 → 同一个入口，用 args 区分签不签字。"""
+    return {
+        ACTION_AUTH_CONFIRM: {"entry": ENTRY_AUTHORIZE,
+                             "args": {"scopes": ",".join(scopes), "confirm": True}},
+        ACTION_AUTH_CANCEL: {"entry": ENTRY_AUTHORIZE,
+                             "args": {"scopes": ",".join(scopes), "confirm": False}},
+    }
+
+
+def build_authorize_html(*, scopes: tuple[str, ...]) -> str:
+    """授权确认卡。文案固定，不掺变量——用户签字前看到的话不该随上下文变。"""
+    return (
+        "<section>"
+        f"<strong>{_escape(AUTHORIZATION_TITLE)}</strong>"
+        f"<p>{_escape(AUTHORIZATION_TEXT)}</p>"
+        f"<p class=\"risk\">{_escape(AUTHORIZATION_HEADLINE)}</p>"
+        f"<p>本次确认范围：{_escape('、'.join(scopes))}（授权版本 "
+        f"v{AUTHORIZATION_VERSION}）</p>"
+        f"<p class=\"hint\">{_escape(AUTHORIZATION_FOOTER)}</p>"
+        f"<button data-neko-action=\"{ACTION_AUTH_CONFIRM}\">确认授权</button>"
+        f"<button data-neko-action=\"{ACTION_AUTH_CANCEL}\">暂不授权</button>"
+        "</section>"
+    )
+
+
 def build_result_html(note: str) -> str:
     """结果态卡片：只留一句话，按钮已清掉。"""
     return f"<section><p>{_escape(note)}</p></section>"
 
 
-class AuditRecord(BaseModel):
-    """一次决定的审计行。每次决定都写一条，含 L2 的理由与模型。"""
+class AuthorizationRecord(BaseModel):
+    """用户对 L1/L2 的显式授权确认。
 
+    写在磁盘上，插件重启后恢复——恢复的不是"自动开启"：配置里
+    ``ai_judgement=false`` / ``auto_decide="off"`` 时，授权记录在手也不会有
+    任何动作。它只是避免重启把用户已经做过的确认吞掉。
+    """
+
+    version: int = AUTHORIZATION_VERSION
+    scopes: tuple[str, ...] = ()
+    confirmed_at: float = Field(default_factory=time.time)
+    confirmed_by: str = Field(default="user")
+    note: str = Field(default="")
+
+    def as_audit_text(self) -> str:
+        """审计里的授权溯源：版本 + 范围 + 谁签的字。"""
+        return f"v{self.version}:{','.join(self.scopes) or '-'} by={self.confirmed_by}"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "scopes": list(self.scopes),
+            "confirmed_time": _iso(self.confirmed_at),
+            "confirmed_by": self.confirmed_by,
+            "note": self.note,
+        }
+
+
+def load_authorization(path: Any) -> AuthorizationRecord | None:
+    """从磁盘恢复授权确认。文件不存在/读不懂/校验不过都当没有——不猜。"""
+    if path is None:
+        return None
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return AuthorizationRecord.model_validate(raw)
+    except ValidationError:
+        return None
+
+
+class AuditRecord(BaseModel):
+    """一条审计行。每次决定都写一条，含 L2 的授权溯源、模型与理由。"""
+
+    # kind = decision（一次审批决定）| authorization（一次授权确认）。
+    # 两者共用一张表：授权是决定的依据，拆开就查不到"这条自动放行凭的是什么"。
+    kind: str = Field(default="decision")
     ts: float = Field(default_factory=time.time)
     request_id: str = ""
     session_id: str = ""
     tool_summary: str = ""
     decision: str | None = Field(default=None, description="allow / deny；None = 没发决定")
-    decided_by: str = Field(description="user / ai / expired / host_timeout")
+    decided_by: str = Field(description="user / ai / expired / host_timeout；授权行为 authorization")
     model: str = Field(default="", description="给出该决定的模型；空 = 非模型决定")
     reason: str = Field(default="", description="一句话理由")
+    rule: str = Field(default="", description="命中的 L0 规则；空 = 未命中")
+    severity: str = Field(default="", description="L0 风险档")
+    authorization: str = Field(default="", description="生效中的授权溯源；空 = 未涉及授权")
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "kind": self.kind,
             "ts": self.ts,
             "time": _iso(self.ts),
             "request_id": self.request_id,
@@ -479,11 +636,16 @@ class AuditRecord(BaseModel):
             "decided_by": self.decided_by,
             "model": self.model or "-",
             "reason": self.reason,
+            "rule": self.rule or "-",
+            "severity": self.severity or "-",
+            "authorization": self.authorization or "-",
         }
 
     def as_text(self) -> str:
-        return (f"{_iso(self.ts)} | {self.decision or '无决定'} | by={self.decided_by} | "
-                f"model={self.model or '-'} | req={self.request_id} | "
+        return (f"{_iso(self.ts)} | {self.kind} | {self.decision or '无决定'} | "
+                f"by={self.decided_by} | rule={self.rule or '-'} | "
+                f"auth={self.authorization or '-'} | model={self.model or '-'} | "
+                f"req={self.request_id or '-'} | "
                 f"session={self.session_id or '无'} | {self.tool_summary} | {self.reason}")
 
 
@@ -504,6 +666,7 @@ class ApprovalGateway:
                  auto_decide_max_severity: str = "notice",
                  has_api_key: bool = False,
                  audit_path: Any = None,
+                 authorization_path: Any = None,
                  judge: Any = None) -> None:
         self._logger = logger
         self._port = int(port)
@@ -515,6 +678,9 @@ class ApprovalGateway:
         self._auto_decide_max_severity = str(auto_decide_max_severity)
         self._has_api_key = bool(has_api_key)
         self._audit_path = audit_path
+        self._authorization_path = authorization_path
+        # 用户的显式授权确认。默认 None = 没签字 → L1/L2 全不可用。
+        self._authorization = load_authorization(authorization_path)
         # 判断后端。5a 恒为 None——门控算得出来，但没有模型就不自动决定。
         self._judge = judge
         self._lock = threading.Lock()
@@ -527,6 +693,7 @@ class ApprovalGateway:
         self.stats_ai = 0
         self.stats_expired = 0
         self.stats_host_timeout = 0
+        self.stats_authorizations = 0
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
 
@@ -582,12 +749,20 @@ class ApprovalGateway:
         self._thread.start()
         self._logger.info(
             "审批服务就绪 http://127.0.0.1:{}{} 到期={}s 保留={}s "
-            "L1建议={} L2自动={} 判断后端={}",
+            "L1建议={} L2自动={} 授权={} 判断后端={}",
             self._port, HOOK_PATH, self._timeout_seconds, self._retention_seconds,
             "开" if self._l1_ready() else "关",
             self._auto_decide,
+            "已确认" if self._authorization is not None else "未确认",
             "已接入" if self._judge is not None else "未接入（5b）",
         )
+        if self._authorization is None and (self._ai_judgement
+                                            or self._auto_decide != AUTO_OFF):
+            # 配置开了但没签字：不说清楚，用户会以为已经生效了。
+            self._logger.warning(
+                "approval.ai_judgement / auto_decide 已配置，但用户尚未确认授权，"
+                "L1/L2 均不生效。调用 approval_authorize 确认授权文案后才可用",
+            )
         return True
 
     def stop(self) -> None:
@@ -605,15 +780,17 @@ class ApprovalGateway:
                     # 关服务时还挂着的请求：我们不代用户决定，只标记，
                     # 让宿主的 onFailure 策略去处理。
                     record.decided_by = DECIDED_BY_EXPIRED
+                    entry = self._write_audit_locked(record)
                     self._count_locked(record)
-                    self._write_audit_locked(record)
+                    # 关服务没有"投递"这一步，直接落盘即可。
+                    self._append_audit_file(entry)
                 record.event.set()
         self._logger.info("审批服务已关闭")
 
     # ── hook 侧 ────────────────────────────────────────────────────────────
 
     def submit(self, payload: Any, *, respond: Any = None) -> dict | None:
-        """HTTP handler 调入口：登记 → 等用户 → 回填或**不回填**。
+        """HTTP handler 调入口：登记 → 事件发生时判 L2 → 等用户 → 回填或**不回填**。
 
         返回值是「要回填给宿主的响应体」；``None`` 表示**没有决定**，
         调用方应回 503 且不带任何 decision。
@@ -639,15 +816,25 @@ class ApprovalGateway:
             request.session_id or "无", request.tool_name or "未知", record.severity,
         )
 
+        # L2 在**事件发生的那一刻**判，不是等到期（规格 §2 硬规则 4）。
+        # 放在锁外：判断后端可能慢（网络），不能堵住 resolve / HUD / 建卡。
+        self._maybe_auto_allow(record)
+
         record.event.wait(timeout=self._timeout_seconds)
 
         with self._lock:
             if record.decided_by is None:
-                self._settle_at_expiry(record)
+                # 到期：**只标记，不发任何决定、不记成拒绝**（规格 §2 硬规则 1）。
+                # 拦住这次调用的是宿主自己的 onFailure:"block"，不是我们的判断。
+                self._mark_expired_locked(record)
 
-        # 先投递再记账：投递失败要把 decided_by 改成 host_timeout，
-        # 而审计必须反映**最终**状态——先写审计再投递的话，
-        # 审计里会留着一条"已允许"，实际却没送到。
+        # 审计行进内存必须**早于**投递：客户端一收到回填就可能来查审计，
+        # "先回客户端后记账"会让 audit_rows() 偶发少一行——实测 CI seed 下
+        # 约 1/4 概率红一次。落盘则必须晚于投递：host_timeout 是投递失败才
+        # 知道的，JSONL 是追加写的，只能写最终状态。
+        with self._lock:
+            entry = self._write_audit_locked(record)
+
         result = self._response_for(record)
         if respond is not None:
             try:
@@ -663,38 +850,101 @@ class ApprovalGateway:
                 self.note_host_timeout(request.request_id)
 
         with self._lock:
+            # 计数只按**最终**状态记一次：投递失败时这条不算"已允许"。
             self._count_locked(record)
-            self._write_audit_locked(record)
+            self._append_audit_file(entry)
             # **不删记录**：过期条目要留在 _records 里供 pending_list 事后查，
             # 由 _prune_locked 按保留期统一清理。删在这里就等于"过期即消失"，
             # 而那正是审计最需要看到的几条。
         return result
 
-        result = self._response_for(record)
-        if respond is not None:
-            try:
-                respond(result)
-            except (ConnectionError, TimeoutError) as exc:
-                # 连接类失败一律算"没送达"：Windows 上客户端提前离开时抛的是
-                # ConnectionAbortedError(10053)，它**不是** BrokenPipeError 的子类，
-                # 只捕后两者会漏——实测踩过。不重试：重试等于发两条。
-                self._logger.info(
-                    "回填时连接已断开（{}），请求 {} 记为 host_timeout，未送达",
-                    type(exc).__name__, request.request_id,
-                )
-                self.note_host_timeout(request.request_id)
-        return result
+    # ── L2 自动放行（事件发生时；规格 §2 硬规则 2/3/4） ─────────────────────
+
+    def _maybe_auto_allow(self, record: PendingApproval) -> bool:
+        """门控 + 后端都过，才替用户点一次"允许"。返回是否自动放行了。
+
+        **永不 auto-deny**：后端说 deny 也不代用户拒绝，照样把卡片摆出来让人点。
+        没授权 / 没 key / 没后端 / 后端异常 / 后端说 deny / 无效返回 → 一律不自动
+        决定，记录留给用户，走到期。也就是说：这条路只有一个可能的产出是 allow。
+        """
+        with self._lock:
+            authorization = self._authorization
+        scopes = authorization.scopes if authorization is not None else ()
+        eligible, why = auto_decide_gate(
+            rule=record.rule, severity=record.severity,
+            ai_judgement=self._ai_judgement, has_key=self._has_api_key,
+            auto_decide=self._auto_decide,
+            max_severity=self._auto_decide_max_severity,
+            authorized_scopes=scopes,
+        )
+        if not eligible:
+            # 绝大多数请求走这条（默认全关）。不打日志：每次都打就是噪音，
+            # 原因在卡片与审计里都能看到。
+            return False
+        if self._judge is None:
+            # 门控算得过但没接判断后端（5a）。**不因为门控通过就自己拍一个**——
+            # 那是插件在替用户判断。把请求留给用户，走到期。
+            self._logger.info(
+                "请求 {} 的 L2 门控通过（{}），但判断后端未接入（5b），"
+                "不自动决定，转交用户判断",
+                record.request.request_id, why,
+            )
+            return False
+
+        try:
+            verdict = self._judge(record)
+        except Exception as exc:  # noqa: BLE001  后端炸了不能炸掉审批
+            self._logger.warning(
+                "请求 {} 的 L2 判断后端异常（{}），不自动决定，转交用户判断",
+                record.request.request_id, type(exc).__name__,
+            )
+            return False
+        if not isinstance(verdict, dict) or verdict.get("decision") not in DECISIONS:
+            self._logger.warning(
+                "请求 {} 的 L2 判断没给出有效决定，不自动决定，转交用户判断",
+                record.request.request_id,
+            )
+            return False
+        if verdict["decision"] != APPROVE_ALLOW:
+            # 永不 auto-deny（规格 §2 硬规则 3）：AI 说"拒"也只是个建议，
+            # 拒绝必须由用户亲手点。
+            self._logger.info(
+                "请求 {} 的 L2 判断建议 deny，但插件永不自动拒绝，转交用户判断",
+                record.request.request_id,
+            )
+            return False
+
+        with self._lock:
+            # 用户可能在这一瞬间点了按钮——那种情况以用户为准，不覆盖。
+            if record.decided_by is not None:
+                return False
+            record.decision = APPROVE_ALLOW
+            record.decided_by = DECIDED_BY_AI
+            record.judge_model = str(verdict.get("model") or "")
+            record.judge_reason = str(verdict.get("reason") or "")
+            record.authorization = (authorization.as_audit_text()
+                                    if authorization is not None else "")
+            record.auto = True
+            # 自动放行不该再弹卡片等人点——但要发一条 blind 通知 + 一条审计。
+            # card_id 置成占位空串，timer 就不会为它建卡。
+            record.card_id = ""
+            record.event.set()
+        self._logger.warning(
+            "请求 {} 由 L2 自动放行（用户已授权 {}，模型 {}，理由 {}）",
+            record.request.request_id,
+            authorization.as_audit_text() if authorization is not None else "-",
+            record.judge_model or "-", record.judge_reason or "-",
+        )
+        return True
 
     def _response_for(self, record: PendingApproval) -> dict | None:
         """记录 → 回填体。``None`` = 没有决定，调用方回 503。"""
         if record.decided_by == DECIDED_BY_EXPIRED:
             return None
         if record.decided_by == DECIDED_BY_AI:
-            return hook_response(
-                record.decision or APPROVE_DENY,
-                message=(f"同桌猫：由 L2 自动决定（{record.judge_reason or '低风险'}），"
-                         "非你亲手点的"),
-            )
+            # L2 只可能自动 allow；且 **allow 不带 message**（deny 专属字段）。
+            # 自动放行的说明走 blind 通知、卡片与审计，不回填给宿主。
+            return hook_response(APPROVE_ALLOW)
         # message 是 deny 专属字段：allow 时带上"你拒绝了"会自相矛盾
         # （这个 bug 在端到端跑第一遍时撞见过一次，重构后又差点回来，
         #  所以有单测盯着）。
@@ -702,68 +952,24 @@ class ApprovalGateway:
             return hook_response(APPROVE_DENY, message=_user_deny_message())
         return hook_response(APPROVE_ALLOW)
 
-    def _settle_at_expiry(self, record: PendingApproval) -> None:
-        """到期时的了结。调用方必须已持有锁。
+    def _mark_expired_locked(self, record: PendingApproval) -> None:
+        """到期：只标记 expired，**不发任何决定**。调用方必须已持有锁。
 
-        顺序固定：先看 L2 门控，通过**且**有判断后端才让 AI 决定；
-        否则只标 ``expired``，**绝不发任何 decision**。
-        统计计数统一交给 ``_count_locked``，这里不碰，避免两处各加一次。
+        这里刻意不碰门控、不调判断后端——L2 的时机是事件发生的那一刻
+        （``_maybe_auto_allow``），到期时再判就等于让用户白等 570 秒。
+        到期只做一件事：把状态写成"没人决定"。
         """
-        eligible, why = auto_decide_gate(
-            rule=record.rule, severity=record.severity,
-            ai_judgement=self._ai_judgement, has_key=self._has_api_key,
-            auto_decide=self._auto_decide,
-            max_severity=self._auto_decide_max_severity,
-        )
-        if not eligible:
-            record.decided_by = DECIDED_BY_EXPIRED
-            self._logger.warning(
-                "审批到期（{}s）无人决定，插件不代你决定，请求 {} 标记 expired 且不回填"
-                "（L2 未放行：{}）",
-                self._timeout_seconds, record.request.request_id, why,
-            )
-            return
-        if self._judge is None:
-            # 门控算得过，但 5a 没接判断后端。**不因为门控通过就自己拍一个**——
-            # 那是插件在替用户判断。明确降级，留日志说明原因。
-            record.decided_by = DECIDED_BY_EXPIRED
-            self._logger.warning(
-                "请求 {} 的 L2 门控通过（{}），但判断后端未接入（5b），"
-                "降级为 expired 且不回填",
-                record.request.request_id, why,
-            )
-            return
-
-        try:
-            verdict = self._judge(record)          # 5b 接模型；异常按 expired 处理
-        except Exception as exc:  # noqa: BLE001  后端炸了不能炸掉审批
-            record.decided_by = DECIDED_BY_EXPIRED
-            self._logger.warning(
-                "请求 {} 的 L2 判断后端异常（{}），降级为 expired 且不回填",
-                record.request.request_id, type(exc).__name__,
-            )
-            return
-        if not isinstance(verdict, dict) or verdict.get("decision") not in DECISIONS:
-            record.decided_by = DECIDED_BY_EXPIRED
-            self._logger.warning(
-                "请求 {} 的 L2 判断没给出有效决定，降级为 expired 且不回填",
-                record.request.request_id,
-            )
-            return
-        record.decision = verdict["decision"]
-        record.decided_by = DECIDED_BY_AI
-        record.judge_model = str(verdict.get("model") or "")
-        record.judge_reason = str(verdict.get("reason") or "")
-        self._logger.info(
-            "请求 {} 由 L2 自动决定（{}，模型 {}，理由 {}）",
-            record.request.request_id, record.decision,
-            record.judge_model or "-", record.judge_reason,
+        record.decided_by = DECIDED_BY_EXPIRED
+        self._logger.warning(
+            "审批到期（{}s）无人决定：宿主已自行处理，本插件未做判断，"
+            "请求 {} 标记 expired 且不回填",
+            self._timeout_seconds, record.request.request_id,
         )
 
     def _count_locked(self, record: PendingApproval) -> None:
         """按最终 decided_by 记一次数。调用方必须已持有锁。
 
-        集中在一处：``_settle_at_expiry`` 里也加过计数，结果 stats_ai 永远是 0——
+        集中在一处：早期版本把计数写在各个分支里，结果 stats_ai 永远是 0——
         因为那时 if/elif 已经走完，加在分支里的计数没人执行。
         """
         if record.decided_by == DECIDED_BY_USER:
@@ -778,17 +984,34 @@ class ApprovalGateway:
         elif record.decided_by == DECIDED_BY_HOST_TIMEOUT:
             self.stats_host_timeout += 1
 
-    def _write_audit_locked(self, record: PendingApproval) -> None:
-        """每次决定都写一条审计。调用方必须已持有锁。"""
+    def _write_audit_locked(self, record: PendingApproval) -> AuditRecord:
+        """建一条审计行并放进内存，返回它。调用方必须已持有锁。
+
+        **只进内存，不落盘、不计数**：落盘要等投递结果（host_timeout 是投递
+        失败才知道的），计数要按最终状态记一次，两件事都由 submit 收尾。
+        """
         entry = AuditRecord(
+            kind="decision",
             request_id=record.request.request_id,
             session_id=record.request.session_id,
             tool_summary=record.request.tool_summary,
             decision=record.decision,
             decided_by=record.decided_by or DECIDED_BY_EXPIRED,
-            model=getattr(record, "judge_model", ""),
+            model=record.judge_model,
+            rule=record.rule,
+            severity=record.severity,
+            authorization=record.authorization,
             reason=self._audit_reason(record),
         )
+        self._audit.append(entry)
+        if len(self._audit) > AUDIT_MEMORY_LIMIT:
+            del self._audit[: len(self._audit) - AUDIT_MEMORY_LIMIT]
+        # 记在记录上：投递失败时 note_host_timeout 要能把这一条改成最终状态。
+        record.audit_entry = entry
+        return entry
+
+    def _append_audit_locked(self, entry: AuditRecord) -> None:
+        """进内存 + 落盘。调用方必须已持有锁。"""
         self._audit.append(entry)
         if len(self._audit) > AUDIT_MEMORY_LIMIT:
             del self._audit[: len(self._audit) - AUDIT_MEMORY_LIMIT]
@@ -798,10 +1021,12 @@ class ApprovalGateway:
         if record.decided_by == DECIDED_BY_USER:
             return "用户在 N.E.K.O 里点了按钮"
         if record.decided_by == DECIDED_BY_AI:
-            return getattr(record, "judge_reason", "") or "L2 自动决定"
+            return (getattr(record, "judge_reason", "")
+                    or "L2 在用户授权下自动放行（低风险）")
         if record.decided_by == DECIDED_BY_HOST_TIMEOUT:
             return "回填时连接已被宿主断开，决定未送达"
-        return "到期无人决定，插件不代判，交由宿主 onFailure 策略处理"
+        # 到期：**不许出现"拒绝"字样**——我们没拒绝，是宿主自己处理的。
+        return "到期无人决定；宿主已自行处理，本插件未做判断"
 
     def _append_audit_file(self, entry: AuditRecord) -> None:
         """审计落一份 JSONL，插件重启后仍可查。写失败只记日志，不丢内存里的那份。"""
@@ -814,12 +1039,82 @@ class ApprovalGateway:
         except OSError as exc:
             self._logger.warning("审计写入失败（{}）：{}", type(exc).__name__, exc)
 
+    # ── 显式授权（规格 §2 硬规则 2） ─────────────────────────────────────────
+
+    def grant_authorization(self, scopes: Any, *,
+                            confirmed_by: str = "user") -> AuthorizationRecord:
+        """记录用户的授权确认。**只有用户在卡片上点了「确认授权」才能走到这。**
+
+        插件自身没有任何路径调用它：没有定时任务、没有 hook、没有配置变更会
+        触发授权（``on_config_change`` 刻意不碰它，见 ``__init__.py``）。
+        """
+        clean = tuple(dict.fromkeys(
+            str(scope) for scope in (scopes or ()) if str(scope) in AUTH_SCOPES))
+        if not clean:
+            raise ValueError(f"没有可授权的范围（可用：{'/'.join(AUTH_SCOPES)}）")
+        record = AuthorizationRecord(scopes=clean, confirmed_by=confirmed_by or "user")
+        with self._lock:
+            self._authorization = record
+            self.stats_authorizations += 1
+            self._persist_authorization_locked(record)
+            self._append_audit_locked(AuditRecord(
+                kind="authorization",
+                tool_summary="授权确认",
+                decision=None,
+                decided_by=DECIDED_BY_AUTHORIZATION,
+                authorization=record.as_audit_text(),
+                reason=f"用户确认授权文案：{AUTHORIZATION_HEADLINE}",
+            ))
+        self._logger.warning(
+            "用户已确认授权：范围={} 版本=v{}。{}",
+            ",".join(clean), record.version, AUTHORIZATION_HEADLINE,
+        )
+        return record
+
+    def _persist_authorization_locked(self, record: AuthorizationRecord) -> None:
+        """授权确认落盘，重启后恢复。写失败只记日志——不影响本次生效。"""
+        if self._authorization_path is None:
+            return
+        try:
+            self._authorization_path.parent.mkdir(parents=True, exist_ok=True)
+            self._authorization_path.write_text(
+                json.dumps(record.model_dump(), ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            self._logger.warning("授权确认写入失败（{}）：{}", type(exc).__name__, exc)
+
+    def authorized_scopes(self) -> tuple[str, ...]:
+        with self._lock:
+            record = self._authorization
+        return record.scopes if record is not None else ()
+
+    def authorization_snapshot(self) -> dict[str, Any]:
+        """授权状态快照（只读）。给 status 入口和授权卡片用。"""
+        with self._lock:
+            record = self._authorization
+        if record is None:
+            return {
+                "granted": False, "version": 0, "scopes": [],
+                "confirmed_time": None, "confirmed_by": "",
+                "text": AUTHORIZATION_TEXT, "headline": AUTHORIZATION_HEADLINE,
+            }
+        snapshot = record.as_dict()
+        snapshot.update({
+            "granted": True,
+            "text": AUTHORIZATION_TEXT,
+            "headline": AUTHORIZATION_HEADLINE,
+        })
+        return snapshot
+
     def note_host_timeout(self, request_id: str) -> None:
         """投递失败：决定可能做了但没送到宿主。
 
         把 ``decided_by`` 覆盖成 ``host_timeout``——从宿主的视角看，
         这条请求**没有发生过任何决定**（它没收到），所以审计必须这么记。
         原本的决定留在 ``decision`` 字段里，人和审计都能看出"用户选了允许但没送达"。
+
+        **同时改已经写进内存的那条审计行**：它比投递更早落（见 submit 里的注释），
+        不改的话内存里会留着"by=user"，而落盘的 JSONL 是"by=host_timeout"——
+        同一份审计两种说法，比没有审计更糟。
         计数交给 ``_count_locked``，这里只改状态，避免两处各加一次。
         """
         with self._lock:
@@ -828,6 +1123,11 @@ class ApprovalGateway:
                     continue
                 if record.decided_by != DECIDED_BY_HOST_TIMEOUT:
                     record.decided_by = DECIDED_BY_HOST_TIMEOUT
+                entry = record.audit_entry
+                if entry is not None:
+                    entry.decided_by = DECIDED_BY_HOST_TIMEOUT
+                    entry.decision = record.decision
+                    entry.reason = self._audit_reason(record)
                 return
 
     def _prune_locked(self) -> None:
@@ -847,6 +1147,18 @@ class ApprovalGateway:
             fresh = [r for r in self._records.values() if r.needs_card()]
             for record in fresh:
                 record.card_id = ""      # 占位：表示"已取走，正在建"
+            return fresh
+
+    def take_auto_allowed(self) -> list[PendingApproval]:
+        """取走已自动放行、还没发过通知的记录（取走即占位，避免重复通知）。
+
+        自动放行不弹卡片，但**必须让用户知道**：看不见的放行等于后门。
+        通知由插件的 approval timer 发（push_message 是 async SDK 调用）。
+        """
+        with self._lock:
+            fresh = [r for r in self._records.values() if r.auto and not r.auto_announced]
+            for record in fresh:
+                record.auto_announced = True
             return fresh
 
     def attach_card(self, request_id: str, card_id: str) -> None:
@@ -897,10 +1209,11 @@ class ApprovalGateway:
         return "unknown"
 
     def policy_snapshot(self) -> dict[str, Any]:
-        """当前门控开关的快照。
+        """当前门控开关与授权状态的快照。
 
-        **只读**：这些值只能来自用户配置，运行期没有任何方法能改它们。
-        测试靠这一点守住规格 §2 硬规则 6「AI 不能自己给自己授权」。
+        **只读**：这些值只能来自用户配置（+ 用户在授权卡上签字），
+        运行期没有任何方法能改它们。测试靠这一点守住规格 §2 硬规则 2
+        「没有显式授权就不执行任何明确操作」。
         """
         return {
             "ai_judgement": self._ai_judgement,
@@ -908,6 +1221,7 @@ class ApprovalGateway:
             "auto_decide_max_severity": self._auto_decide_max_severity,
             "has_api_key": self._has_api_key,
             "judge_connected": self._judge is not None,
+            "authorized_scopes": list(self.authorized_scopes()),
         }
 
     def advice_state(self) -> str:
@@ -915,6 +1229,7 @@ class ApprovalGateway:
             ai_judgement=self._ai_judgement,
             has_key=self._has_api_key,
             backend_ready=self._judge is not None,
+            authorized=bool(self.authorized_scopes()),
         )
 
     def _l1_ready(self) -> bool:
@@ -966,6 +1281,7 @@ class ApprovalGateway:
             "ai": self.stats_ai,
             "expired": self.stats_expired,
             "host_timeout": self.stats_host_timeout,
+            "authorizations": self.stats_authorizations,
             "running": 1 if self.running() else 0,
         }
 

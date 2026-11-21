@@ -52,12 +52,16 @@ from .adapters.claude_code import (
 from .adapters.gateway import current_watermark, read_new_gateway_events
 from .approval import (
     APPROVE_ALLOW,
+    AUTH_SCOPES,
+    AUTHORIZATION_HEADLINE,
     AUTO_LOW_RISK_ONLY,
     AUTO_OFF,
     CARD_CSS,
     DECIDED_BY_AI,
     DECIDED_BY_USER,
     ApprovalGateway,
+    build_authorize_actions,
+    build_authorize_html,
     build_card_actions,
     build_card_html,
     build_explain_html,
@@ -117,7 +121,12 @@ class StatusReply(BaseModel):
     adapters: dict[str, str] = Field(default_factory=dict, description="各观测适配器的就绪状态")
     approval: dict[str, int] = Field(
         default_factory=dict,
-        description="审批中继状态：running / pending / allow / deny / timeout",
+        description="审批中继状态：running / pending / allow / deny / ai / expired",
+    )
+    authorization: dict | None = Field(
+        default=None,
+        description="L1/L2 授权状态：granted / scopes / version / confirmed_time。"
+                    "审批服务未运行时为 null",
     )
 
 
@@ -429,6 +438,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 section.get("auto_decide_max_severity") or "notice").strip().lower(),
             has_api_key=bool(str(section.get("api_key") or "").strip()),
             audit_path=self.data_path("audit.jsonl"),
+            authorization_path=self.data_path("authorization.json"),
         )
         if not self._approval.start():
             self._approval = None
@@ -491,12 +501,18 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
     @lifecycle(id="config_change")
     def on_config_change(self, **_):
-        """配置改了就让下一轮重新读路径与合并窗口，不等重启。"""
+        """配置改了就让下一轮重新读路径与合并窗口，不等重启。
+
+        **刻意不碰审批授权**：授权是用户在卡片上签过字的，不是配置项。
+        配置变更自动恢复/修改授权，就等于插件能自己给自己授权——
+        规格 §2 硬规则 2 明令禁止。真要撤授权，用户改配置关掉 L1/L2 即可
+        （授权记录在手，开关关着，一样不动作）。
+        """
         self._watch_paths = None
         self._transcript_adapter = None
         self._gateway_adapter = None
         self._broadcaster = None
-        self.logger.info("配置已变更，观测适配器将在下一轮重建")
+        self.logger.info("配置已变更，观测适配器将在下一轮重建（审批授权不受影响）")
         return Ok({"status": "reloaded"})
 
     # ── 配置 ───────────────────────────────────────────────────────────────
@@ -618,9 +634,39 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 await self._create_approval_card(pending)
             for pending in self._approval.settle_pending_cards():
                 await self._settle_approval_card(pending)
+            for pending in self._approval.take_auto_allowed():
+                await self._announce_auto_allow(pending)
             await self._push_hud_if_changed()
         except Exception as exc:  # noqa: BLE001  一轮失败不能杀死 timer
             self.logger.warning("审批卡片处理异常（{}）：{}", type(exc).__name__, exc)
+
+    async def _announce_auto_allow(self, pending: Any) -> None:
+        """L2 自动放行后发一条 blind 通知（规格 §2 硬规则 4）。
+
+        自动放行**不弹卡片**（要人点就失去意义），但绝不能不吭声——
+        看不见的放行等于后门。所以这里必须说清"放了什么、凭什么放的"：
+        授权溯源、模型、理由都带上，用户事后能拿 audit_list 对账。
+        """
+        request = pending.request
+        self.logger.info(
+            "L2 自动放行通知：请求 {}（{}，{}）", request.request_id,
+            pending.judge_model or "-", pending.judge_reason or "-",
+        )
+        text = (
+            f"同桌猫：已按你的授权自动放行 {request.tool_summary or request.tool_name}"
+            f"（L2 低风险，授权 {pending.authorization or '-'}，"
+            f"模型 {pending.judge_model or '-'}，理由 {pending.judge_reason or '低风险'}）"
+        )
+        try:
+            self.push_message(
+                source=SOURCE,
+                visibility=["hud"],
+                ai_behavior="blind",
+                parts=[{"type": "text", "text": text}],
+                priority=4,
+            )
+        except Exception as exc:  # noqa: BLE001  通知发不出去不影响已放行的调用
+            self.logger.warning("L2 自动放行通知发送失败（{}）：{}", type(exc).__name__, exc)
 
     async def _push_hud_if_changed(self) -> None:
         """未决数量进 HUD。**只在数量变化时发一次**——每轮都发就是刷屏。
@@ -661,6 +707,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
             subject=subject, tool_summary=body, session_id=request.session_id,
             working_directory=request.working_directory, timeout_seconds=timeout,
             advice_state=self._approval.advice_state(),
+            risk=pending.severity, rule=pending.rule,
         )
         try:
             card = await self.ctx.create_card(
@@ -686,10 +733,13 @@ class AgentDeskmatePlugin(NekoPluginBase):
             note = ("已允许，Claude Code 继续执行。" if pending.decision == APPROVE_ALLOW
                     else "已拒绝，这次调用被中止。")
         elif pending.decided_by == DECIDED_BY_AI:
-            note = f"已由 L2 自动决定：{pending.decision}（{pending.judge_reason}）"
+            # L2 只可能自动 allow。文案必须点明"凭你的授权"，不能写成插件自己的决定。
+            note = (f"已由 L2 自动放行（凭你的授权 {pending.authorization or '-'}，"
+                    f"模型 {pending.judge_model or '-'}，理由 {pending.judge_reason or '低风险'}）")
         else:
-            note = ("已过期：无人决定，插件不代你判断，本次调用交由宿主按 "
-                    "onFailure 策略处理。")
+            # 到期：只陈述事实——宿主自己处理的，我们没做判断。
+            # **不许出现"已自动拒绝"**，那是把宿主的决定安到插件头上。
+            note = "已过期：宿主已自行处理，本插件未做判断。"
         try:
             card = self.ctx.get_card(pending.card_id)
             await card.update(html=build_result_html(note), summary=note[:60], actions={})
@@ -717,7 +767,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
             return Err(SdkError("找不到这个审批请求（可能已过期并被清理）"))
         if outcome == "expired":
             # 过期卡片：不回填，明确告诉用户这条已经不算数了。
-            return Ok({"message": "这条已过期（宿主已拦截），不再回填"})
+            return Ok({"message": "这条已过期（宿主已自行处理），不再回填"})
         if outcome == "already-resolved":
             return Ok({"message": "这个请求已经决定过了"})
         return Ok({"message": "已允许" if decision == APPROVE_ALLOW else "已拒绝"})
@@ -754,6 +804,81 @@ class AgentDeskmatePlugin(NekoPluginBase):
             self.logger.warning("解释卡片更新失败（{}）：请求 {}", exc, request_id)
         return Ok(explanation)
 
+    @ui.action(id="approval_authorize", label=tr("entry.approval_authorize.name",
+                                                 default="授权确认"))
+    @plugin_entry(
+        id="approval_authorize",
+        name=tr("entry.approval_authorize.name", default="授权确认"),
+        description=tr(
+            "entry.approval_authorize.description",
+            default="L1/L2 的授权入口：弹出授权文案让用户确认（含「模型判断可能出错，"
+                    "决定由你授权并承担后果」）。用户点「确认授权」后才写入授权记录并"
+                    "审计。插件永不会自行调用它。",
+        ),
+    )
+    async def approval_authorize(self, scopes: str = "", confirm: bool = False,
+                                 _ctx: dict | None = None):
+        """授权确认。``confirm=False`` 只弹卡片，``confirm=True`` 才签字。
+
+        这是整个插件里**唯一**能打开 L1/L2 的路径，而它只能由用户在卡片上点
+        按钮触发（``data-neko-action`` → 本入口 → ``grant_authorization``）。
+        没有定时任务、hook、配置变更会走到这里——单测盯着这一点。
+        """
+        if self._approval is None:
+            return Err(SdkError("审批服务未运行"))
+        requested = [s for s in (scopes or "").replace(" ", ",").split(",") if s]
+        if requested:
+            wanted = tuple(s for s in requested if s in AUTH_SCOPES)
+            if not wanted:
+                # 传了却不合法：报错，**不许默认放成全部**——那会把没要求授权的
+                # 范围一起授出去，是静默扩权。
+                return Err(SdkError(
+                    f"没有可授权的范围（可用：{'、'.join(AUTH_SCOPES)}）"))
+        else:
+            wanted = AUTH_SCOPES
+
+        if not confirm:
+            html = build_authorize_html(scopes=wanted)
+            summary = f"授权确认：{'、'.join(wanted)}"
+            try:
+                card = await self.ctx.create_card(
+                    html=html, css=CARD_CSS, actions=build_authorize_actions(wanted),
+                    summary=summary[:80],
+                )
+                self.logger.info("授权确认卡片已弹出 {}", card.id)
+            except CardSubmissionError as exc:
+                # 卡片发不出去也要让用户看到文案本身——返回体里带全文。
+                self.logger.warning("授权卡片提交失败（{}），仅在返回体里给出文案", exc)
+            snapshot = self._approval.authorization_snapshot()
+            return Ok({
+                "granted": False,
+                "message": "请在卡片上点「确认授权」；未确认前 L1/L2 均不生效。",
+                "text": snapshot["text"],
+                "headline": snapshot["headline"],
+                "scopes": list(wanted),
+            })
+
+        try:
+            record = self._approval.grant_authorization(wanted)
+        except ValueError as exc:
+            return Err(SdkError(str(exc)))
+        note = (f"已确认授权：{'、'.join(record.scopes)}（版本 v{record.version}）。"
+                f"{AUTHORIZATION_HEADLINE}")
+        if _ctx and _ctx.get("card_id"):
+            try:
+                card = self.ctx.get_card(_ctx["card_id"],
+                                         target_lanlan=_ctx.get("lanlan_name"))
+                await card.update(html=build_result_html(note), summary=note[:60],
+                                  actions={})
+            except (CardSubmissionError, KeyError) as exc:
+                self.logger.warning("授权结果卡片更新失败（{}）", exc)
+        return Ok({
+            "granted": True,
+            "message": note,
+            "scopes": list(record.scopes),
+            "version": record.version,
+        })
+
     # ── 入口 ───────────────────────────────────────────────────────────────
 
     @plugin_entry(
@@ -784,6 +909,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 "gateway_metadata": "ready",
             },
             approval=self._approval.stats() if self._approval is not None else {"running": 0},
+            authorization=(self._approval.authorization_snapshot()
+                           if self._approval is not None else None),
         )
 
     @plugin_entry(

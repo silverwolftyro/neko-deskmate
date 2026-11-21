@@ -1,11 +1,12 @@
-"""approval.py 审批中继单测（M0-lite-5 / 5a 三层门控）。
+"""approval.py 审批中继单测（M0-lite-5 / 5a 三层门控 + 显式授权）。
 
-核心契约：**插件永不代替用户做判断。**
+核心契约：**插件永不代替用户做判断，除非用户显式授权；而授权也换不来 auto-deny。**
 
 - 用户点了 → 回填 allow/deny（decided_by=user）
-- 到期没人点 → 只标 ``expired``，**不发任何 decision**（宿主的 onFailure 兜底）
+- 到期没人点 → 只标 ``expired``，**不发任何 decision、不记成拒绝**
 - 连接被宿主断开 → 记 ``host_timeout``，**不发任何 decision**
-- L2 自动决定 → 必须门控全过 + 有判断后端，且留可审计记录
+- L2 自动放行 → 只在事件发生那一刻，且必须已授权；**只可能 allow**
+- 没授权 / 没 key / 没后端 / 后端说 deny / 后端异常 → 一律不自动决定
 
 全部用真实 HTTP 客户端打真实 socket——用假 socket 验不了"连接断开"这类事。
 """
@@ -24,25 +25,36 @@ import pytest
 
 from plugin.plugins.agent_deskmate.approval import (
     ACTION_APPROVE,
+    ACTION_AUTH_CANCEL,
+    ACTION_AUTH_CONFIRM,
     ACTION_DENY,
     ACTION_EXPLAIN,
     APPROVE_ALLOW,
     APPROVE_DENY,
+    AUTH_SCOPE_ADVICE,
+    AUTH_SCOPE_AUTO,
+    AUTH_SCOPES,
+    AUTHORIZATION_HEADLINE,
     AUTO_LOW_RISK_ONLY,
     AUTO_OFF,
     DECIDED_BY_AI,
+    DECIDED_BY_AUTHORIZATION,
     DECIDED_BY_EXPIRED,
     DECIDED_BY_HOST_TIMEOUT,
     DECIDED_BY_USER,
+    ENTRY_AUTHORIZE,
     ENTRY_DECIDE,
     ENTRY_EXPLAIN,
     HOOK_PATH,
     ApprovalGateway,
     ApprovalRequest,
+    AuthorizationRecord,
     PendingApproval,
     advice_state,
     assess_risk,
     auto_decide_gate,
+    build_authorize_actions,
+    build_authorize_html,
     build_card_actions,
     build_card_html,
     build_explain_html,
@@ -50,6 +62,7 @@ from plugin.plugins.agent_deskmate.approval import (
     build_result_html,
     explain_request,
     hook_response,
+    load_authorization,
     no_decision_response,
 )
 
@@ -84,6 +97,28 @@ class ListLogger:
         self._log("error", message, *args)
 
 
+class _Port:
+    """可变端口号。
+
+    ``_free_port()`` 只是"当时没人绑"，到真正 bind 之间有个窗口：上个用例刚关的
+    socket 可能还占着这个号，OS 也可能把它分给别的连接。那种偶发失败跟被测代码
+    无关（实测 CI seed 下会红），所以 ``_gateway`` 绑不上时换一个端口重试，
+    并把这个对象的值一起改掉——调用方持有的是同一个对象，不用跟着动。
+    """
+
+    def __init__(self, value: int) -> None:
+        self.value = int(value)
+
+    def __int__(self) -> int:
+        return self.value
+
+    def __index__(self) -> int:
+        return self.value
+
+    def __repr__(self) -> str:
+        return f"_Port({self.value})"
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -91,33 +126,28 @@ def _free_port() -> int:
 
 
 @pytest.fixture()
-def port() -> int:
-    """每个用例一个空闲端口。固定端口会在并行/重跑间撞车。"""
-    return _free_port()
+def port() -> _Port:
+    """每个用例一个空闲端口（可能被 _gateway 换掉，以 gateway.port 为准）。"""
+    return _Port(_free_port())
 
 
-def _gateway_any_port(timeout: float, **kwargs):
-    """起一个网关，端口被别人抢了就换一个再试。
+def _gateway(port, timeout: float = 5.0, **kwargs) -> ApprovalGateway:
+    """起一个网关。端口被别人抢了就换一个再试，并同步改调用方那个 _Port。
 
     ``_free_port()`` 只是"当时没人绑"，到真正 bind 之间有个窗口；
     上一个用例刚关的 socket 也可能让这个端口处于 TIME_WAIT。
     那种偶发失败跟被测代码无关，重试比让它红更有意义。
     """
     last = None
-    for _ in range(5):
-        candidate = _free_port()
+    for candidate in (int(port), *(_free_port() for _ in range(4))):
         gateway = ApprovalGateway(ListLogger(), port=candidate,
                                   timeout_seconds=timeout, **kwargs)
         if gateway.start():
-            return gateway, candidate
+            if isinstance(port, _Port):
+                port.value = candidate      # 换过端口：让调用方也拿到新的
+            return gateway
         last = gateway
     raise AssertionError(f"换了 5 个端口都绑不上，最后一个：{last}")
-
-
-def _gateway(port: int, timeout: float = 5.0, **kwargs) -> ApprovalGateway:
-    gateway = ApprovalGateway(ListLogger(), port=port, timeout_seconds=timeout, **kwargs)
-    assert gateway.start() is True, f"端口 {port} 绑不上"
-    return gateway
 
 
 def _wait_for_pending(gateway: ApprovalGateway, timeout: float = 15.0) -> None:
@@ -134,21 +164,21 @@ def _wait_for_pending(gateway: ApprovalGateway, timeout: float = 15.0) -> None:
     raise AssertionError(f"审批请求在 {timeout}s 内没有挂上")
 
 
-def _post(port: int, payload: dict, path: str = HOOK_PATH, timeout: float = 30.0):
+def _post(port, payload: dict, path: str = HOOK_PATH, timeout: float = 30.0):
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}", data=body,
+        f"http://127.0.0.1:{int(port)}{path}", data=body,
         headers={"Content-Type": "application/json"}, method="POST",
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.status, json.loads(response.read().decode("utf-8"))
 
 
-def _post_status(port: int, payload: dict, timeout: float = 30.0) -> tuple[int, dict]:
+def _post_status(port, payload: dict, timeout: float = 30.0) -> tuple[int, dict]:
     """发请求并原样拿回状态码——503 会抛 HTTPError，这里替调用方接住。"""
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}{HOOK_PATH}", data=body,
+        f"http://127.0.0.1:{int(port)}{HOOK_PATH}", data=body,
         headers={"Content-Type": "application/json"}, method="POST",
     )
     try:
@@ -240,18 +270,22 @@ def test_assess_risk_ignores_non_bash_tools() -> None:
 
 # ── 三层门控（规格 §1） ─────────────────────────────────────────────────────
 
+# 已签字的授权范围：L2 相关用例默认带上它，单独验"没授权"的用例再显式去掉。
+SIGNED = AUTH_SCOPES
+
+
 def test_gate_defaults_to_closed() -> None:
     """默认全关：auto_decide=off 时其余参数怎么设都不放行。"""
     assert auto_decide_gate(rule="", severity="notice", ai_judgement=True,
                             has_key=True, auto_decide=AUTO_OFF,
-                            max_severity="notice")[0] is False
+                            max_severity="notice", authorized_scopes=SIGNED)[0] is False
 
 
 def test_gate_requires_l1_first() -> None:
     """不能跳级：没开 ai_judgement 就没有解释能力，此时自动决定是黑箱代办。"""
     eligible, why = auto_decide_gate(rule="", severity="notice", ai_judgement=False,
                                      has_key=True, auto_decide=AUTO_LOW_RISK_ONLY,
-                                     max_severity="notice")
+                                     max_severity="notice", authorized_scopes=SIGNED)
     assert eligible is False
     assert "ai_judgement" in why
 
@@ -259,17 +293,32 @@ def test_gate_requires_l1_first() -> None:
 def test_gate_requires_a_key() -> None:
     eligible, why = auto_decide_gate(rule="", severity="notice", ai_judgement=True,
                                      has_key=False, auto_decide=AUTO_LOW_RISK_ONLY,
-                                     max_severity="notice")
+                                     max_severity="notice", authorized_scopes=SIGNED)
     assert eligible is False
     assert "api_key" in why
 
 
+def test_gate_requires_an_explicit_authorization() -> None:
+    """规格 §2 硬规则 2：配置全开也不够，用户必须在授权入口签过字。
+
+    这是"没有显式授权就不执行任何明确操作"的机械保证——光写配置不生效。
+    """
+    for scopes in ((), (AUTH_SCOPE_ADVICE,), (AUTH_SCOPE_AUTO,)):
+        eligible, why = auto_decide_gate(
+            rule="", severity="notice", ai_judgement=True, has_key=True,
+            auto_decide=AUTO_LOW_RISK_ONLY, max_severity="notice",
+            authorized_scopes=scopes)
+        assert eligible is False, f"授权范围 {scopes} 居然放行了"
+        assert "授权" in why
+
+
 def test_gate_excludes_delete_forever() -> None:
-    """删除类永远不进 L2，无论阈值怎么设。"""
+    """删除类永远不进 L2，无论阈值怎么设、授权多全。"""
     for max_severity in ("info", "notice", "warn", "critical"):
         eligible, why = auto_decide_gate(
             rule="delete", severity="critical", ai_judgement=True, has_key=True,
-            auto_decide=AUTO_LOW_RISK_ONLY, max_severity=max_severity)
+            auto_decide=AUTO_LOW_RISK_ONLY, max_severity=max_severity,
+            authorized_scopes=SIGNED)
         assert eligible is False, f"阈值 {max_severity} 居然放行了删除类"
         assert "永不进入 L2" in why
 
@@ -277,23 +326,28 @@ def test_gate_excludes_delete_forever() -> None:
 def test_gate_respects_the_severity_threshold() -> None:
     eligible, why = auto_decide_gate(rule="", severity="warn", ai_judgement=True,
                                      has_key=True, auto_decide=AUTO_LOW_RISK_ONLY,
-                                     max_severity="notice")
+                                     max_severity="notice", authorized_scopes=SIGNED)
     assert eligible is False
     assert "超过阈值" in why
 
 
-def test_gate_opens_when_all_four_hold() -> None:
+def test_gate_opens_when_all_five_hold() -> None:
     eligible, why = auto_decide_gate(rule="", severity="notice", ai_judgement=True,
                                      has_key=True, auto_decide=AUTO_LOW_RISK_ONLY,
-                                     max_severity="notice")
+                                     max_severity="notice", authorized_scopes=SIGNED)
     assert eligible is True
     assert why == "L2 门控通过"
 
 
 def test_advice_state_degrades_without_silently_succeeding() -> None:
     """四种状态都不许假装成功。"""
-    assert advice_state(ai_judgement=False, has_key=False, backend_ready=False) == "disabled"
-    assert advice_state(ai_judgement=True, has_key=False, backend_ready=False) == "no_key"
+    assert advice_state(ai_judgement=False, has_key=False,
+                        backend_ready=False) == "disabled"
+    # 配置开了但没签字：必须说"未授权"，不能显示成"没有 key"——那是两件事
+    assert advice_state(ai_judgement=True, has_key=True,
+                        backend_ready=False, authorized=False) == "unauthorized"
+    assert advice_state(ai_judgement=True, has_key=False,
+                        backend_ready=False) == "no_key"
     assert advice_state(ai_judgement=True, has_key=True,
                         backend_ready=False) == "pending_backend"
     assert advice_state(ai_judgement=True, has_key=True, backend_ready=True) == "ready"
@@ -377,7 +431,10 @@ def test_expiry_sends_no_decision(port: int) -> None:
         assert status == 503                       # 非 2xx → 宿主按失败策略处理
         assert "hookSpecificOutput" not in body    # **没有任何 decision**
         assert body["reason"] == "no_decision"
-        assert "不代你决定" in body["message"]
+        # 文案只写「宿主已自行处理，本插件未做判断」，不写"拒绝"
+        assert "宿主已自行处理" in body["message"]
+        assert "本插件未做判断" in body["message"]
+        assert "拒绝" not in body["message"]
 
         rows = gateway.audit_rows()
         assert len(rows) == 1
@@ -385,6 +442,52 @@ def test_expiry_sends_no_decision(port: int) -> None:
         assert rows[0]["decision"] is None         # 审计里也记"没发决定"
         assert gateway.stats()["expired"] == 1
         assert gateway.undecided_count() == 0
+    finally:
+        gateway.stop()
+
+
+def test_audit_row_exists_the_moment_the_client_gets_its_answer(port: int) -> None:
+    """客户端一收到回填，审计行就必须已经在内存里。
+
+    曾经的顺序是"先投递、后记账"，于是 `_post_status()` 返回后立刻读
+    ``audit_rows()`` 会偶发少一行——实测 CI seed 下约 1/4 概率红一次。
+    这不是测试写法问题，是产品语义问题：用户刚点的决定却查不到，像丢了。
+    所以审计行进内存必须早于投递；只有**落盘**要等投递结果
+    （``host_timeout`` 是投递失败才知道的，JSONL 是追加写的）。
+    """
+    gateway = _gateway(port, timeout=0.3, audit_path=None)
+    try:
+        status, _ = _post_status(port, PAYLOAD)
+        assert status == 503
+        # 不做任何等待：返回的这一刻就必须查得到
+        rows = gateway.audit_rows()
+        assert len(rows) == 1, f"回填已送达但审计行还没落：{rows}"
+        assert rows[0]["decided_by"] == DECIDED_BY_EXPIRED
+    finally:
+        gateway.stop()
+
+
+def test_expiry_audit_never_says_deny(port: int, tmp_path: Path) -> None:
+    """规格 §2 硬规则 1：到期**不记录成「已拒绝」**。
+
+    审计是最容易被误读的地方——一旦某行写着 deny，事后就说不清
+    "是用户拒的还是插件拒的"。所以整份审计文本里都不许出现拒绝字样。
+    """
+    audit = tmp_path / "audit.jsonl"
+    gateway = _gateway(port, timeout=0.3, audit_path=audit)
+    try:
+        _post_status(port, PAYLOAD)
+        row = gateway.audit_rows()[0]
+        assert row["decision"] is None
+        assert row["decided_by"] == DECIDED_BY_EXPIRED
+        text = gateway.audit_text()
+        assert "deny" not in text
+        assert "拒绝" not in text
+        assert "无决定" in text          # 明写"没有决定"，不是"决定为拒绝"
+        # 落盘的 JSONL 同样不能有
+        written = audit.read_text(encoding="utf-8")
+        assert "deny" not in written
+        assert "拒绝" not in written
     finally:
         gateway.stop()
 
@@ -441,13 +544,12 @@ def test_expired_card_button_is_refused(port: int) -> None:
 def test_delete_never_auto_decides_even_with_l2_open(port: int) -> None:
     """规格 §2 硬规则 3：删除类永远不走 L2。
 
-    就算用户把 L2 全开、阈值调到最高，删除类命中后到期仍然只标 expired。
+    就算用户把 L2 全开、签了字、阈值调到最高，删除类命中后仍然只标 expired
+    ——而且到期是"没决定"，不是"自动拒绝"。
     """
-    gateway = _gateway(port, timeout=0.3, ai_judgement=True, has_api_key=True,
-                       auto_decide=AUTO_LOW_RISK_ONLY,
-                       auto_decide_max_severity="critical",
-                       judge=lambda record: {"decision": "allow", "model": "m",
-                                             "reason": "低风险"})
+    gateway = _l2_gateway(port, lambda r: {"decision": "allow", "model": "m",
+                                          "reason": "低风险"},
+                          auto_decide_max_severity="critical")
     try:
         status, body = _post_status(port, PAYLOAD)
         assert status == 503
@@ -460,13 +562,11 @@ def test_delete_never_auto_decides_even_with_l2_open(port: int) -> None:
 
 
 def test_l2_gate_open_without_backend_still_refuses(port: int) -> None:
-    """门控算得过但没接判断后端（5a）→ 降级 expired，不自己拍一个。
+    """门控算得过但没接判断后端（5a）→ 不自动决定，转交用户。
 
     这正是"插件不许因为门控通过就替用户判断"的机械保证。
     """
-    gateway = _gateway(port, timeout=0.3, ai_judgement=True, has_api_key=True,
-                       auto_decide=AUTO_LOW_RISK_ONLY,
-                       auto_decide_max_severity="notice")
+    gateway = _l2_gateway(port, None)
     try:
         payload = dict(PAYLOAD, tool_input={"command": "ls -la"})
         status, body = _post_status(port, payload)
@@ -475,21 +575,45 @@ def test_l2_gate_open_without_backend_still_refuses(port: int) -> None:
         rows = gateway.audit_rows()
         assert rows[0]["decided_by"] == DECIDED_BY_EXPIRED
         assert rows[0]["decision"] is None
-        assert any("判断后端未接入" in message for _, message in gateway._logger.lines)
+        assert any("不自动决定" in message for _, message in gateway._logger.lines)
     finally:
         gateway.stop()
 
 
-# ── L2 自动决定（5b 的接缝；5a 用假后端验通路） ────────────────────────────
+def test_l2_needs_authorization_before_it_fires(port: int) -> None:
+    """配置全开 + 后端就绪，但用户没签字 → 依然不自动决定。
+
+    这是"没有显式授权就不执行任何明确操作"的端到端版本：单测里把授权去掉，
+    其余条件全部满足，看它是否仍然什么都不做。
+    """
+    gateway = _l2_gateway(port, lambda r: {"decision": "allow", "model": "m",
+                                          "reason": "低风险"},
+                          authorize=False)
+    try:
+        status, body = _post_status(port, _low_risk_payload())
+        assert status == 503
+        assert "hookSpecificOutput" not in body
+        assert gateway.audit_rows()[0]["decided_by"] == DECIDED_BY_EXPIRED
+        assert gateway.stats()["ai"] == 0
+    finally:
+        gateway.stop()
+
+
+# ── L2 自动放行（5b 的接缝；5a 用假后端验通路） ────────────────────────────
 
 def _low_risk_payload() -> dict:
     return dict(PAYLOAD, tool_input={"command": "ls -la"})
 
 
-def _l2_gateway(port: int, judge) -> ApprovalGateway:
-    return _gateway(port, timeout=0.4, ai_judgement=True, has_api_key=True,
-                    auto_decide=AUTO_LOW_RISK_ONLY,
-                    auto_decide_max_severity="notice", judge=judge)
+def _l2_gateway(port: int, judge, *, authorize: bool = True,
+                auto_decide_max_severity: str = "notice",
+                timeout: float = 0.4) -> ApprovalGateway:
+    gateway = _gateway(port, timeout=timeout, ai_judgement=True, has_api_key=True,
+                       auto_decide=AUTO_LOW_RISK_ONLY,
+                       auto_decide_max_severity=auto_decide_max_severity, judge=judge)
+    if authorize:
+        gateway.grant_authorization(AUTH_SCOPES)
+    return gateway
 
 
 def test_l2_auto_allow_is_audited_with_model_and_reason(port: int) -> None:
@@ -499,35 +623,99 @@ def test_l2_auto_allow_is_audited_with_model_and_reason(port: int) -> None:
     try:
         status, body = _post_status(port, _low_risk_payload())
         assert status == 200
-        assert body["hookSpecificOutput"]["decision"]["behavior"] == "allow"
-        assert "非你亲手点的" in body["hookSpecificOutput"]["decision"]["message"]
+        decision = body["hookSpecificOutput"]["decision"]
+        assert decision["behavior"] == "allow"
+        # allow 不带 message（官方 schema：message/interrupt 是 deny 专属字段）
+        assert "message" not in decision
 
         row = gateway.audit_rows()[0]
         assert row["decided_by"] == DECIDED_BY_AI
         assert row["decision"] == "allow"
         assert row["model"] == "deepseek-chat"
         assert row["reason"] == "只读命令，无副作用"
+        # 授权溯源必须能在审计里查到：谁授权的、授权到什么范围、哪个版本
+        assert "ai_judgement" in row["authorization"]
+        assert "auto_decide" in row["authorization"]
+        assert "v1" in row["authorization"]
         assert gateway.stats()["ai"] == 1
     finally:
         gateway.stop()
 
 
-def test_l2_auto_deny_is_audited(port: int) -> None:
-    gateway = _l2_gateway(port, lambda r: {"decision": "deny", "model": "m",
-                                           "reason": "看起来在动不该动的东西"})
+def test_l2_decides_at_event_time_not_at_expiry(port: int) -> None:
+    """规格 §2 硬规则 4：事件发生那一刻就判，不让用户白等 570 秒。
+
+    用 8 秒的到期窗口：如果实现是"等到期才判"，这个用例会等满 8 秒才回填，
+    耗时直接暴露它。判定条件用耗时而不是等待循环，flaky 更低。
+    """
+    gateway = _l2_gateway(port, lambda r: {"decision": "allow", "model": "m",
+                                          "reason": "低风险"}, timeout=8.0)
     try:
-        _, body = _post_status(port, _low_risk_payload())
-        assert body["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+        started = time.monotonic()
+        status, _ = _post_status(port, _low_risk_payload(), timeout=30.0)
+        elapsed = time.monotonic() - started
+        assert status == 200
+        assert elapsed < 3.0, f"自动放行花了 {elapsed:.1f}s，像是等到期才判的"
+    finally:
+        gateway.stop()
+
+
+def test_l2_never_auto_denies(port: int) -> None:
+    """规格 §2 硬规则 3：L2 只可能 auto-allow，**永不 auto-deny**。
+
+    后端说 deny 也只是个建议：插件不代用户拒绝，把卡片摆出来让人亲手点。
+    """
+    gateway = _l2_gateway(port, lambda r: {"decision": "deny", "model": "m",
+                                          "reason": "看起来在动不该动的东西"},
+                          timeout=30.0)
+    try:
+        result: dict = {}
+        thread = threading.Thread(
+            target=lambda: result.update(response=_post(port, _low_risk_payload())),
+            daemon=True)
+        thread.start()
+        # 没有自动回填：请求应该还挂着等用户
+        _wait_for_pending(gateway)
+        assert gateway.undecided_count() == 1
+        assert not result, "后端说 deny，插件却自己回填了"
+        pending = _only_pending(gateway)
+        gateway.resolve(pending.request.request_id, APPROVE_DENY)
+        thread.join(timeout=10)
+
+        decision = result["response"][1]["hookSpecificOutput"]["decision"]
+        assert decision["behavior"] == "deny"
         row = gateway.audit_rows()[0]
-        assert row["decided_by"] == DECIDED_BY_AI
-        assert row["decision"] == "deny"
+        # 是用户点的 deny，不是 AI 代决的 deny
+        assert row["decided_by"] == DECIDED_BY_USER
+        assert gateway.stats()["ai"] == 0
+    finally:
+        gateway.stop()
+
+
+def test_l2_auto_allow_does_not_pop_a_card(port: int) -> None:
+    """自动放行不弹卡片——要人点就失去意义。
+
+    但它必须留下一条可通知的记录（``take_auto_allowed``），否则用户根本看不见
+    放过什么。看不见的放行等于后门。
+    """
+    gateway = _l2_gateway(port, lambda r: {"decision": "allow", "model": "m",
+                                          "reason": "低风险"})
+    try:
+        status, _ = _post_status(port, _low_risk_payload())
+        assert status == 200
+        assert gateway.take_new() == []                 # 不建卡
+        assert gateway.undecided_count() == 0
+        auto = gateway.take_auto_allowed()
+        assert len(auto) == 1
+        assert auto[0].judge_model == "m"
+        assert gateway.take_auto_allowed() == []        # 只通知一次
     finally:
         gateway.stop()
 
 
 @pytest.mark.parametrize("bad", [None, {}, {"decision": "也许吧"}, "不是dict"])
 def test_l2_invalid_verdict_falls_back_to_expired(port: int, bad: object) -> None:
-    """判断后端给出无效决定 → 降级 expired，绝不猜一个。"""
+    """判断后端给出无效决定 → 不自动决定，请求留给用户，走到期。"""
     gateway = _l2_gateway(port, lambda r: bad)
     try:
         status, body = _post_status(port, _low_risk_payload())
@@ -541,7 +729,7 @@ def test_l2_invalid_verdict_falls_back_to_expired(port: int, bad: object) -> Non
 
 
 def test_l2_backend_explosion_falls_back_to_expired(port: int) -> None:
-    """后端抛异常不能炸掉审批——降级 expired。"""
+    """后端抛异常不能炸掉审批——不自动决定，转交用户。"""
 
     def exploding(_: PendingApproval) -> dict:
         raise RuntimeError("模型服务挂了")
@@ -557,12 +745,21 @@ def test_l2_backend_explosion_falls_back_to_expired(port: int) -> None:
 
 
 def test_user_click_beats_l2(port: int) -> None:
-    """用户点了就以用户为准——L2 只在"用户没点"时才有机会。"""
+    """用户点了就以用户为准——L2 判完之前用户就点了，不许覆盖用户的决定。
+
+    判断后端刻意放慢（等用户先点）：不这么做，"用户点"和"AI 判"谁先谁后
+    是竞态，测出来的东西不稳定。要验的正是"用户已经决定了，AI 不许翻案"。
+    """
+    clicked = threading.Event()
+
+    def slow_judge(_: PendingApproval) -> dict:
+        clicked.wait(timeout=5.0)
+        return {"decision": "allow", "model": "m", "reason": "低风险"}
+
     gateway = _gateway(port, timeout=30.0, ai_judgement=True, has_api_key=True,
                        auto_decide=AUTO_LOW_RISK_ONLY,
-                       auto_decide_max_severity="notice",
-                       judge=lambda r: {"decision": "deny", "model": "m",
-                                        "reason": "不该放"})
+                       auto_decide_max_severity="notice", judge=slow_judge)
+    gateway.grant_authorization(AUTH_SCOPES)
     try:
         result: dict = {}
         thread = threading.Thread(
@@ -570,12 +767,14 @@ def test_user_click_beats_l2(port: int) -> None:
             daemon=True)
         thread.start()
         pending = _only_pending(gateway)
-        gateway.resolve(pending.request.request_id, APPROVE_ALLOW)
+        gateway.resolve(pending.request.request_id, APPROVE_DENY)
+        clicked.set()
         thread.join(timeout=10)
 
         behavior = result["response"][1]["hookSpecificOutput"]["decision"]["behavior"]
-        assert behavior == "allow"
+        assert behavior == "deny"
         assert gateway.audit_rows()[0]["decided_by"] == DECIDED_BY_USER
+        assert gateway.stats()["ai"] == 0
     finally:
         gateway.stop()
 
@@ -625,7 +824,7 @@ def test_real_disconnect_does_not_kill_the_server(port: int) -> None:
     """
     gateway = _gateway(port, timeout=30.0)
     try:
-        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        sock = socket.create_connection(("127.0.0.1", int(port)), timeout=10)
         body = json.dumps(PAYLOAD).encode("utf-8")
         sock.sendall(
             b"POST " + HOOK_PATH.encode() + b" HTTP/1.1\r\n"
@@ -641,7 +840,7 @@ def test_real_disconnect_does_not_kill_the_server(port: int) -> None:
         assert gateway.running() is True
         assert gateway.undecided_count() == 0
         # 服务还活着：还能接受新连接（不必走完整审批回路，那条上面已验过）
-        with socket.create_connection(("127.0.0.1", port), timeout=5):
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=5):
             pass
     finally:
         gateway.stop()
@@ -751,7 +950,7 @@ def test_bad_json_is_400(port: int) -> None:
     gateway = _gateway(port)
     try:
         request = urllib.request.Request(
-            f"http://127.0.0.1:{port}{HOOK_PATH}",
+            f"http://127.0.0.1:{int(port)}{HOOK_PATH}",
             data=b"{ this is not json",
             headers={"Content-Type": "application/json"}, method="POST",
         )
@@ -834,11 +1033,33 @@ def test_card_html_has_all_four_blocks() -> None:
     assert f'data-neko-action="{ACTION_APPROVE}"' in html
     assert f'data-neko-action="{ACTION_DENY}"' in html
     assert f'data-neko-action="{ACTION_EXPLAIN}"' in html
-    # 4) 超时说明：说清"宿主自行拦截、视为未决定"，不写"已自动拒绝"
-    assert "宿主会自行拦截" in html
+    # 4) 超时说明：说清"宿主自行处理、视为未决定"，不写"已自动拒绝"
+    assert "宿主会自行处理" in html
     assert "视为未决定" in html
     assert "插件不代你判断" in html
     assert "自动拒绝" not in html
+
+
+def test_card_highlights_high_risk_in_red() -> None:
+    """规格 §2 硬规则 3：critical / 删除类 / 危险写 → 标红 + 明说不自动放行。"""
+    # 删除类：规则命中就要红，哪怕 severity 参数没给
+    html = build_card_html(subject="claude-code", tool_summary="Bash: rm -rf x",
+                           session_id="s", working_directory=None,
+                           timeout_seconds=570, risk="notice", rule="delete")
+    assert 'class="risk"' in html
+    assert "必须由你亲自点允许或拒绝" in html
+
+    # critical 但没命中已知规则（危险写等 M0-lite-3b 落地后会补规则）
+    html = build_card_html(subject="claude-code", tool_summary="Write: /etc/hosts",
+                           session_id="s", working_directory=None,
+                           timeout_seconds=570, risk="critical", rule="")
+    assert 'class="risk"' in html
+
+    # 低风险不红：不能把所有卡片都标成高风险，那样红色就没有信息量了
+    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
+                           session_id="s", working_directory=None,
+                           timeout_seconds=570, risk="notice", rule="")
+    assert 'class="risk"' not in html
 
 
 def test_card_degraded_advice_when_no_key() -> None:
@@ -849,6 +1070,20 @@ def test_card_degraded_advice_when_no_key() -> None:
     assert "未配置 key，无法给出建议" in html
     assert "建议：" not in html          # 没有假建议
     assert "理由" not in html
+
+
+def test_card_advice_blocked_without_authorization() -> None:
+    """配置开了但用户没签字：必须说"未确认授权"，并指路授权入口。
+
+    不能显示成"没有 key"——那是另一件事，混起来用户不知道该去哪补。
+    """
+    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
+                           session_id="s", working_directory=None,
+                           timeout_seconds=570, advice_state="unauthorized")
+    assert "未确认授权" in html
+    assert "approval_authorize" in html
+    assert "建议：" not in html
+    assert "未配置 key" not in html
 
 
 def test_card_advice_placeholder_when_key_present() -> None:
@@ -893,11 +1128,11 @@ def test_card_escapes_agent_supplied_text() -> None:
 
 
 def test_result_card_says_expired_not_auto_denied() -> None:
-    note = ("已过期：无人决定，插件不代你判断，本次调用交由宿主按 "
-            "onFailure 策略处理。")
+    note = "已过期：宿主已自行处理，本插件未做判断。"
     html = build_result_html(note)
     assert "已过期" in html
     assert "自动拒绝" not in html
+    assert "拒绝" not in html
 
 
 # ── 「这是什么」 ────────────────────────────────────────────────────────────
@@ -927,10 +1162,106 @@ def test_explain_html_escapes() -> None:
     assert "<script>" not in html
 
 
-# ── 纪律：AI 不能自己给自己授权（规格 §2 硬规则 6） ─────────────────────────
+# ── 显式授权（规格 §2 硬规则 2） ───────────────────────────────────────────
+
+def test_authorization_starts_absent() -> None:
+    """默认没签字：L1/L2 都不可用，哪怕配置全开。"""
+    gateway = ApprovalGateway(ListLogger(), port=_free_port(), ai_judgement=True,
+                              auto_decide=AUTO_LOW_RISK_ONLY, has_api_key=True)
+    assert gateway.authorized_scopes() == ()
+    snapshot = gateway.authorization_snapshot()
+    assert snapshot["granted"] is False
+    assert snapshot["scopes"] == []
+    # 文案里必须有"可能出错"和"用户担责"两句——那是用户签字前该看到的话
+    assert "模型" in snapshot["text"]
+    assert AUTHORIZATION_HEADLINE in snapshot["headline"]
+    assert gateway.advice_state() == "unauthorized"
+
+
+def test_grant_writes_an_audit_row_with_scope_and_version(tmp_path: Path) -> None:
+    """确认记录写进审计：时间、范围、授权版本（规格 §2 硬规则 2）。"""
+    gateway = ApprovalGateway(ListLogger(), port=_free_port(),
+                              authorization_path=tmp_path / "authorization.json")
+    record = gateway.grant_authorization([AUTH_SCOPE_AUTO, AUTH_SCOPE_ADVICE,
+                                          "不是合法范围"])
+    assert set(record.scopes) == set(AUTH_SCOPES)     # 非法范围被丢掉，不猜
+    assert set(gateway.authorized_scopes()) == set(AUTH_SCOPES)
+
+    rows = gateway.audit_rows()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["kind"] == "authorization"
+    assert row["decided_by"] == DECIDED_BY_AUTHORIZATION
+    assert row["decision"] is None                    # 授权不是一次审批决定
+    assert "ai_judgement" in row["authorization"]
+    assert "auto_decide" in row["authorization"]
+    assert "v1" in row["authorization"]
+    assert "承担后果" in row["reason"]
+    assert row["time"]                                # ISO 时间
+
+
+def test_authorization_survives_a_restart(tmp_path: Path) -> None:
+    """重启不吞掉用户已经做过的确认——但要靠配置开关才真正生效。"""
+    path = tmp_path / "authorization.json"
+    first = ApprovalGateway(ListLogger(), port=_free_port(),
+                            authorization_path=path)
+    first.grant_authorization(AUTH_SCOPES)
+
+    second = ApprovalGateway(ListLogger(), port=_free_port(),
+                             authorization_path=path)
+    assert second.authorized_scopes() == AUTH_SCOPES
+
+    # 授权在手，但配置关着 → 依然不动作（恢复授权 ≠ 自动开启）
+    closed = ApprovalGateway(ListLogger(), port=_free_port(),
+                             authorization_path=path,
+                             ai_judgement=False, auto_decide=AUTO_OFF)
+    assert closed.advice_state() == "disabled"
+    assert closed.policy_snapshot()["auto_decide"] == AUTO_OFF
+
+
+def test_authorization_file_is_not_a_remote_switch(tmp_path: Path) -> None:
+    """读不懂/被篡改的授权文件当没有处理，不猜、不半效。"""
+    path = tmp_path / "authorization.json"
+    path.write_text("{ 不是 json", encoding="utf-8")
+    assert load_authorization(path) is None
+    path.write_text('{"scopes": ["nonsense"], "version": 1}', encoding="utf-8")
+    record = load_authorization(path)
+    # 能解析（scopes 是合法字段），但范围不在白名单里 → 等于没授权
+    assert record is not None
+    assert not set(record.scopes) & set(AUTH_SCOPES)
+    assert load_authorization(None) is None
+    assert load_authorization(tmp_path / "missing.json") is None
+
+
+def test_grant_rejects_an_empty_scope_list() -> None:
+    gateway = ApprovalGateway(ListLogger(), port=_free_port())
+    with pytest.raises(ValueError):
+        gateway.grant_authorization([])
+    with pytest.raises(ValueError):
+        gateway.grant_authorization(["完全不相干的东西"])
+    assert gateway.authorized_scopes() == ()
+
+
+def test_authorize_card_carries_the_consent_text() -> None:
+    """授权卡片的文案是验收项：必须含"可能出错"与"用户担责"。"""
+    html = build_authorize_html(scopes=AUTH_SCOPES)
+    assert AUTHORIZATION_HEADLINE in html
+    assert "决定由你授权并承担后果" in html
+    assert "ai_judgement" in html and "auto_decide" in html
+    assert f'data-neko-action="{ACTION_AUTH_CONFIRM}"' in html
+    assert f'data-neko-action="{ACTION_AUTH_CANCEL}"' in html
+    # 两个按钮都指向授权入口，用 args 区分签不签字
+    actions = build_authorize_actions(AUTH_SCOPES)
+    assert set(actions) == {ACTION_AUTH_CONFIRM, ACTION_AUTH_CANCEL}
+    assert actions[ACTION_AUTH_CONFIRM]["entry"] == ENTRY_AUTHORIZE
+    assert actions[ACTION_AUTH_CONFIRM]["args"]["confirm"] is True
+    assert actions[ACTION_AUTH_CANCEL]["args"]["confirm"] is False
+
+
+# ── 纪律：没有显式授权就不动作（规格 §2 硬规则 2） ─────────────────────────
 
 def test_policy_is_read_only_at_runtime() -> None:
-    """门控开关只能来自用户配置；运行期没有任何方法能改它们。"""
+    """门控开关与授权只能来自用户配置 + 用户签字；运行期没有任何方法能改它们。"""
     gateway = ApprovalGateway(
         ListLogger(), port=_free_port(), ai_judgement=False, auto_decide=AUTO_OFF,
         auto_decide_max_severity="notice", has_api_key=False)
@@ -942,29 +1273,44 @@ def test_policy_is_read_only_at_runtime() -> None:
     gateway.snapshot()
     gateway.audit_rows()
     gateway.stats()
+    gateway.advice_state()
+    gateway.take_new()
+    gateway.take_auto_allowed()
 
     assert gateway.policy_snapshot() == before
     assert before["ai_judgement"] is False
     assert before["auto_decide"] == AUTO_OFF
+    assert before["authorized_scopes"] == []
 
 
 def test_no_method_enables_the_policy() -> None:
-    """反向守护：ApprovalGateway 上不存在能打开门控的公开方法。"""
+    """反向守护：ApprovalGateway 上不存在能自我授权/自我开门的公开方法。
+
+    ``grant_authorization`` 是唯一能写授权的方法，而它只能由用户在授权卡上点
+    按钮触发——没有定时任务、hook、配置变更会调用它（``__init__.py`` 的
+    ``on_config_change`` 刻意不碰它，另有测试盯着）。
+    """
     forbidden = {"enable_ai", "enable_auto", "set_auto_decide", "set_ai_judgement",
-                 "turn_on", "authorize"}
+                 "turn_on", "authorize", "auto_authorize", "self_authorize"}
     public = {name for name in dir(ApprovalGateway) if not name.startswith("_")}
     assert not (forbidden & public), f"出现了能自我授权的方法：{forbidden & public}"
+    # grant_authorization 必须存在（否则用户无法授权），但名字不许在禁用表里
+    assert "grant_authorization" in public
 
 
-def test_policy_snapshot_reflects_config() -> None:
-    gateway = ApprovalGateway(ListLogger(), port=_free_port(), ai_judgement=True,
-                              auto_decide=AUTO_LOW_RISK_ONLY, has_api_key=True,
-                              auto_decide_max_severity="warn")
-    assert gateway.policy_snapshot() == {
-        "ai_judgement": True, "auto_decide": AUTO_LOW_RISK_ONLY,
-        "auto_decide_max_severity": "warn", "has_api_key": True,
-        "judge_connected": False,
-    }
+def test_config_change_does_not_touch_the_authorization() -> None:
+    """on_config_change 不许恢复/修改授权——否则配置变更就能自我授权。
+
+    这条守着"插件没有运行期自行打开授权的路径"。被测代码在 __init__.py，
+    这里用源码断言而不是实例调用：要的是"这个方法里没有授权相关调用"。
+    """
+    import inspect
+
+    from plugin.plugins import agent_deskmate
+
+    source = inspect.getsource(agent_deskmate.AgentDeskmatePlugin.on_config_change)
+    for token in ("grant_authorization", "_authorization", "authorization_path"):
+        assert token not in source, f"on_config_change 里出现了 {token}"
 
 
 # ── 响应体形状 ──────────────────────────────────────────────────────────────
@@ -983,13 +1329,41 @@ def test_no_decision_response_has_no_decision() -> None:
     body = no_decision_response(reason="no_decision", timeout_seconds=570)
     assert body["ok"] is False
     assert "hookSpecificOutput" not in body
-    assert "不代你决定" in body["message"]
+    assert "宿主已自行处理" in body["message"]
+    assert "本插件未做判断" in body["message"]
+    assert "拒绝" not in body["message"]
 
 
 def test_stats_shape() -> None:
     gateway = ApprovalGateway(ListLogger(), port=_free_port())
     assert gateway.stats() == {"pending": 0, "allow": 0, "deny": 0, "ai": 0,
-                               "expired": 0, "host_timeout": 0, "running": 0}
+                               "expired": 0, "host_timeout": 0,
+                               "authorizations": 0, "running": 0}
+
+
+def test_policy_snapshot_reflects_config() -> None:
+    gateway = ApprovalGateway(ListLogger(), port=_free_port(), ai_judgement=True,
+                              auto_decide=AUTO_LOW_RISK_ONLY, has_api_key=True,
+                              auto_decide_max_severity="warn")
+    assert gateway.policy_snapshot() == {
+        "ai_judgement": True, "auto_decide": AUTO_LOW_RISK_ONLY,
+        "auto_decide_max_severity": "warn", "has_api_key": True,
+        "judge_connected": False, "authorized_scopes": [],
+    }
+    # 签字后快照要能反映出来——用户要能从 status 入口看到自己授了什么
+    gateway.grant_authorization(AUTH_SCOPES)
+    assert gateway.policy_snapshot()["authorized_scopes"] == list(AUTH_SCOPES)
+
+
+def test_authorization_record_round_trips_through_json() -> None:
+    record = AuthorizationRecord(scopes=AUTH_SCOPES, confirmed_by="user",
+                                 note="测试")
+    restored = AuthorizationRecord.model_validate(json.loads(record.model_dump_json()))
+    assert restored.scopes == AUTH_SCOPES
+    assert restored.version == 1
+    assert "v1" in restored.as_audit_text()
+    assert restored.as_dict()["scopes"] == list(AUTH_SCOPES)
+    assert restored.as_dict()["confirmed_time"]
 
 
 # ── 协作面（不需要真发 HTTP） ────────────────────────────────────────────────

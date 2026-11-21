@@ -11,8 +11,10 @@
   "entry.approval_decide.description": "Target of the approval card buttons: feeds the user's Allow/Reject back to the waiting Claude Code. Not meant to be called by hand.",
   "entry.approval_explain.name": "What is this",
   "entry.approval_explain.description": "Explains what this approval request is and what the L0 rules say about it. No model: only facts the rule layer can state.",
+  "entry.approval_authorize.name": "Grant Authorization",
+  "entry.approval_authorize.description": "Authorization gate for L1/L2: shows the consent text (including \"a model can be wrong; you authorize the decision and own the consequences\") and waits for the user to confirm. Only after the user clicks Grant is the authorization recorded and audited; the plugin never calls this itself.",
   "entry.pending_list.name": "Approval Queue",
   "entry.pending_list.description": "Returns undecided and settled-but-not-yet-pruned approvals: session, command, created time, state, decided_by. Expired entries are kept for a while.",
   "entry.audit_list.name": "Approval Audit",
-  "entry.audit_list.description": "Returns an audit row per decision: time, command, decision, decided_by (user/ai/expired), model, reason. Includes plain text for export."
+  "entry.audit_list.description": "Returns an audit row per decision: time, command, decision, decided_by (user/ai/expired/host_timeout), model, reason, plus the authorization trail behind any L2 auto-allow. Each authorization confirmation is a row of its own. Includes plain text for export."
 }
