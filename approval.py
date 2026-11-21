@@ -432,6 +432,11 @@ def no_decision_response(*, reason: str, timeout_seconds: float) -> dict:
     配 503 一起用。宿主看到非 2xx 且 ``onFailure:"block"`` 已配置，
     就会按它自己的失败策略处理（拦住这次调用）——那是宿主的决定，不是我们的。
     文案只写「宿主已自行处理，本插件未做判断」，不许出现"拒绝"字样。
+
+    **F4（2026-11-21 真机实测）**：只写上面两句时，Claude Code 把到期理解成
+    "hook 服务挂了"，反过来建议用户去查端口——用户白担心一场。所以补一句
+    人话说明"这是在等你，不是它坏了"。刻意不出现端口号、地址、
+    ``onFailure`` 这类内部词：那是给我们排查用的，写进给 CC 看的话里只会添乱。
     """
     return {
         "ok": False,
@@ -440,6 +445,8 @@ def no_decision_response(*, reason: str, timeout_seconds: float) -> dict:
         "message": (
             f"同桌猫：{timeout_seconds:g} 秒内无人决定。"
             "宿主已自行处理本次调用，本插件未做判断。"
+            "（这不是故障——同桌猫一直在等你做决定，没有代替你作答；"
+            "超时后由 Claude Code 自己接手这次权限请求。）"
         ),
     }
 

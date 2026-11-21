@@ -74,7 +74,7 @@ from .broadcast import Broadcaster, describe_actor, render_text
 from .events import UnifiedEvent, attribute, delegated_server
 from .hooksetup import (
     install_hook,
-    installed_port,
+    installed_hook,
     settings_path,
     uninstall_hook,
 )
@@ -571,7 +571,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
         的头号原因，启动时提醒比让用户自己发现好。
         """
         target = settings_path()
-        installed = installed_port(target, self.plugin_dir)
+        installed = installed_hook(target, self.plugin_dir)
         if installed is None:
             self.logger.warning(
                 "Claude Code settings 里没有装配审批中继（{} 未找到我们的 hook）。"
@@ -580,12 +580,23 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 target,
             )
             return
-        if installed != port:
+        port = installed.get("port")
+        if installed.get("kind") == "http":
+            # 残留的旧形状：既不清它也不提它，用户就完全不知情，
+            # 而那个形状在插件没开时会把该目录下所有权限请求卡死。
+            self.logger.error(
+                "{} 里残留一份过期的 http 形态审批 hook（不是现在用的 command hook）。"
+                "它在插件没启动时可能拦住你所有的权限请求——"
+                "请调一次 hook_install 入口，它会替换成 command hook 并先备份",
+                target,
+            )
+            return
+        if port != self._approval.port:
             self.logger.error(
                 "端口不一致：配置 approval.port={} 但已装配的 hook 用的是 {}。"
                 "PermissionRequest 会打到旧端口上，请重跑 hook_install 入口"
                 "（它会替换成新端口，不会多出一条）",
-                port, installed,
+                self._approval.port, port,
             )
 
     def _log_first_run_hint(self, config: dict[str, Any]) -> None:
@@ -1205,11 +1216,12 @@ class AgentDeskmatePlugin(NekoPluginBase):
     def _hook_status(self) -> dict[str, Any]:
         """审批 hook 装没装、装的是哪个端口。只读，不发起任何请求。"""
         target = settings_path()
-        port = installed_port(target, self.plugin_dir)
+        found = installed_hook(target, self.plugin_dir)
         return {
-            "installed": port is not None,
+            "installed": found is not None,
+            "kind": (found or {}).get("kind"),
             "settings_file": str(target),
-            "port": port,
+            "port": (found or {}).get("port"),
         }
 
     def _model_status(self) -> dict[str, Any]:

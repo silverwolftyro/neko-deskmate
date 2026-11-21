@@ -25,8 +25,10 @@ import pytest
 from plugin.plugins.agent_deskmate.hook_relay import HEALTH_PATH as RELAY_HEALTH_PATH
 from plugin.plugins.agent_deskmate.hooksetup import (
     EVENT_NAME,
+    HOOK_TIMEOUT_SECONDS,
     RELAY_MARKER,
     install_hook,
+    installed_hook,
     installed_port,
     is_ours,
     read_settings,
@@ -139,6 +141,19 @@ def test_empty_settings_file_is_treated_as_empty(settings: Path) -> None:
 
 # ── 装配 ──────────────────────────────────────────────────────────────────
 
+def test_install_writes_an_explicit_timeout(settings: Path,
+                                            backups: Path) -> None:
+    """hook 条目必须显式带 timeout=600，**不赌官方默认值**。
+
+    我们的到期是 570s、中继转发超时是 600s。万一 command hook 的默认值是 60s，
+    570s 的审批窗口会先被砍断——症状是"卡片还没点，CC 那边已经报超时"，
+    极难归因。所以写死。
+    """
+    install_hook(PLUGIN_DIR, 48921, settings=settings, backup_dir=backups)
+    hook = _entries(settings)[0]["hooks"][0]
+    assert hook["timeout"] == HOOK_TIMEOUT_SECONDS == 600
+
+
 def test_install_writes_our_entry_and_reports_the_file(settings: Path,
                                                        backups: Path) -> None:
     result = install_hook(PLUGIN_DIR, 48921, settings=settings, backup_dir=backups)
@@ -152,6 +167,56 @@ def test_install_writes_our_entry_and_reports_the_file(settings: Path,
     hook = entries[0]["hooks"][0]
     assert hook["type"] == "command"
     assert RELAY_MARKER in hook["command"]
+
+
+def test_install_does_not_touch_other_files_by_default(settings: Path,
+                                                       backups: Path,
+                                                       tmp_path: Path) -> None:
+    """默认只写传入的那一份 settings，别处一律不碰。
+
+    用户 2026-11-22 明确要求：项目级 .claude/settings.json 不许动，
+    那可能是他按项目自己维护的。要清别处得调用方显式传。
+    """
+    other = tmp_path / "project-settings.json"
+    other.write_text(json.dumps(_legacy_http_settings(), ensure_ascii=False),
+                     encoding="utf-8")
+    before = other.read_text(encoding="utf-8")
+
+    result = install_hook(PLUGIN_DIR, 48921, settings=settings, backup_dir=backups)
+
+    assert result["cleaned_elsewhere"] == []
+    assert other.read_text(encoding="utf-8") == before, "默认动了别处的文件"
+
+
+def test_installed_hook_reports_the_legacy_http_shape(settings: Path) -> None:
+    """残留的旧 http hook 必须被认出来并报出来，不是当"没装"。
+
+    用户机器上可能留着一份过期的 http hook。只认 command 的话，
+    启动核对会报"没有装配审批中继"——既不清它也不提它，用户完全不知情，
+    而那个形状在插件没开时会把该目录下所有权限请求卡死。
+    """
+    settings.write_text(json.dumps(_legacy_http_settings(), ensure_ascii=False),
+                        encoding="utf-8")
+    found = installed_hook(settings, PLUGIN_DIR)
+    assert found is not None
+    assert found["kind"] == "http"
+    assert found["port"] == 48921
+
+
+def test_installed_hook_reports_the_command_shape(settings: Path,
+                                                  backups: Path) -> None:
+    install_hook(PLUGIN_DIR, 51234, settings=settings, backup_dir=backups)
+    found = installed_hook(settings, PLUGIN_DIR)
+    assert found == {"kind": "command", "port": 51234}
+
+
+def test_installed_hook_ignores_a_foreign_hook(settings: Path) -> None:
+    settings.write_text(json.dumps({
+        "hooks": {EVENT_NAME: [
+            {"matcher": "", "hooks": [{"type": "command", "command": "echo 别人的"}]},
+        ]},
+    }, ensure_ascii=False), encoding="utf-8")
+    assert installed_hook(settings, PLUGIN_DIR) is None
 
 
 def test_install_keeps_other_hooks_untouched(settings: Path,

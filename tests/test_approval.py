@@ -1484,6 +1484,31 @@ def test_no_decision_response_has_no_decision() -> None:
     assert "拒绝" not in body["message"]
 
 
+def test_no_decision_response_says_it_is_not_a_fault() -> None:
+    """F4：只写"宿主已自行处理"时，CC 把到期理解成"hook 服务挂了"，
+    反过来让用户去查端口——白担心一场。所以必须补一句"这是在等你，不是坏了"。
+    """
+    message = no_decision_response(reason="no_decision",
+                                   timeout_seconds=570)["message"]
+    assert "不是故障" in message
+    assert "没有代替你作答" in message
+    # 顺带守住规则 1 的不变式：到期文案里不许出现"拒绝"字样，
+    # 一个都不行——出现了就等于把"没决定"写成了"决定拒绝"。
+    assert "拒绝" not in message
+
+
+def test_no_decision_response_has_no_internal_jargon() -> None:
+    """给 CC 看的话里不出现内部词：端口号、地址、onFailure、503。
+
+    那些是给我们排查用的。写进给 CC 看的话里，它只会顺着往下猜
+    （"是不是端口被占了"），把用户带偏。
+    """
+    message = no_decision_response(reason="no_decision",
+                                   timeout_seconds=570)["message"]
+    for jargon in ("端口", "onFailure", "127.0.0.1", "503", "hook 服务"):
+        assert jargon not in message, f"到期文案泄了内部词 {jargon!r}"
+
+
 def test_stats_shape() -> None:
     gateway = ApprovalGateway(ListLogger(), port=_free_port())
     assert gateway.stats() == {"pending": 0, "allow": 0, "deny": 0, "ai": 0,

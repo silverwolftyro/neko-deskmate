@@ -49,6 +49,11 @@ RELAY_INTERPRETER = "python"
 SELFCHECK_TIMEOUT = 20.0
 
 HOOK_TYPE = "command"
+# 装进 settings 的 hook 超时。**显式写出来，不赌官方默认值**：
+# 我们的到期是 570s（hook 600s 前留 30s），中继的转发超时也是 600s。
+# 万一 command hook 的默认值是 60s，570s 的审批窗口会先被砍断，
+# 症状是"卡片还没点，Claude Code 那边已经报超时了"——那种故障极难归因。
+HOOK_TIMEOUT_SECONDS = 600
 
 
 def settings_path() -> Path:
@@ -143,8 +148,15 @@ def _entries_of(data: dict[str, Any]) -> list[Any]:
     return list(entries) if isinstance(entries, list) else []
 
 
-def installed_port(path: Any, plugin_dir: Any) -> int | None:
-    """已装配的那条 hook 用的端口；没装过返回 None。"""
+def installed_hook(path: Any, plugin_dir: Any) -> dict[str, Any] | None:
+    """已装配的那条 hook 的详情；没装过返回 None。
+
+    **两种形状都认**（``is_our_hook``）：command 带标记 / 老的 http 指向本机。
+    老形状必须认：用户机器上可能残留一份过期的 http hook，只认 command 的话
+    启动核对会报"没有装配审批中继"——既不清它也不提它，用户完全不知情。
+
+    返回 ``{"kind": "command"|"http", "port": int|None}``。
+    """
     data, error = read_settings(path)
     if error:
         return None
@@ -153,19 +165,44 @@ def installed_port(path: Any, plugin_dir: Any) -> int | None:
         if not isinstance(entry, dict):
             continue
         for hook in entry.get("hooks") or []:
-            if not isinstance(hook, dict):
+            if not isinstance(hook, dict) or not is_our_hook(hook):
                 continue
-            command = hook.get("command")
-            if not is_ours(command) or script not in command:
-                continue
-            # 脚本路径在命令里是带引号的，所以切完之后第一个 token 可能是 "。
-            # 引号一律当空白处理，再取第一个纯数字 token；
-            # 标记注释里的 token 不是数字，自然被跳过。
-            for token in command.rsplit(script, 1)[-1].replace('"', " ").split():
-                if token.isdigit():
-                    return int(token)
-            return None
+            kind = "http" if hook.get("type") == "http" else "command"
+            port = _port_of_hook(hook, script)
+            return {"kind": kind, "port": port}
     return None
+
+
+def _port_of_hook(hook: dict[str, Any], script: str) -> int | None:
+    """从一条 hook 里取出端口。command 从命令参数取，http 从 URL 取。"""
+    if hook.get("type") == "http":
+        url = hook.get("url")
+        if not isinstance(url, str):
+            return None
+        # http://127.0.0.1:48921/hook/permission → 冒号后、斜杠前那段
+        tail = url.split("://", 1)[-1]
+        host_port = tail.split("/", 1)[0]
+        _, _, port_text = host_port.rpartition(":")
+        try:
+            return int(port_text)
+        except ValueError:
+            return None
+    command = hook.get("command")
+    if not isinstance(command, str) or script not in command:
+        return None
+    # 脚本路径在命令里是带引号的，所以切完之后第一个 token 可能是 "。
+    # 引号一律当空白处理，再取第一个纯数字 token；
+    # 标记注释里的 token 不是数字，自然被跳过。
+    for token in command.rsplit(script, 1)[-1].replace('"', " ").split():
+        if token.isdigit():
+            return int(token)
+    return None
+
+
+def installed_port(path: Any, plugin_dir: Any) -> int | None:
+    """已装配的那条 hook 用的端口；没装过返回 None。"""
+    found = installed_hook(path, plugin_dir)
+    return found["port"] if found else None
 
 
 def selfcheck(plugin_dir: Any) -> tuple[bool, str]:
@@ -224,23 +261,6 @@ def _write_atomic(path: Path, data: dict[str, Any]) -> None:
     temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8")
     os.replace(temp, path)
-
-
-def candidate_paths() -> list[Path]:
-    """Claude Code 会读 settings 的地方：用户级 + 项目级（cwd 下）。
-
-    **项目级那一条是尽力而为**：宿主进程的 cwd 不一定是用户跑 Claude Code 的目录。
-    但它只会被用来**摘掉我们自己装的 hook**，且每次都先备份，
-    所以认错了路径也没有副作用——最坏就是什么都没找到。
-    """
-    paths = [settings_path()]
-    try:
-        project = Path.cwd() / ".claude" / "settings.json"
-    except OSError:
-        return paths
-    if project.is_file() and project.resolve() != paths[0].resolve():
-        paths.append(project)
-    return paths
 
 
 def _strip_ours(path: Path, backup_dir: Any) -> tuple[int, Path | None, str]:
@@ -311,7 +331,9 @@ def install_hook(plugin_dir: Any, port: int, *, settings: Any = None,
     entries = [item for item in _entries_of(data)
                if not (isinstance(item, dict) and _is_our_entry(item))]
     replaced = before - len(entries)
-    entries.append({"matcher": "", "hooks": [{"type": HOOK_TYPE, "command": command}]})
+    entries.append({"matcher": "",
+                    "hooks": [{"type": HOOK_TYPE, "command": command,
+                               "timeout": HOOK_TIMEOUT_SECONDS}]})
     hooks[EVENT_NAME] = entries
 
     try:
@@ -321,13 +343,12 @@ def install_hook(plugin_dir: Any, port: int, *, settings: Any = None,
                 "reason": f"写不进 {path}（{type(exc).__name__}）：{exc}",
                 "backup": str(backup) if backup else None}
 
-    # 别处的旧 hook：摘掉，避免两个 hook 同时跑。
+    # 别处的旧 hook：默认**不扫**。用户 2026-11-22 明确要求只写
+    # ~/.claude/settings.json，项目级 .claude/settings.json 不许动——
+    # 那可能是用户按项目自己维护的文件，插件没有理由替它改。
+    # 需要清别处时由调用方显式传 extra_locations。
     cleaned: list[dict[str, Any]] = []
-    if extra_locations is None:
-        elsewhere = [item for item in candidate_paths()
-                     if item.resolve() != path.resolve()]
-    else:
-        elsewhere = [Path(item) for item in extra_locations]
+    elsewhere = [Path(item) for item in (extra_locations or [])]
     for other in elsewhere:
         removed, other_backup, other_error = _strip_ours(other, backup_dir)
         cleaned.append({
