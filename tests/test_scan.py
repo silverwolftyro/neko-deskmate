@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 import plugin.plugins.agent_deskmate as module
-from plugin.plugins.agent_deskmate import diagnose
+from plugin.plugins.agent_deskmate import _mine_roots, _to_bool, _watch_section, diagnose
 from plugin.plugins.agent_deskmate.adapters.claude_code import ClaudeCodeAdapter
 from plugin.plugins.agent_deskmate.adapters.gateway import GatewayAdapter
 
@@ -272,8 +272,6 @@ def test_scan_now_delegates_to_diagnose() -> None:
 
 # ── 首启引导（B） ───────────────────────────────────────────────────────────
 # 只打日志、不播报：这是配置建议，不是观测结果。
-
-from plugin.plugins.agent_deskmate import _mine_roots, _to_bool, _watch_section  # noqa: E402
 
 
 def test_mine_roots_empty_by_default() -> None:
