@@ -108,6 +108,8 @@ AUTHORIZATION_FOOTER = (
 )
 
 HOOK_PATH = "/hook/permission"
+# 探活端点。中继转发之前先打这里；插件没起来时中继据此交还原生权限流程。
+HEALTH_PATH = "/health"
 MAX_BODY_BYTES = 256 * 1024
 
 # 默认到期时间。必须**明显小于** hooks.json 里的 hook timeout（600s），
@@ -1357,7 +1359,19 @@ class ApprovalGateway:
 
 
 def _user_deny_message() -> str:
-    return "同桌猫：用户在 N.E.K.O 里拒绝了这次调用"
+    """用户亲手点拒绝时，回给 Claude Code 的那句话。
+
+    **必须是硬指令**（2026-11-21 真机实测后改）：原来只写"用户拒绝了这次调用"，
+    Claude 把它理解成"命令失败"，于是换写法重试、换路径绕过，越拦越忙。
+    所以这里明确说清三件事：这是用户的明确拒绝、不要换写法、不要绕过、
+    等用户下一步指示。
+
+    这句话会进 Claude 的上下文，是给它看的，不是给用户看的——
+    写成人话它会当成建议，写成指令它才会停。
+    """
+    return ("同桌猫：用户在 N.E.K.O 里明确拒绝了这次调用。"
+            "不要换写法重试，不要绕过，也不要尝试等价的其他命令。"
+            "停下来，等用户的下一步指示。")
 
 
 class _HookHandler(BaseHTTPRequestHandler):
@@ -1368,6 +1382,16 @@ class _HookHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         # 基类默认往 stderr 打访问日志；插件的日志走 self.logger，这里静音。
         return
+
+    def do_GET(self) -> None:  # noqa: N802  标准库命名
+        """探活。中继（hook_relay.py）在转发之前先打这里，1s 超时。
+
+        只回答"活着"，不带任何状态——中继需要知道的就是这一个比特。
+        """
+        if self.path.split("?", 1)[0] != HEALTH_PATH:
+            self._respond(404, {"ok": False, "reason": "not_found"})
+            return
+        self._respond(200, {"ok": True, "service": "agent_deskmate"})
 
     def do_POST(self) -> None:  # noqa: N802  标准库命名
         if self.path.split("?", 1)[0] != HOOK_PATH:

@@ -466,6 +466,42 @@ def test_deny_carries_a_message_and_does_not_interrupt(port: int) -> None:
         gateway.stop()
 
 
+def test_deny_message_forbids_retrying_in_another_form(port: int) -> None:
+    """规格 §18.2 F3：deny 的 message 必须是**禁止重试的硬指令**。
+
+    真机实测：旧文案只写"用户拒绝了这次调用"，Claude Code 把它理解成
+    "命令失败/路径写法有问题"，于是回「需要我改用这个形式再试一次吗？」——
+    越拦越忙。所以这句话是写给 Claude 看的指令，不是写给用户的陈述。
+    """
+    gateway = _gateway(port)
+    try:
+        body = _decide_later(gateway, port, PAYLOAD, APPROVE_DENY)
+        message = body["hookSpecificOutput"]["decision"]["message"]
+        assert "不要换写法重试" in message
+        assert "不要绕过" in message
+        assert "等价" in message
+        assert "等用户的下一步指示" in message
+    finally:
+        gateway.stop()
+
+
+def test_deny_message_is_not_merely_a_statement(port: int) -> None:
+    """反向守护：别退化成"用户拒绝了这次调用"那种陈述句。
+
+    上面那条测试锁的是"该有的都有"，这条锁的是"不该出现的别出现"——
+    两件事都要有人守，否则一次"简化文案"就会把 F3 带回来。
+    """
+    gateway = _gateway(port)
+    try:
+        body = _decide_later(gateway, port, PAYLOAD, APPROVE_DENY)
+        message = body["hookSpecificOutput"]["decision"]["message"]
+        assert message != "同桌猫：用户在 N.E.K.O 里拒绝了这次调用"
+        # 至少出现一个祈使/禁止词，说明它是在下指令而不是在陈述
+        assert any(word in message for word in ("不要", "停下", "等用户"))
+    finally:
+        gateway.stop()
+
+
 def test_every_decision_is_audited(port: int, tmp_path: Path) -> None:
     gateway = _gateway(port, audit_path=tmp_path / "audit.jsonl")
     try:

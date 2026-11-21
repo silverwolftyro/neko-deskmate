@@ -16,5 +16,11 @@
   "entry.pending_list.name": "审批待办",
   "entry.pending_list.description": "返回未决与已了结（未清理）的审批：会话、命令、建立时间、状态、decided_by。过期不删，保留一段时间供事后查。",
   "entry.audit_list.name": "审批审计",
-  "entry.audit_list.description": "返回每次审批决定的审计：时间、命令、决定、decided_by（user/ai/expired/host_timeout）、模型、理由，以及 L2 生效时的授权溯源；授权确认本身也各占一条。附带纯文本便于导出。"
+  "entry.audit_list.description": "返回每次审批决定的审计：时间、命令、决定、decided_by（user/ai/expired/host_timeout）、模型、理由，以及 L2 生效时的授权溯源；授权确认本身也各占一条。附带纯文本便于导出。",
+  "entry.hook_install.name": "装配审批 hook",
+  "entry.hook_install.description": "把审批中继装进 Claude Code 的 ~/.claude/settings.json。装的是 command hook：插件没启动时中继输出空对象，Claude Code 回退原生权限弹窗，不会卡住你。返回里带改了哪个文件和备份在哪。",
+  "entry.hook_uninstall.name": "卸载审批 hook",
+  "entry.hook_uninstall.description": "从 Claude Code 的 ~/.claude/settings.json 里摘掉审批中继。只摘我们装的那条，别人的 hook 不动。",
+  "entry.model_test.name": "测试模型连接",
+  "entry.model_test.description": "向 [agent_deskmate.model] 配置的模型发一句最短的招呼，回显模型名与耗时。不发送任何命令或上下文。"
 }

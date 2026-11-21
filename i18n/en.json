@@ -16,5 +16,11 @@
   "entry.pending_list.name": "Approval Queue",
   "entry.pending_list.description": "Returns undecided and settled-but-not-yet-pruned approvals: session, command, created time, state, decided_by. Expired entries are kept for a while.",
   "entry.audit_list.name": "Approval Audit",
-  "entry.audit_list.description": "Returns an audit row per decision: time, command, decision, decided_by (user/ai/expired/host_timeout), model, reason, plus the authorization trail behind any L2 auto-allow. Each authorization confirmation is a row of its own. Includes plain text for export."
+  "entry.audit_list.description": "Returns an audit row per decision: time, command, decision, decided_by (user/ai/expired/host_timeout), model, reason, plus the authorization trail behind any L2 auto-allow. Each authorization confirmation is a row of its own. Includes plain text for export.",
+  "entry.hook_install.name": "Install Approval Hook",
+  "entry.hook_install.description": "Installs the approval relay into Claude Code's ~/.claude/settings.json as a command hook: when the plugin is not running the relay emits an empty object and Claude Code falls back to its native permission prompt. The reply names the file changed and where the backup is.",
+  "entry.hook_uninstall.name": "Uninstall Approval Hook",
+  "entry.hook_uninstall.description": "Removes the approval relay from Claude Code's ~/.claude/settings.json. Only our own entry is touched.",
+  "entry.model_test.name": "Test Model Connection",
+  "entry.model_test.description": "Sends a one-word ping to the model configured under [agent_deskmate.model] and reports the model name and elapsed time. No command or context is sent."
 }

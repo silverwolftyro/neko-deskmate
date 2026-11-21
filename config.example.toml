@@ -73,8 +73,10 @@ roots = []
 #   L2 的时机是**事件发生那一刻**，不等 570 秒；自动放行后发一条 blind 通知
 #   + 写一条含授权人/规则/模型/理由的审计。
 [agent_deskmate.approval]
-# 本地 HTTP 服务监听端口，只绑 127.0.0.1。改它必须同步改 hooks.json 里的 url，
-# 两边不一致时启动会打错误日志（否则症状是"插件没反应"，能查一小时）。
+# 本地 HTTP 服务监听端口，只绑 127.0.0.1。
+# 改它之后必须重跑一次 hook_install 入口——装进 Claude Code settings 的那条
+# command hook 里写死了端口，不一致时启动会打错误日志（否则症状是
+# "插件没反应"，能查一小时）。
 port = 48921
 
 # 到期标记（秒）。默认 570 = hook 600s 前留 30s 余量。
@@ -97,6 +99,26 @@ auto_decide = "off"
 # 调到 critical 也不会放行删除类——那是规则级排除，不是阈值问题。
 auto_decide_max_severity = "notice"
 
-# 模型用的 key（5b 接入后才会被真正使用）。只用来判断"有没有 key"，
-# **不写日志、不进卡片、不给模型看**。
+# 模型用的 key。只用来判断"有没有 key"，**不写日志、不进卡片、不给模型看**。
+# 5b 起真正被使用；见下面 [agent_deskmate.model]。
 api_key = ""
+
+# ── 模型建议（5b 最小版） ─────────────────────────────────────────────────
+# 四个字段，**不写死供应商**：protocol 只有 openai / anthropic 两种请求形状，
+# base_url 指向哪里是用户的事。默认值是 DeepSeek 官方，只因为本机现成有 key。
+#
+# 硬约束（规格 §8，不是配置项）：
+#   - 模型**只给建议，永不代决**——它的输出只填卡片的「建议 + 理由」两块，
+#     没有任何路径能通向回给 Claude Code 的 allow/deny；
+#   - L1 仍要求 ai_judgement=true **且**用户在 approval_authorize 入口签过字；
+#   - 只把「工具名 + 命令 + 工作目录 + 风险档」发给模型，不发会话历史；
+#   - 超时 15s、temperature 0、max_tokens 300，全部写死在代码里。
+[agent_deskmate.model]
+# 请求形状：openai（/chat/completions）| anthropic（/v1/messages）
+protocol = "openai"
+# 接口根地址，末尾不带 /v1 或 /chat/completions
+base_url = "https://api.deepseek.com"
+# 与上面 approval.api_key 等价；这里优先，为空时回退到那一处
+api_key = ""
+# 模型名
+model = "deepseek-chat"

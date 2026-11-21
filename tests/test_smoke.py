@@ -67,7 +67,8 @@ def test_events_registered() -> None:
     assert set(registered) == {
         "startup", "shutdown", "config_change", "status", "dump_events", "scan_now",
         "watch", "approval", "approval_decide", "approval_explain",
-        "approval_authorize", "pending_list", "audit_list",
+        "approval_authorize", "hook_install", "hook_uninstall", "model_test",
+        "pending_list", "audit_list",
     }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"
     assert registered["shutdown"].event_type == "lifecycle"
@@ -80,6 +81,11 @@ def test_events_registered() -> None:
     assert registered["approval_explain"].event_type == "plugin_entry"
     # 授权入口：L1/L2 唯一的开启路径，同样靠 @ui.action 承接卡片按钮
     assert registered["approval_authorize"].event_type == "plugin_entry"
+    # hook 装配：5a 实测发现没人装 hook 是"卡片永远不来"的头号原因
+    assert registered["hook_install"].event_type == "plugin_entry"
+    assert registered["hook_uninstall"].event_type == "plugin_entry"
+    # 5b：模型建议 + 测试连接
+    assert registered["model_test"].event_type == "plugin_entry"
     # 5a：审批待办与审计两个查询入口
     assert registered["pending_list"].event_type == "plugin_entry"
     assert registered["audit_list"].event_type == "plugin_entry"

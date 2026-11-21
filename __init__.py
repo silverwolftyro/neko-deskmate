@@ -21,10 +21,12 @@ L0 规则层 → SDK 播报 → 审批中继 → 零 key 行为。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html as _html
-import json
 import os
+import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +72,16 @@ from .approval import (
 )
 from .broadcast import Broadcaster, describe_actor, render_text
 from .events import UnifiedEvent, attribute, delegated_server
+from .hooksetup import (
+    install_hook,
+    installed_port,
+    settings_path,
+    uninstall_hook,
+)
+from .model_advice import (
+    STATE_OK,
+    ModelAdvisor,
+)
 from .rules import (
     Coalescer,
     RuleHit,
@@ -96,13 +108,46 @@ SCAN_EVENT_COUNT = 50
 # scan_now 回显几条"将要播报"的原文，超过就截断。
 SCAN_SAMPLE_LIMIT = 3
 
-# hooks.json 里写死的端口。改 approval.port 必须同步改它，否则 hook 打不进来。
+# 审批中继默认端口。装进 Claude Code settings 的那条 command hook 用它，
+# 改它之后必须重跑 hook_install，否则中继还在打旧端口（启动时会核对并报警）。
 HOOKS_DEFAULT_PORT = 48921
-# hooks.json 里写死的 hook 超时。我们的到期时间必须明显小于它。
+# Claude Code 的 hook 超时（官方默认 600s）。我们的到期时间必须明显小于它，
+# 否则我们还没到期宿主先断开，pending 永远等不到标记。
 HOOK_TIMEOUT_SECONDS = 600
 # 审批默认到期：hook 600s 前 30 秒。只标记 expired，不发任何决定。
 DEFAULT_TIMEOUT_SECONDS = 570.0
 DEFAULT_RETENTION_SECONDS = 3600.0
+
+
+def code_fingerprint(plugin_dir: Any) -> str:
+    """当前加载的代码指纹。规格 §17.6：用户在插件管理器里看不出跑的是哪一版。
+
+    两条路，**都不假设 git 存在**（打包后没有 .git，git 也可能不在 PATH）：
+
+    1. 有 .git 且 git 可用 → ``git rev-parse --short HEAD``
+    2. 否则 → 插件自己的 .py 文件内容哈希（排序后拼起来算，保证稳定）
+
+    刻意不 import hashlib/subprocess 到 async 函数里：本函数是同步的，
+    在 startup 里被调用。subprocess 放在同步函数里也顺带避开 ASYNC 规则。
+    """
+    root = Path(plugin_dir)
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(root), capture_output=True, text=True, timeout=10, check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    digest = hashlib.sha256()
+    try:
+        for path in sorted(root.glob("*.py")):
+            digest.update(path.name.encode("utf-8"))
+            digest.update(path.read_bytes())
+    except OSError:
+        return "unknown"
+    return "sha256:" + digest.hexdigest()[:12]
 
 
 def _escape(text: str) -> str:
@@ -127,6 +172,16 @@ class StatusReply(BaseModel):
         default=None,
         description="L1/L2 授权状态：granted / scopes / version / confirmed_time。"
                     "审批服务未运行时为 null",
+    )
+    build: str = Field(default="", description="代码指纹：git short sha 或内容哈希")
+    hook: dict = Field(
+        default_factory=dict,
+        description="审批 hook 装配状态：installed / settings_file / port",
+    )
+    model: dict = Field(
+        default_factory=dict,
+        description="模型建议配置状态：enabled / configured / model / protocol。"
+                    "**不含 api_key**",
     )
 
 
@@ -210,6 +265,51 @@ def _approval_section(config: dict[str, Any]) -> dict[str, Any]:
     """从 ``[agent_deskmate]`` 整节里取 ``approval`` 子表（规格 §5）。"""
     section = config.get("approval")
     return section if isinstance(section, dict) else {}
+
+
+def _model_section(config: dict[str, Any]) -> dict[str, Any]:
+    """从 ``[agent_deskmate]`` 整节里取 ``model`` 子表（5b：模型建议）。
+
+    刻意不写死供应商：``protocol`` 只有 openai / anthropic 两种形状，
+    ``base_url`` 指向哪里是用户的事。默认走 DeepSeek 官方只是因为
+    本机现成有 key，不是偏好。
+    """
+    section = config.get("model")
+    return section if isinstance(section, dict) else {}
+
+
+def _command_of(request: Any) -> str:
+    """从审批请求里取命令原文，只取命令。
+
+    ``tool_summary`` 是"工具名: 命令"的一行摘要，模型那边再包一次工具名就重复了，
+    所以这里把前缀去掉。取不到就回 tool_summary 本身——宁可少切，不要切错。
+    """
+    summary = str(getattr(request, "tool_summary", "") or "")
+    name = str(getattr(request, "tool_name", "") or "")
+    if name and summary.startswith(f"{name}:"):
+        return summary[len(name) + 1:].strip()
+    return summary
+
+
+def _advisor_from_config(config: dict[str, Any]) -> ModelAdvisor:
+    """按配置造一个模型建议客户端。
+
+    ``api_key`` 的读取顺序：``[agent_deskmate.model] api_key`` 优先，
+    回退到旧的 ``[agent_deskmate.approval] api_key``（5a 时的位置）。
+    不兼容会让老配置静默失效——那种"配了却不生效"最难查。
+    """
+    section = _model_section(config)
+    approval = _approval_section(config)
+    api_key = str(section.get("api_key") or approval.get("api_key") or "").strip()
+    return ModelAdvisor(
+        protocol=str(section.get("protocol") or "openai").strip().lower(),
+        base_url=str(section.get("base_url") or "").strip(),
+        api_key=api_key,
+        model=str(section.get("model") or "").strip(),
+        # 开关仍在 approval 节：ai_judgement 是"要不要建议"，
+        # model 节只描述"连哪个模型"。拆开是为了不让一处配置管两件事。
+        enabled=_to_bool(approval.get("ai_judgement"), False),
+    )
 
 
 def _mine_roots(config: dict[str, Any]) -> list[Path]:
@@ -381,6 +481,9 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._approval: ApprovalGateway | None = None
         self._hint_logged = False
         self._last_hud_count = -1
+        # 5b：模型建议客户端 + 跑它的线程池。advisor 为 None 表示零 key 默认态。
+        self._advisor: ModelAdvisor | None = None
+        self._advice_pool: ThreadPoolExecutor | None = None
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     # startup 用 async def、shutdown 用 def，刻意对齐官方 memo_reminder 的写法：
@@ -394,8 +497,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
     async def on_startup(self, **_):
         self._started_at = time.time()
         self.logger.info(
-            "同桌猫启动 plugin_id={} source={} stage={}",
-            self.plugin_id, SOURCE, STAGE,
+            "同桌猫启动 plugin_id={} source={} stage={} 代码={}",
+            self.plugin_id, SOURCE, STAGE, code_fingerprint(self.plugin_dir),
         )
         config = await self._plugin_config()
         self._last_config = config
@@ -417,6 +520,14 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
         ``api_key`` 只用来判断"有没有 key"，**不落日志、不进卡片、不给模型**。
         """
+        # 5b：模型建议客户端。零 key（默认）时它是配好的但 enabled=False，
+        # 卡片建议块走降级文案，不会有人去调模型。
+        self._advisor = _advisor_from_config(config)
+        if self._advice_pool is None:
+            # 1 个 worker：建议是锦上添花，不该并发去打模型接口。
+            # 放线程池是因为它是阻塞 IO，不能卡住审批 timer。
+            self._advice_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="deskmate-advice")
         section = _approval_section(config)
         port = int(_to_number(section.get("port"), HOOKS_DEFAULT_PORT))
         timeout = _to_number(section.get("timeout_mark_expired"), DEFAULT_TIMEOUT_SECONDS)
@@ -436,14 +547,14 @@ class AgentDeskmatePlugin(NekoPluginBase):
             auto_decide=auto_decide,
             auto_decide_max_severity=str(
                 section.get("auto_decide_max_severity") or "notice").strip().lower(),
-            has_api_key=bool(str(section.get("api_key") or "").strip()),
+            has_api_key=bool(self._advisor.api_key),
             audit_path=self.data_path("audit.jsonl"),
             authorization_path=self.data_path("authorization.json"),
         )
         if not self._approval.start():
             self._approval = None
             return
-        self._check_hooks_port(port)
+        self._check_installed_hook_port(port)
         if timeout >= HOOK_TIMEOUT_SECONDS:
             self.logger.error(
                 "approval.timeout_mark_expired={}s 不小于 hooks.json 的 hook 超时 {}s，"
@@ -451,27 +562,30 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 timeout, HOOK_TIMEOUT_SECONDS,
             )
 
-    def _check_hooks_port(self, port: int) -> None:
-        """hooks.json 里的端口和配置不一致时大声报警。
+    def _check_installed_hook_port(self, port: int) -> None:
+        """已装进 Claude Code settings 的那条 hook，端口和配置不一致时大声报警。
 
-        两者对不上，Claude Code 的 PermissionRequest hook 就打不进来，
-        而症状是"插件没反应"——不明确指出来能查一小时。
+        改过 ``approval.port`` 之后必须重跑 ``hook_install`` 入口——旧 hook 还在
+        打旧端口，症状是"插件没反应"，不明确指出来能查一小时。
+        没装过 hook 也在这里说一句：5a 实测发现没人装 hook 是"卡片永远不来"
+        的头号原因，启动时提醒比让用户自己发现好。
         """
-        try:
-            hooks_path = self.plugin_dir / "hooks.json"
-            if not hooks_path.is_file():
-                return
-            declared = json.loads(hooks_path.read_text(encoding="utf-8"))
-            url = declared["hooks"]["PermissionRequest"][0]["hooks"][0]["url"]
-            declared_port = int(url.rsplit(":", 1)[-1].split("/", 1)[0])
-        except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
-            self.logger.warning("读 hooks.json 核对端口失败（{}），跳过核对", type(exc).__name__)
+        target = settings_path()
+        installed = installed_port(target, self.plugin_dir)
+        if installed is None:
+            self.logger.warning(
+                "Claude Code settings 里没有装配审批中继（{} 未找到我们的 hook）。"
+                "PermissionRequest 不会打进来，卡片永远不会出现——"
+                "请调一次 hook_install 入口装上，并重启 Claude Code",
+                target,
+            )
             return
-        if declared_port != port:
+        if installed != port:
             self.logger.error(
-                "端口不一致：配置 approval_port={} 但 hooks.json 里是 {}。"
-                "PermissionRequest hook 会打不到插件，请把两边改成同一个值",
-                port, declared_port,
+                "端口不一致：配置 approval.port={} 但已装配的 hook 用的是 {}。"
+                "PermissionRequest 会打到旧端口上，请重跑 hook_install 入口"
+                "（它会替换成新端口，不会多出一条）",
+                port, installed,
             )
 
     def _log_first_run_hint(self, config: dict[str, Any]) -> None:
@@ -496,6 +610,11 @@ class AgentDeskmatePlugin(NekoPluginBase):
         if self._approval is not None:
             self._approval.stop()
             self._approval = None
+        if self._advice_pool is not None:
+            # 建议调用最长 15s，等它跑完再收摊——硬关会留下半截 HTTP 请求。
+            self._advice_pool.shutdown(wait=True)
+            self._advice_pool = None
+        self._advisor = None
         self._started_at = None
         return Ok({"status": "shutdown"})
 
@@ -703,10 +822,13 @@ class AgentDeskmatePlugin(NekoPluginBase):
         )
         body = request.tool_summary or request.tool_name or "未知工具"
         timeout = self._approval.timeout_seconds
+        advice = await self._advice_for_card(pending)
         html = build_card_html(
             subject=subject, tool_summary=body, session_id=request.session_id,
             working_directory=request.working_directory, timeout_seconds=timeout,
-            advice_state=self._approval.advice_state(),
+            advice_state=advice["state"],
+            suggestion=advice["suggestion"], reason=advice["reason"],
+            basis=advice["basis"],
             risk=pending.severity, action_class=pending.action_class,
         )
         try:
@@ -723,6 +845,55 @@ class AgentDeskmatePlugin(NekoPluginBase):
             return
         self._approval.attach_card(request.request_id, card.id)
         self.logger.info("审批卡片已弹出 {}（请求 {}）", card.id, request.request_id)
+
+    async def _advice_for_card(self, pending: Any) -> dict[str, str]:
+        """给卡片取「建议 + 理由 + 依据」。**只填卡片，不参与任何回填。**
+
+        规格 §8：模型只给建议，永不代决。所以这里的产出全部流进
+        ``build_card_html`` 的建议块，没有任何一条路通向 ``hook_response``。
+        L2 自动放行仍然要用户签字 + 门控全过 + 有判断后端，那条路不接这个类。
+
+        调用放在线程池里：模型是阻塞 IO，最坏等 15s，不能卡住审批 timer
+        （timer 一轮还要建别的卡、推 HUD）。
+        """
+        fallback = {"state": self._approval.advice_state(), "suggestion": "",
+                    "reason": "", "basis": ""}
+        advisor = self._advisor
+        if advisor is None or not advisor.enabled:
+            return fallback
+        # 没签字 → 不给建议。授权是 L1 的前提，不是可选项。
+        if not self._approval.authorized_scopes():
+            return {"state": "unauthorized", "suggestion": "", "reason": "",
+                    "basis": ""}
+        gap = advisor.missing()
+        if gap:
+            self.logger.info("模型建议降级：{}", gap)
+            return {"state": "no_key", "suggestion": "", "reason": "", "basis": ""}
+
+        request = pending.request
+        loop = asyncio.get_running_loop()
+        try:
+            advice = await loop.run_in_executor(
+                self._advice_pool, lambda: advisor.suggest(
+                    tool_name=request.tool_name,
+                    command=_command_of(request),
+                    cwd=request.working_directory or "",
+                    risk=pending.severity,
+                ))
+        except Exception as exc:  # noqa: BLE001  建议失败不能炸掉建卡
+            self.logger.warning("模型建议调用异常（{}）：{}", type(exc).__name__, exc)
+            return {"state": "error", "suggestion": "", "reason": "", "basis": ""}
+
+        if not advice.ok:
+            self.logger.info("模型建议降级：state={} detail={}",
+                             advice.state, advice.detail)
+            return {"state": advice.state, "suggestion": "", "reason": "", "basis": ""}
+        basis = (f"工具 {request.tool_name or '未知'}；"
+                 f"工作目录 {request.working_directory or '未知'}；"
+                 f"本地规则风险档 {pending.severity}"
+                 f"（{pending.rule or '未命中'}）；模型 {advice.model}")
+        return {"state": STATE_OK, "suggestion": advice.suggestion,
+                "reason": advice.reason, "basis": basis}
 
     async def _settle_approval_card(self, pending: Any) -> None:
         """用户点完（或到期）后把卡片改成结果态，并清掉按钮防重复点。"""
@@ -803,6 +974,121 @@ class AgentDeskmatePlugin(NekoPluginBase):
         except (CardSubmissionError, KeyError) as exc:
             self.logger.warning("解释卡片更新失败（{}）：请求 {}", exc, request_id)
         return Ok(explanation)
+
+    # ── hook 装配（5a 实测：没人装 hook，卡片永远不来） ────────────────────
+
+    @plugin_entry(
+        id="hook_install",
+        name=tr("entry.hook_install.name", default="装配审批 hook"),
+        description=tr(
+            "entry.hook_install.description",
+            default="把审批中继装进 Claude Code 的 ~/.claude/settings.json。"
+                    "装的是 command hook：插件没启动时中继输出空对象，"
+                    "Claude Code 回退原生权限弹窗，不会卡住你。"
+                    "返回里带改了哪个文件和备份在哪。",
+        ),
+    )
+    async def hook_install(self, **_):
+        """装配审批 hook。幂等：重复调用是替换，不会多出一条。
+
+        **只动 ``~/.claude/settings.json``**，写之前先备份到
+        ``<用户数据>/plugins/agent_deskmate/hook-backups/``，备份路径在返回值里。
+        别人的 hook 一概不碰。
+
+        自检不过就不写文件：装一条跑不起来的 command hook，等于让用户每次
+        权限请求都看一次报错，比不装更糟。
+        """
+        if self._approval is None:
+            return Err(SdkError("审批服务未运行，先启动插件再装 hook"))
+        port = self._approval.port
+        result = install_hook(
+            self.plugin_dir, port,
+            settings=settings_path(),
+            backup_dir=self.data_path("hook-backups"),
+        )
+        if not result.get("ok"):
+            self.logger.error("hook 装配失败：{}", result.get("reason"))
+            return Err(SdkError(str(result.get("reason") or "装配失败")))
+        self.logger.info(
+            "hook 已装配到 {}（端口 {}，备份 {}）。重启 Claude Code 后生效",
+            result["settings_file"], port, result.get("backup") or "无（原本没有该文件）",
+        )
+        return Ok({
+            "installed": True,
+            "settings_file": result["settings_file"],
+            "backup": result.get("backup"),
+            "port": port,
+            "command": result["command"],
+            "message": ("已写入。重启 Claude Code 后生效；"
+                        "插件没启动时中继会输出空对象，Claude Code 回退原生权限弹窗。"),
+        })
+
+    @plugin_entry(
+        id="hook_uninstall",
+        name=tr("entry.hook_uninstall.name", default="卸载审批 hook"),
+        description=tr(
+            "entry.hook_uninstall.description",
+            default="从 Claude Code 的 ~/.claude/settings.json 里摘掉审批中继。"
+                    "只摘我们装的那条，别人的 hook 不动。",
+        ),
+    )
+    async def hook_uninstall(self, **_):
+        """卸载。同样只动 settings.json，先备份再写。"""
+        result = uninstall_hook(
+            settings=settings_path(),
+            backup_dir=self.data_path("hook-backups"),
+        )
+        if not result.get("ok"):
+            self.logger.error("hook 卸载失败：{}", result.get("reason"))
+            return Err(SdkError(str(result.get("reason") or "卸载失败")))
+        self.logger.info("hook 已卸载（{}，移除 {} 条）",
+                         result["settings_file"], result.get("removed", 0))
+        return Ok({
+            "installed": False,
+            "settings_file": result["settings_file"],
+            "backup": result.get("backup"),
+            "removed": result.get("removed", 0),
+            "message": "已摘掉。Claude Code 恢复原生权限流程。",
+        })
+
+    # ── 5b：模型建议 + 测试连接 ────────────────────────────────────────────
+
+    @plugin_entry(
+        id="model_test",
+        name=tr("entry.model_test.name", default="测试模型连接"),
+        description=tr(
+            "entry.model_test.description",
+            default="向 [agent_deskmate.model] 配置的模型发一句最短的招呼，"
+                    "回显模型名与耗时。不发送任何命令或上下文。",
+        ),
+    )
+    async def model_test(self, **_):
+        """「测试连接」。只验证连通性，不碰任何审批状态。
+
+        刻意不发命令、不发上下文——连通性测试不需要那些，少发一点是一点。
+        """
+        advisor = self._advisor
+        if advisor is None:
+            advisor = _advisor_from_config(await self._plugin_config())
+        result = await asyncio.get_running_loop().run_in_executor(
+            self._advice_pool, advisor.ping)
+        # api_key 一律不进返回值：日志、返回值、卡片都不该出现它。
+        self.logger.info(
+            "模型连接测试：ok={} state={} model={} 耗时={}ms",
+            result.get("ok"), result.get("state"), result.get("model") or "-",
+            result.get("elapsed_ms"),
+        )
+        if not result.get("ok"):
+            # 只回原因，不把内部档位名（state）拼进去——那是调试用的，
+            # 已经单独进日志。用户要看的是一句能照着做的话。
+            return Err(SdkError(str(result.get("reason") or "调用失败")))
+        return Ok({
+            "connected": True,
+            "model": result.get("model"),
+            "elapsed_ms": result.get("elapsed_ms"),
+            "reply": result.get("reply"),
+            "message": "连通正常。模型只给建议，永不代你决定。",
+        })
 
     @ui.action(id="approval_authorize", label=tr("entry.approval_authorize.name",
                                                  default="授权确认"))
@@ -911,7 +1197,35 @@ class AgentDeskmatePlugin(NekoPluginBase):
             approval=self._approval.stats() if self._approval is not None else {"running": 0},
             authorization=(self._approval.authorization_snapshot()
                            if self._approval is not None else None),
+            build=code_fingerprint(self.plugin_dir),
+            hook=self._hook_status(),
+            model=self._model_status(),
         )
+
+    def _hook_status(self) -> dict[str, Any]:
+        """审批 hook 装没装、装的是哪个端口。只读，不发起任何请求。"""
+        target = settings_path()
+        port = installed_port(target, self.plugin_dir)
+        return {
+            "installed": port is not None,
+            "settings_file": str(target),
+            "port": port,
+        }
+
+    def _model_status(self) -> dict[str, Any]:
+        """模型建议的状态。**刻意不含 api_key**——它不该出现在任何回显里。"""
+        advisor = self._advisor
+        if advisor is None:
+            return {"enabled": False, "configured": False, "model": "",
+                    "protocol": "", "missing": "未初始化"}
+        return {
+            "enabled": advisor.enabled,
+            "configured": advisor.configured(),
+            "model": advisor.model,
+            "protocol": advisor.protocol,
+            "base_url": advisor.base_url,
+            "missing": advisor.missing(),
+        }
 
     @plugin_entry(
         id="dump_events",
