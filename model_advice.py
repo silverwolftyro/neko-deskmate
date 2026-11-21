@@ -45,7 +45,42 @@ SUGGEST_DENY = "deny"
 SUGGEST_UNSURE = "unsure"
 SUGGESTIONS = (SUGGEST_ALLOW, SUGGEST_DENY, SUGGEST_UNSURE)
 
-# 失败/降级档位。每档对应卡片上一句不同的话。
+# 取值 → 给人看的那几个字。**必须在卡片侧用这张表翻译，不能直接显示 token**：
+# 直接显示的话卡片上会出现"建议：allow"这种机器词（2026-11-22 真机事故的
+# 同族第二例，被链路测试当场抓住）。表跟着取值定义在同一个模块里，
+# 所以加一种建议时很难只加一半。
+SUGGESTION_TEXT = {
+    SUGGEST_ALLOW: "倾向放行",
+    SUGGEST_DENY: "倾向别放行",
+    SUGGEST_UNSURE: "不确定",
+}
+# 认不出的取值显示成什么。取最保守的那个——宁可说"不确定"，
+# 也不把一个来路不明的 token 印在卡片上。
+SUGGESTION_FALLBACK = SUGGEST_UNSURE
+
+
+def suggestion_text(suggestion: str) -> str:
+    """建议取值 → 人话。认不出的按"不确定"显示，绝不外溢原始 token。"""
+    return SUGGESTION_TEXT.get(suggestion, SUGGESTION_TEXT[SUGGESTION_FALLBACK])
+
+# 失败/降级档位。**这是"调用结果码"，不是卡片上的展示状态。**
+#
+# 两者曾经是两套词表放在两个模块里各自定义，而且部分撞名（no_key /
+# disabled / unauthorized 同名，其余不同名）——那比完全重名更危险：
+# _advice_for_card 把调用结果码直接当展示状态传进 build_card_html，
+# 模型一成功就 ADVICE_TEXT["ok"] → KeyError → 整张卡片崩掉（真机实测，
+# 第一次真实请求卡片根本没弹出来）。
+#
+# 现在这样切分：
+#   * 本模块的 STATE_* 只描述"这次调用发生了什么"，客户端自己用；
+#   * 卡片上的展示状态只有 approval.ADVICE_TEXT 那一套名字
+#     （disabled / unauthorized / no_key / pending_backend / ready）；
+#   * 两套之间**唯一的翻译点是 _advice_for_card**，它翻译出来的东西必须
+#     落在 approval.ADVICE_STATES 里，落不进去就按未知状态兜底。
+#
+# 所以这里**刻意不再放任何给用户看的文案**。曾经有一份 ADVICE_STATE_TEXT
+# 摆在这里，是 approval.ADVICE_TEXT 的重复拷贝，而且没有任何渲染路径读它
+# （只有它自己的测试在读）——两份迟早说不同话，已删。
 STATE_OK = "ok"
 STATE_NO_KEY = "no_key"
 STATE_AUTH_FAILED = "auth_failed"
@@ -55,20 +90,6 @@ STATE_BAD_RESPONSE = "bad_response"
 STATE_DISABLED = "disabled"
 STATE_UNAUTHORIZED = "unauthorized"
 STATE_ERROR = "error"
-
-# 卡片上「建议」那一块的降级文案。**全部陈述句**：
-# 不说"填个 key 就好"（索取），不说"模型不可用"（暗示闸门不工作）。
-ADVICE_STATE_TEXT = {
-    STATE_OK: "",                       # 有真建议时由调用方填三行
-    STATE_NO_KEY: "未配置模型，当前只做提醒。安全兜底与模型无关。",
-    STATE_AUTH_FAILED: "模型鉴权失败（401），本次不给建议。安全兜底与模型无关。",
-    STATE_TIMEOUT: "模型 15 秒内没有回应，本次不给建议。安全兜底与模型无关。",
-    STATE_INVALID: "模型的回复无法解析，本次不给建议。安全兜底与模型无关。",
-    STATE_BAD_RESPONSE: "模型接口返回异常，本次不给建议。安全兜底与模型无关。",
-    STATE_DISABLED: "未开启模型建议。安全兜底与模型无关。",
-    STATE_UNAUTHORIZED: "尚未确认授权，暂不给出建议。安全兜底与模型无关。",
-    STATE_ERROR: "本次无法给出建议。安全兜底与模型无关。",
-}
 
 # 给模型的系统提示。刻意要求固定两行格式——解析逻辑靠它，
 # 但解析本身是宽容的（见 _parse），模型多说话不会让它失败。

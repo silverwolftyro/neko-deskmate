@@ -118,16 +118,49 @@ def test_prompt_clips_a_huge_command() -> None:
     assert len(prompt) < 2000
 
 
-def test_advice_state_texts_never_solicit_or_imply_the_gate_is_off() -> None:
-    """每档降级文案都是陈述句：不索取 key，不暗示闸门不工作。"""
-    from plugin.plugins.agent_deskmate.model_advice import ADVICE_STATE_TEXT
+def test_model_advice_ships_no_user_facing_copy() -> None:
+    """model_advice 里**不该再有任何给用户看的文案**。
 
-    for state, text in ADVICE_STATE_TEXT.items():
-        if not text:
-            continue
-        assert "填写" not in text, f"{state} 出现了索取式措辞"
-        assert "即可" not in text, f"{state} 出现了索取式措辞"
-        assert "安全兜底与模型无关" in text, f"{state} 没说清兜底不依赖模型"
+    曾经这里有一份 ADVICE_STATE_TEXT，是 approval.ADVICE_TEXT 的重复拷贝，
+    而且没有任何渲染路径读它。两份文案迟早说不同话，已删；
+    展示文案的唯一家在 approval.ADVICE_TEXT，它的性质由
+    test_approval.py 里的测试守着（陈述句、不索取、不暗示闸门不工作）。
+    """
+    import plugin.plugins.agent_deskmate.model_advice as advice_mod
+
+    assert not hasattr(advice_mod, "ADVICE_STATE_TEXT"), (
+        "model_advice 又长出用户文案了——展示文案只该有一份，在 approval 里")
+
+
+def test_outcome_codes_are_not_display_states() -> None:
+    """两套词表不许再混：调用结果码多数**不是**卡片展示状态。
+
+    这是那条真机故障的根因——把 STATE_OK（"ok"）当展示状态传进
+    build_card_html，卡片侧只认 "ready"，于是 ADVICE_TEXT["ok"] KeyError。
+    这里把"哪些撞名、哪些不撞"钉住：撞名的那几个尤其危险，
+    因为它们今天能跑，改坏的那一刻不会有任何测试先喊。
+    """
+    from plugin.plugins.agent_deskmate import model_advice as advice_mod
+    from plugin.plugins.agent_deskmate.approval import ADVICE_STATES
+
+    outcomes = {value for name, value in vars(advice_mod).items()
+                if name.startswith("STATE_")}
+    assert "ok" in outcomes, "STATE_OK 不该被改名——它是调用结果码的内部名字"
+    # "ok" 必须是调用结果码、且**不是**展示状态
+    assert advice_mod.STATE_OK == "ok"
+    assert advice_mod.STATE_OK not in ADVICE_STATES
+    # 撞名的那几个：正因为同名，最容易被人当成一套词
+    assert outcomes & ADVICE_STATES, "预期有几个撞名的值，没有反而奇怪"
+    # 翻译表必须覆盖全部调用结果码
+    from plugin.plugins.agent_deskmate import _DISPLAY_STATE_FOR_OUTCOME
+
+    assert set(_DISPLAY_STATE_FOR_OUTCOME) == outcomes, (
+        "翻译表没有穷举调用结果码；漏掉的那个失败档位会静默落到兜底态")
+    # 而且"成功"那一格必须指向 ready——这正是当初写错的那个字
+    assert _DISPLAY_STATE_FOR_OUTCOME[advice_mod.STATE_OK] == "ready"
+    # 表里每个值都必须是合法的展示状态
+    for outcome, display in _DISPLAY_STATE_FOR_OUTCOME.items():
+        assert display in ADVICE_STATES, f"{outcome} 映射到了非法展示态 {display!r}"
 
 
 # ── 解析 ──────────────────────────────────────────────────────────────────
@@ -365,12 +398,25 @@ def test_advice_has_no_decision_field() -> None:
 
 
 def test_approval_module_does_not_import_the_advisor() -> None:
-    """规格 §8：模型只给建议。审批中继不该知道模型的存在。
+    """规格 §8：模型只给建议。审批中继不该 import 模型客户端。
 
     这条守着"建议"与"回填"之间的墙：哪天有人想图方便让模型直接回填，
     第一步就是在这里 import，测试会红。
+
+    刻意用 AST 查真实 import，不用字符串匹配：注释和文档串里提到
+    "model_advice" 是正常的（说明两套词表的分工就要写在那里），
+    字符串匹配会把那种注释误判成依赖。
     """
+    import ast
+
     source = (Path(__file__).resolve().parents[1] / "approval.py").read_text(
         encoding="utf-8")
-    assert "model_advice" not in source
-    assert "ModelAdvisor" not in source
+    tree = ast.parse(source)
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    assert not any("model_advice" in name for name in imported), (
+        f"approval.py import 了模型客户端：{sorted(imported)}")

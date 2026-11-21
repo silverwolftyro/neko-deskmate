@@ -243,14 +243,14 @@ def advice_state(*, ai_judgement: bool, has_key: bool, backend_ready: bool,
     不能显示成"没有 key"——那是两件事，混起来用户不知道该去哪补。
     """
     if not ai_judgement:
-        return "disabled"
+        return ADVICE_STATE_FALLBACK
     if not authorized:
         return "unauthorized"
     if not has_key:
         return "no_key"
     if not backend_ready:
         return "pending_backend"
-    return "ready"
+    return ADVICE_STATE_READY
 
 
 ADVICE_TEXT = {
@@ -265,6 +265,40 @@ ADVICE_TEXT = {
     "no_key": "当前只做提醒，未接入模型。安全兜底与模型无关。",
     "pending_backend": "当前只做提醒，模型能力尚未接入。安全兜底与模型无关。",
 }
+
+# ── 卡片侧「建议块」的唯一词表 ────────────────────────────────────────────
+# **只有本模块拥有这套名字。** model_advice.py 里的 STATE_* 是"调用结果码"
+# （ok / timeout / auth_failed…），那是模型客户端自己的事；两套词曾经有重叠
+# 又不完全重叠（no_key / disabled / unauthorized 撞名，其余不撞），结果
+# _advice_for_card 把调用结果码当成展示状态直接传进 build_card_html，
+# 模型一成功就 ADVICE_TEXT["ok"] → KeyError → 整张卡片崩掉（真机实测）。
+#
+# 修法不是"让卡片多认一个 ok"——那只会把词表改大，下一个人再加第三种。
+# 修法是：展示状态只在这里定义，_advice_for_card 是唯一的翻译点，
+# 并且它翻译出来的东西必须落在这三个名字里，否则按未知处理。
+ADVICE_STATE_READY = "ready"
+# 未知状态的兜底文案。取 disabled：它是一句纯粹的"现在没有建议"，
+# 不指向任何需要用户去补的动作，也不会暗示闸门不工作。
+ADVICE_STATE_FALLBACK = "disabled"
+# 合法的展示状态集合。_advice_for_card 与 build_card_html 都拿它自检。
+# **必须含 ADVICE_STATE_READY**：ready 态不渲染 ADVICE_TEXT 里的句子，
+# 它渲染「建议 + 理由 + 依据」三行，所以它不在 ADVICE_TEXT 的键里——
+# 只拿 ADVICE_TEXT 的键当合法集合，就会把 ready 误判成未知状态，
+# 模型成功给出建议时反而降级成"没有建议"（写这一段时真犯过，被测试抓住）。
+ADVICE_STATES = frozenset(ADVICE_TEXT) | {ADVICE_STATE_READY}
+
+
+def advice_text(state: str) -> str:
+    """取某个展示状态对应的文案；**未知状态不抛异常**。
+
+    建议是锦上添花，卡片是核心功能。建议出任何问题都不能让卡片不出现——
+    所以这里永远有值可返回，调用方不需要 try。
+    """
+    return ADVICE_TEXT.get(state, ADVICE_TEXT[ADVICE_STATE_FALLBACK])
+
+
+def is_known_advice_state(state: Any) -> bool:
+    return state in ADVICE_STATES
 
 
 class ApprovalRequest(BaseModel):
@@ -489,10 +523,11 @@ def _minutes(seconds: float) -> str:
 
 def build_card_html(*, subject: str, tool_summary: str, session_id: str,
                     working_directory: str | None, timeout_seconds: float,
-                    advice_state: str = "disabled",
+                    advice_state: str = ADVICE_STATE_FALLBACK,
                     suggestion: str = "", reason: str = "", basis: str = "",
                     risk: str = DEFAULT_RISK_SEVERITY,
-                    action_class: str = DEFAULT_ACTION_CLASS) -> str:
+                    action_class: str = DEFAULT_ACTION_CLASS,
+                    logger: Any = None) -> str:
     """审批卡片的 HTML。纯函数——卡片文案是验收项，必须能单测。
 
     六块内容：标题/来源/命令、**极高危红条**、会话与 cwd、
@@ -501,20 +536,34 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
     这样播报和卡片说的是同一套话。
 
     建议块刻意排在按钮**上方**（规格 §16.1「覆盖 §12.1」）：用户点之前要看到。
+
+    **任何 ``advice_state`` 都不能让这个函数抛异常。** 模型建议是锦上添花，
+    卡片是核心功能——建议挂了也必须能正常审批。所以未知状态走
+    ``advice_text`` 的兜底文案；传了 ``logger`` 就顺手记一条 warning，
+    让"为什么这张卡没有建议"有据可查（不传也不影响渲染）。
     """
     location = f"会话 {session_id or '未知'}"
     if working_directory:
         location += f" @ {working_directory}"
 
+    if not is_known_advice_state(advice_state):
+        # 未知状态：兜底 + 记账。绝不向上抛——那会让整张卡片消失。
+        if logger is not None:
+            logger.warning(
+                "审批卡片收到未知的建议状态 {!r}，按「无建议」渲染（请求 {}）",
+                advice_state, session_id or "未知",
+            )
+        advice_state = ADVICE_STATE_FALLBACK
+
     # 建议块：没 key / 没签字 / 没开开关时降级成一行陈述，不编内容。
-    if advice_state == "ready":
+    if advice_state == ADVICE_STATE_READY:
         advice_lines = [
             f"<p><strong>建议：{_escape(suggestion)}</strong></p>",
             f"<p>理由：{_escape(reason)}</p>",
             f"<p>依据：{_escape(basis)}</p>",
         ]
     else:
-        advice_lines = [f"<strong>{_escape(ADVICE_TEXT[advice_state])}</strong>"]
+        advice_lines = [f"<strong>{_escape(advice_text(advice_state))}</strong>"]
 
     # 极高危永远呈现（规格 §2 硬规则 3 + §17.2）：标红 + 明说任何配置都不会
     # 让它自动放行。判据是**动作类别或极高危档**，不是规则名（C3）——
@@ -1316,7 +1365,7 @@ class ApprovalGateway:
             ai_judgement=self._ai_judgement,
             has_key=self._has_api_key,
             backend_ready=self._judge is not None,
-        ) == "ready"
+        ) == ADVICE_STATE_READY
 
     def undecided_count(self) -> int:
         with self._lock:

@@ -53,6 +53,8 @@ from .adapters.claude_code import (
 )
 from .adapters.gateway import current_watermark, read_new_gateway_events
 from .approval import (
+    ADVICE_STATE_FALLBACK,
+    ADVICE_STATE_READY,
     APPROVE_ALLOW,
     AUTH_SCOPES,
     AUTHORIZATION_HEADLINE,
@@ -69,6 +71,7 @@ from .approval import (
     build_explain_html,
     build_result_html,
     explain_request,
+    is_known_advice_state,
 )
 from .broadcast import Broadcaster, describe_actor, render_text
 from .events import UnifiedEvent, attribute, delegated_server
@@ -79,8 +82,17 @@ from .hooksetup import (
     uninstall_hook,
 )
 from .model_advice import (
+    STATE_AUTH_FAILED,
+    STATE_BAD_RESPONSE,
+    STATE_DISABLED,
+    STATE_ERROR,
+    STATE_INVALID,
+    STATE_NO_KEY,
     STATE_OK,
+    STATE_TIMEOUT,
+    STATE_UNAUTHORIZED,
     ModelAdvisor,
+    suggestion_text,
 )
 from .rules import (
     Coalescer,
@@ -276,6 +288,26 @@ def _model_section(config: dict[str, Any]) -> dict[str, Any]:
     """
     section = config.get("model")
     return section if isinstance(section, dict) else {}
+
+
+# 「调用结果码 → 卡片展示状态」的显式映射。
+# 只有这里做这件事（见 _advice_for_card 的文档）。
+# 刻意**穷举** model_advice 的每个 STATE_*：漏一个就意味着那个失败档位
+# 会落到兜底态——功能上安全（卡片照样出），但用户看不到具体原因。
+# 所以漏映射时 _degraded_advice 会记 warning，测试也会盯住这张表覆盖全。
+_DISPLAY_STATE_FOR_OUTCOME = {
+    # 成功：卡片渲染「建议 + 理由 + 依据」三行。内容由 _advice_for_card 填，
+    # 状态名走这张表——保证"成功对应哪个展示态"也只有一处定义。
+    STATE_OK: ADVICE_STATE_READY,
+    STATE_NO_KEY: "no_key",
+    STATE_AUTH_FAILED: ADVICE_STATE_FALLBACK,
+    STATE_TIMEOUT: ADVICE_STATE_FALLBACK,
+    STATE_INVALID: ADVICE_STATE_FALLBACK,
+    STATE_BAD_RESPONSE: ADVICE_STATE_FALLBACK,
+    STATE_DISABLED: ADVICE_STATE_FALLBACK,
+    STATE_UNAUTHORIZED: "unauthorized",
+    STATE_ERROR: ADVICE_STATE_FALLBACK,
+}
 
 
 def _command_of(request: Any) -> str:
@@ -841,6 +873,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
             suggestion=advice["suggestion"], reason=advice["reason"],
             basis=advice["basis"],
             risk=pending.severity, action_class=pending.action_class,
+            logger=self.logger,
         )
         try:
             card = await self.ctx.create_card(
@@ -864,22 +897,27 @@ class AgentDeskmatePlugin(NekoPluginBase):
         ``build_card_html`` 的建议块，没有任何一条路通向 ``hook_response``。
         L2 自动放行仍然要用户签字 + 门控全过 + 有判断后端，那条路不接这个类。
 
+        **这里是「调用结果码 → 卡片展示状态」的唯一翻译点。**
+        ``model_advice.STATE_*`` 与 ``approval.ADVICE_STATES`` 是两套词，
+        曾经有人把前者直接当后者传，模型一成功就 ``ADVICE_TEXT["ok"]``
+        KeyError，整张卡片崩掉（真机实测：第一次真实请求卡片根本没弹出来）。
+        所以这里显式映射，并且**翻译结果必须落进 ADVICE_STATES**，
+        落不进去就按未知状态兜底——宁可没有建议，不能没有卡片。
+
         调用放在线程池里：模型是阻塞 IO，最坏等 15s，不能卡住审批 timer
         （timer 一轮还要建别的卡、推 HUD）。
         """
-        fallback = {"state": self._approval.advice_state(), "suggestion": "",
-                    "reason": "", "basis": ""}
         advisor = self._advisor
         if advisor is None or not advisor.enabled:
-            return fallback
+            return self._degraded_advice(self._approval.advice_state())
         # 没签字 → 不给建议。授权是 L1 的前提，不是可选项。
         if not self._approval.authorized_scopes():
-            return {"state": "unauthorized", "suggestion": "", "reason": "",
-                    "basis": ""}
+            return self._degraded_advice(ADVICE_STATE_FALLBACK,
+                                         reason_override="unauthorized")
         gap = advisor.missing()
         if gap:
             self.logger.info("模型建议降级：{}", gap)
-            return {"state": "no_key", "suggestion": "", "reason": "", "basis": ""}
+            return self._degraded_advice("no_key")
 
         request = pending.request
         loop = asyncio.get_running_loop()
@@ -893,18 +931,38 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 ))
         except Exception as exc:  # noqa: BLE001  建议失败不能炸掉建卡
             self.logger.warning("模型建议调用异常（{}）：{}", type(exc).__name__, exc)
-            return {"state": "error", "suggestion": "", "reason": "", "basis": ""}
+            return self._degraded_advice(ADVICE_STATE_FALLBACK)
 
         if not advice.ok:
             self.logger.info("模型建议降级：state={} detail={}",
                              advice.state, advice.detail)
-            return {"state": advice.state, "suggestion": "", "reason": "", "basis": ""}
+            return self._degraded_advice(_DISPLAY_STATE_FOR_OUTCOME.get(
+                advice.state, ADVICE_STATE_FALLBACK))
+
         basis = (f"工具 {request.tool_name or '未知'}；"
                  f"工作目录 {request.working_directory or '未知'}；"
                  f"本地规则风险档 {pending.severity}"
                  f"（{pending.rule or '未命中'}）；模型 {advice.model}")
-        return {"state": STATE_OK, "suggestion": advice.suggestion,
+        return {"state": _DISPLAY_STATE_FOR_OUTCOME[STATE_OK],
+                # 建议取值也要翻译成人话再上卡片：直接显示 token 的话
+                # 卡片上会出现"建议：allow"这种机器词（同族第二例）。
+                "suggestion": suggestion_text(advice.suggestion),
                 "reason": advice.reason, "basis": basis}
+
+    def _degraded_advice(self, state: str,
+                         reason_override: str | None = None) -> dict[str, str]:
+        """降级的建议块：只给一个展示状态，不给任何建议内容。
+
+        **self-check**：state 必须落在 ``approval.ADVICE_STATES`` 里。
+        不在就退回兜底态并记一条 warning——这就是那条"两套词表"的防线，
+        以后谁再加第三种叫法，这里会当场抓住，而不是等真机上卡片消失。
+        """
+        chosen = reason_override or state
+        if not is_known_advice_state(chosen):
+            self.logger.warning(
+                "模型建议给出了卡片不认识的展示状态 {!r}，按「无建议」渲染", chosen)
+            chosen = ADVICE_STATE_FALLBACK
+        return {"state": chosen, "suggestion": "", "reason": "", "basis": ""}
 
     async def _settle_approval_card(self, pending: Any) -> None:
         """用户点完（或到期）后把卡片改成结果态，并清掉按钮防重复点。"""
