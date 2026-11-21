@@ -26,3 +26,17 @@ stall_minutes = 10
 claude_projects_dir = "~/.claude/projects"
 # cc-switch 网关账本（SQLite，proxy_request_logs 表，只读打开）
 cc_switch_db = "~/.cc-switch/cc-switch.db"
+
+# ── 归因逃生口 ─────────────────────────────────────────────────────────────
+# 你亲自在这些目录下开过的会话。cwd 落在里面的，播报主语写成
+# 「你自己开的 Claude Code」；不在里面的，critical 一律写成「发起者未知」。
+#
+# 为什么需要它：插件看不出一个 claude 进程是你手开的、还是被别的程序
+# spawn 的（真实事故：DSH spawn 的 claude -p 删了文件，播报被读成
+# "我什么时候让 Claude 删东西了"）。进程树不能当依据——Windows 上父进程
+# 可能已退出、中间常隔一层 shell/node。
+# 所以这里要**你自己声明**：这是用户给的事实，不是插件的猜测。
+# 不声明 = 全部按未知处理（宁可少说，不错说）。
+[agent_deskmate.mine]
+roots = []
+# roots = ["D:\\workspace", "C:\\Users\\alpha\\projects"]

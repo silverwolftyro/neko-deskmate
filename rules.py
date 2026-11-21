@@ -25,9 +25,13 @@ import re
 import time
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
-from .events import UnifiedEvent
+from .events import (
+    AttributionFields,
+    UnifiedEvent,
+    delegated_server,
+)
 
 SEVERITY_INFO = "info"
 SEVERITY_NOTICE = "notice"
@@ -50,8 +54,12 @@ _SIMPLE_SPLIT = re.compile(r"[;|&\n]+")
 _SEPARATORS = re.compile(r"[\s;|&()<>]+")
 
 
-class RuleHit(BaseModel):
-    """一条规则命中的结果。coalesce_key 相同的命中在窗口内合并。"""
+class RuleHit(AttributionFields):
+    """一条规则命中的结果。coalesce_key 相同的命中在窗口内合并。
+
+    归因字段来自 ``AttributionFields``（与 ``UnifiedEvent`` 共用同一份不变式），
+    外加三个播报层字段。``attribution`` 由 requester/evidence 推导，不手填。
+    """
 
     rule: str = Field(description="规则名：delete / failure")
     severity: str = Field(description="info / notice / warn / critical")
@@ -61,6 +69,31 @@ class RuleHit(BaseModel):
     session: str = Field(default="", description="会话标识")
     ts: str = Field(default="", description="ISO8601 UTC")
     coalesce_key: str = Field(default="", description="合并键；相同则在窗口内只报一次")
+
+    # 播报层归因（2026-11-21 决策记录 §5）：
+    # chain_id 委托链根，**今天恒等于 session**。等将来 worker 自己的日志也可观测时，
+    #   才靠它把「大脑下派」和「双手执行」并成一条播报；在那之前不要提前造关联键。
+    # delegated_to 下派目标（mcp__ 的 server 名），None = 没有下派。
+    chain_id: str = Field(default="", description="委托链根；今天恒等于 session")
+    delegated_to: str | None = Field(default=None, description="下派目标（MCP server 名）")
+
+
+def _attribution_of(event: UnifiedEvent | None) -> dict:
+    """从源事件取归因字段。
+
+    ``event`` 为 None（测试里直调纯函数）时返回空 dict —— 一切按「未知」处理。
+    刻意**不传** ``attribution``：它由 requester/evidence 推导，手填就会打架。
+    """
+    if event is None:
+        return {}
+    return {
+        "requester": event.requester,
+        "requester_evidence": event.requester_evidence,
+        "executor": event.executor,
+        "working_directory": event.working_directory,
+        "chain_id": event.session,
+        "delegated_to": delegated_server(event.tool),
+    }
 
 
 # ── 分词 ──────────────────────────────────────────────────────────────────
@@ -119,15 +152,20 @@ def match_delete(command: str) -> str | None:
 
 
 def evaluate_delete(command: str, *, agent: str = "", session: str = "",
-                    ts: str = "") -> RuleHit | None:
-    """对一个 Bash 命令判删除类。纯函数，不碰 I/O。"""
+                    ts: str = "", source: UnifiedEvent | None = None) -> RuleHit | None:
+    """对一个 Bash 命令判删除类。纯函数，不碰 I/O。
+
+    ``source`` 是产生这个命令的统一事件，只用来带归因字段；不传就是「未知」。
+    """
     matched = match_delete(command)
     if matched is None:
         return None
     return RuleHit(
         rule=RULE_DELETE,
         severity=SEVERITY_CRITICAL,
-        summary=f"删除类操作：{_clip(command)}",
+        # 文案模版用「删除文件」而不是「删除类操作」——后者是内部术语，
+        # 用户在 3 秒内要读懂的是"发生了什么"，不是我们的规则分类。
+        summary=f"删除文件：{_clip(command)}",
         matched=matched,
         agent=agent,
         session=session,
@@ -135,7 +173,9 @@ def evaluate_delete(command: str, *, agent: str = "", session: str = "",
         # 合并粒度按规则区分：删除类每次都是独立的危险动作，只合并"同一条命令重复出现"，
         # 不能按会话合并——那会让用户在一分钟内漏掉好几次不同的删除。
         # 实测依据：真实转录里一分钟内有 4 条不同 rm，按会话合并只会播 1 条。
+        # 归因**不进**合并键（决策记录 §3）：合并按动作算，归因是显示层的事。
         coalesce_key=f"{RULE_DELETE}|{session}|{agent}|{matched}|{_fingerprint(command)}",
+        **_attribution_of(source),
     )
 
 
@@ -163,10 +203,12 @@ def severity_for_status(status_code: Any) -> str | None:
 
 
 def evaluate_failure(*, status_code: Any = None, error_message: str = "",
-                     agent: str = "", session: str = "", ts: str = "") -> RuleHit | None:
+                     agent: str = "", session: str = "", ts: str = "",
+                     source: UnifiedEvent | None = None) -> RuleHit | None:
     """对一个网关请求判失败类。纯函数。
 
     ``status_code`` 为 None 但给了 ``error_message`` 也算失败（网络层错误没有状态码）。
+    ``source`` 只用来带归因字段，不传就是「未知」。
     """
     severity = severity_for_status(status_code)
     if severity is None:
@@ -190,6 +232,7 @@ def evaluate_failure(*, status_code: Any = None, error_message: str = "",
         # 失败类按 会话+状态码 合并：网关每个请求都记一行，同一会话连续 503
         # 不合并就会刷屏。这与删除类刻意不同。
         coalesce_key=f"{RULE_FAILURE}|{session}|{agent}|{matched}",
+        **_attribution_of(source),
     )
 
 
@@ -206,6 +249,8 @@ def evaluate_transcript_error(event: UnifiedEvent) -> RuleHit | None:
         session=event.session,
         ts=event.ts,
         coalesce_key=f"{RULE_FAILURE}|{event.session}|{event.agent}|transcript-error",
+        # 事件本身就是 source：归因字段直接从它带过来
+        **_attribution_of(event),
     )
 
 

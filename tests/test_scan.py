@@ -73,13 +73,22 @@ def _gateway_db(tmp_path: Path, statuses: list[int]) -> Path:
     return db
 
 
-def _section(tmp_path: Path, *, transcript: bool = True, gateway: bool = True) -> dict[str, str]:
-    section: dict[str, str] = {"coalesce_seconds": "60"}
+def _section(tmp_path: Path, *, transcript: bool = True, gateway: bool = True,
+             mine_roots: list[str] | None = None) -> dict:
+    """按插件配置的真实层级造 ``[agent_deskmate]`` 整节。
+
+    注意 ``coalesce_seconds`` 在**顶层**、路径在 ``watch`` 子表里——
+    旧代码把 coalesce_seconds 也当 watch 的键读，永远读不到（已修）。
+    """
+    watch: dict[str, str] = {}
     if transcript:
-        section["claude_projects_dir"] = str(tmp_path / "projects")
+        watch["claude_projects_dir"] = str(tmp_path / "projects")
     if gateway:
-        section["cc_switch_db"] = str(tmp_path / "cc-switch.db")
-    return section
+        watch["cc_switch_db"] = str(tmp_path / "cc-switch.db")
+    config: dict = {"coalesce_seconds": 60, "watch": watch}
+    if mine_roots is not None:
+        config["mine"] = {"roots": mine_roots}
+    return config
 
 
 # ── 基本统计 ────────────────────────────────────────────────────────────────

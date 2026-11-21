@@ -8,7 +8,16 @@ from __future__ import annotations
 
 import pytest
 
-from plugin.plugins.agent_deskmate.events import EVENT_ERROR, UnifiedEvent
+from plugin.plugins.agent_deskmate.events import (
+    ATTRIBUTION_KNOWN,
+    ATTRIBUTION_UNKNOWN,
+    EVENT_ERROR,
+    EVIDENCE_MCP_DELEGATION,
+    EVIDENCE_SIDECHAIN,
+    EVIDENCE_USER_DECLARED,
+    UnifiedEvent,
+    attribute,
+)
 from plugin.plugins.agent_deskmate.rules import (
     RULE_DELETE,
     RULE_FAILURE,
@@ -16,6 +25,7 @@ from plugin.plugins.agent_deskmate.rules import (
     SEVERITY_NOTICE,
     SEVERITY_WARN,
     Coalescer,
+    _attribution_of,
     evaluate_delete,
     evaluate_failure,
     evaluate_transcript_error,
@@ -210,3 +220,80 @@ def test_evaluate_event_rules_for_error_only() -> None:
                             tool="Bash", summary="Bash: ls", ts="t")
     assert len(coalescer.evaluate_event(error_event, now=1000.0)) == 1
     assert coalescer.evaluate_event(ok_event, now=1001.0) == []
+
+
+# ── 归因字段透传（2026-11-21 决策记录 §5） ──────────────────────────────────
+# 规则层自己绝不猜发起者：requester 只能从源事件带过来，不传就是「未知」。
+
+
+def _source(**overrides) -> UnifiedEvent:
+    base = dict(agent="claude-code", session="800257f3-aaaa", event="tool_use",
+                tool="Bash", command="rm -rf build/", ts="2026-11-21T00:00:00+00:00",
+                executor="claude-code", working_directory=r"D:\workspace\N.E.K.O")
+    base.update(overrides)
+    return UnifiedEvent(**base)
+
+
+def test_rule_hit_defaults_to_unknown_attribution() -> None:
+    """不传 source（测试里直调纯函数）→ 一切按未知，规则层不自己填。"""
+    hit = evaluate_delete("rm -rf build/", agent="claude-code", session="s1")
+    assert hit.requester is None
+    assert hit.attribution == ATTRIBUTION_UNKNOWN
+    assert hit.chain_id == ""
+    assert hit.delegated_to is None
+
+
+def test_delete_carries_attribution_from_source() -> None:
+    source = attribute(_source(), mine_roots=[r"D:\workspace"])
+    hit = evaluate_delete("rm -rf build/", agent=source.agent, session=source.session,
+                          ts=source.ts, source=source)
+    assert hit.requester == "user"
+    assert hit.requester_evidence == EVIDENCE_USER_DECLARED
+    assert hit.attribution == ATTRIBUTION_KNOWN
+    assert hit.executor == "claude-code"
+    assert hit.working_directory == r"D:\workspace\N.E.K.O"
+    assert hit.chain_id == source.session      # 今天恒等于 session
+    assert hit.delegated_to is None
+
+
+def test_failure_carries_attribution_from_source() -> None:
+    source = attribute(_source(event="error", tool=None, command=None,
+                               source_type="proxy_request_logs", status_code=503),
+                       mine_roots=[r"D:\workspace"])
+    hit = evaluate_failure(status_code=503, error_message="overloaded",
+                           agent=source.agent, session=source.session,
+                           ts=source.ts, source=source)
+    assert hit.attribution == ATTRIBUTION_KNOWN
+    assert hit.requester_evidence == EVIDENCE_USER_DECLARED
+    assert hit.chain_id == source.session
+
+
+def test_transcript_error_uses_event_itself_as_source() -> None:
+    source = attribute(_source(event="error", tool=None, command=None, sidechain=True))
+    hit = evaluate_transcript_error(source)
+    assert hit.requester_evidence == EVIDENCE_SIDECHAIN
+    assert hit.attribution == ATTRIBUTION_KNOWN
+    assert hit.chain_id == source.session
+
+
+def test_mcp_source_sets_delegated_to() -> None:
+    """下派目标来自 mcp__ 的 server 名，且不猜它要干什么。"""
+    source = attribute(_source(tool="mcp__deepseek-worker__deepseek_task"))
+    hit = evaluate_delete("rm -rf build/", source=source)
+    assert hit.delegated_to == "deepseek-worker"
+    assert hit.requester_evidence == EVIDENCE_MCP_DELEGATION
+    assert hit.attribution == ATTRIBUTION_KNOWN
+
+
+def test_attribution_never_enters_the_coalesce_key() -> None:
+    """归因是显示层的事，不进合并键（决策记录 §3）——
+    否则同一条命令换个发起者就会变成两条播报。
+    """
+    a = evaluate_delete("rm -rf build/", session="s1")
+    b = evaluate_delete("rm -rf build/", session="s1",
+                        source=attribute(_source(), mine_roots=[r"D:\workspace"]))
+    assert a.coalesce_key == b.coalesce_key
+
+
+def test_attribution_of_none_is_empty() -> None:
+    assert _attribution_of(None) == {}

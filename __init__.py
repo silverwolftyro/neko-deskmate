@@ -24,6 +24,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -44,7 +45,7 @@ from .adapters.claude_code import (
 )
 from .adapters.gateway import current_watermark, read_new_gateway_events
 from .broadcast import Broadcaster, render_text
-from .events import UnifiedEvent
+from .events import UnifiedEvent, attribute
 from .rules import (
     Coalescer,
     RuleHit,
@@ -124,6 +125,30 @@ def _to_number(value: object, default: float) -> float:
     return result if result == result else default
 
 
+def _watch_section(config: dict[str, Any]) -> dict[str, Any]:
+    """从 ``[agent_deskmate]`` 整节里取 ``watch`` 子表；没有就是空 dict。"""
+    section = config.get("watch")
+    return section if isinstance(section, dict) else {}
+
+
+def _mine_roots(config: dict[str, Any]) -> list[Path]:
+    """读用户声明的"这些目录里的会话是我自己开的"（``[agent_deskmate.mine].roots``）。
+
+    这是**用户给的事实**，不是插件的猜测，所以它可以当归因依据（决策记录 §2 逃生口）。
+    没声明 → 空列表 → 一切按「发起者未知」处理。
+    """
+    mine = config.get("mine")
+    raw = mine.get("roots") if isinstance(mine, dict) else None
+    if not isinstance(raw, (list, tuple)):
+        return []
+    roots: list[Path] = []
+    for item in raw:
+        path = _expand(item)
+        if path is not None:
+            roots.append(path)
+    return roots
+
+
 # ── 只读诊断（scan_now） ────────────────────────────────────────────────────
 # 这一整块刻意与常驻轮询的状态隔离，理由见 diagnose() 的文档字符串。
 # 放在模块级而不是类方法里，是为了能在没有宿主 ctx 的情况下单测。
@@ -151,38 +176,42 @@ def _scan_gateway_tail(db_path: Path, count: int) -> list[UnifiedEvent]:
     return events[-count:]
 
 
-def _hits_for_event(event: UnifiedEvent) -> list[RuleHit]:
-    """一个事件跑当前阶段所有规则。
+def _hits_for_event(event: UnifiedEvent, mine_roots: list[Path] = ()) -> list[RuleHit]:
+    """一个事件跑当前阶段所有规则。先归因，再判规则。
 
     删除类用完整命令判（summary 被截断，会漏掉长命令里的 rm）；
     失败类按真实状态码定严重度，不从 summary 文本反解析。
+    ``source`` 把归因字段带进 RuleHit——不传就是「未知」，规则层绝不自己猜。
     """
+    attributed = attribute(event, mine_roots=mine_roots)
     hits: list[RuleHit] = []
 
-    if event.event == "tool_use" and event.command:
+    if attributed.event == "tool_use" and attributed.command:
         hit = evaluate_delete(
-            event.command,
-            agent=event.agent, session=event.session, ts=event.ts,
+            attributed.command,
+            agent=attributed.agent, session=attributed.session, ts=attributed.ts,
+            source=attributed,
         )
         if hit is not None:
             hits.append(hit)
 
-    elif event.event == "error":
-        if event.source_type == "proxy_request_logs":
+    elif attributed.event == "error":
+        if attributed.source_type == "proxy_request_logs":
             hit = evaluate_failure(
-                status_code=event.status_code,
-                error_message=event.summary,
-                agent=event.agent, session=event.session, ts=event.ts,
+                status_code=attributed.status_code,
+                error_message=attributed.summary,
+                agent=attributed.agent, session=attributed.session, ts=attributed.ts,
+                source=attributed,
             )
         else:
-            hit = evaluate_transcript_error(event)
+            hit = evaluate_transcript_error(attributed)
         if hit is not None:
             hits.append(hit)
 
     return hits
 
 
-def diagnose(section: dict[str, str], *, log=None,
+def diagnose(config: dict[str, Any], *, log=None,
              per_source: int = SCAN_EVENT_COUNT) -> ScanNowReply:
     """读一遍观测源并跑规则，返回统计；**一次播报都不发送**。
 
@@ -196,6 +225,7 @@ def diagnose(section: dict[str, str], *, log=None,
     它不知道常驻轮询已经播过什么，所以刚刚播过的同类事件这里可能仍计 1。
     这是有意的取舍：诊断宁可多说一条，也不能让宿主少播一条。
     """
+    section = _watch_section(config)
     events: list[UnifiedEvent] = []
     sources: dict[str, str] = {}
 
@@ -213,12 +243,13 @@ def diagnose(section: dict[str, str], *, log=None,
     else:
         sources["gateway_metadata"] = "未配置或文件不存在"
 
-    coalescer = Coalescer(window_seconds=_to_number(section.get("coalesce_seconds"), 60.0))
+    mine_roots = _mine_roots(config)
+    coalescer = Coalescer(window_seconds=_to_number(config.get("coalesce_seconds"), 60.0))
     hits: list[RuleHit] = []
     broadcasts = 0
     samples: list[str] = []
     for event in events:
-        for hit in _hits_for_event(event):
+        for hit in _hits_for_event(event, mine_roots):
             hits.append(hit)
             if coalescer.offer(hit) is None:
                 continue  # 一次性合并器：同键在窗口内只算一条
@@ -300,28 +331,30 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
     # ── 配置 ───────────────────────────────────────────────────────────────
 
-    async def _watch_config(self) -> dict[str, str]:
-        """读出观测路径配置。缺配置时返回空 dict，由调用方判"不可用"，不猜默认路径。"""
+    async def _plugin_config(self) -> dict[str, Any]:
+        """读出 ``[agent_deskmate]`` **整节**。缺配置时返回空 dict，不猜默认值。
+
+        刻意返回整节而不是只返回 ``watch`` 子表：``coalesce_seconds`` 在
+        ``[agent_deskmate]`` 顶层（见 config.example.toml），不在 ``watch`` 里。
+        旧代码只取 ``watch`` 子表后读 ``coalesce_seconds``，**永远读不到**，
+        用户改这个键会被静默忽略——现在按文件里的真实层级读。
+        """
         try:
             dumped = await self.config.dump(timeout=5.0)
         except Exception as exc:
             self.logger.warning("读取配置失败：{}", type(exc).__name__)
             return {}
-        if not isinstance(dumped, dict):
-            return {}
-        watch = dumped.get("agent_deskmate")
-        if not isinstance(watch, dict):
-            return {}
-        section = watch.get("watch", {})
+        section = dumped.get("agent_deskmate")
         return section if isinstance(section, dict) else {}
 
     # ── 观测轮询（M0-lite-4 的常驻部分） ──────────────────────────────────
 
-    def _ensure_watchers(self, section: dict[str, str]) -> Broadcaster | None:
+    def _ensure_watchers(self, config: dict[str, Any]) -> Broadcaster | None:
         """按当前配置建好适配器与播报器。配置没给路径就返回 None（不猜默认值）。"""
         if self._broadcaster is not None:
             return self._broadcaster
 
+        section = _watch_section(config)
         projects_dir = _expand(section.get("claude_projects_dir"))
         db_path = _expand(section.get("cc_switch_db"))
         if not (projects_dir is not None and projects_dir.is_dir()) \
@@ -332,7 +365,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
             )
             return None
 
-        coalesce_seconds = _to_number(section.get("coalesce_seconds"), 60.0)
+        coalesce_seconds = _to_number(config.get("coalesce_seconds"), 60.0)
         # 路径配了但不存在时同样不建适配器——建了也只会 poll 出空，还误导日志。
         self._transcript_adapter = (
             ClaudeCodeAdapter(projects_dir)
@@ -352,15 +385,16 @@ class AgentDeskmatePlugin(NekoPluginBase):
         )
         return self._broadcaster
 
-    def _poll_once(self, section: dict[str, str]) -> list[str]:
+    def _poll_once(self, config: dict[str, Any]) -> list[str]:
         """扫一轮观测源 → 跑规则 → 播报。同步函数，由 timer 丢进线程执行。
 
         返回本轮播报结果列表，便于测试与入口观察。
         """
-        broadcaster = self._ensure_watchers(section)
+        broadcaster = self._ensure_watchers(config)
         if broadcaster is None:
             return []
 
+        mine_roots = _mine_roots(config)
         events: list[UnifiedEvent] = []
         if self._transcript_adapter is not None:
             events.extend(self._transcript_adapter.poll())
@@ -369,7 +403,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
         outcomes: list[str] = []
         for event in events:
-            for hit in _hits_for_event(event):
+            for hit in _hits_for_event(event, mine_roots):
                 outcomes.append(broadcaster.broadcast(hit))
                 if len(outcomes) >= MAX_BROADCAST_PER_TICK:
                     self.logger.info("本轮播报已达上限 {} 条，余下留待下一轮",
@@ -390,8 +424,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
         阻塞的 I/O 丢进线程；push_message 是普通调用，任何线程都能用。
         """
         try:
-            section = await self._watch_config()
-            await asyncio.to_thread(self._poll_once, section)
+            config = await self._plugin_config()
+            await asyncio.to_thread(self._poll_once, config)
         except Exception as exc:  # noqa: BLE001  一轮失败不能杀死 timer
             self.logger.warning("观测轮询异常（{}）：{}", type(exc).__name__, exc)
 
@@ -442,7 +476,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
         常驻轮询（M0-lite-4）用适配器的 offset / rowid 水位。
         """
         count = max(1, min(int(count), 100))
-        section = await self._watch_config()
+        config = await self._plugin_config()
+        section = _watch_section(config)
         sources: dict[str, str] = {}
         events: list[UnifiedEvent] = []
 
@@ -493,8 +528,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
         读盘丢进线程：入口跑在 entry loop 里，阻塞它会拖慢同 loop 上的其它调用。
         """
-        section = await self._watch_config()
-        return await asyncio.to_thread(diagnose, section, log=self.logger)
+        config = await self._plugin_config()
+        return await asyncio.to_thread(diagnose, config, log=self.logger)
 
     # ── 一次性读取（不走增量水位） ──────────────────────────────────────────
 
