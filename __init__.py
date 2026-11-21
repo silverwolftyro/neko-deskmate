@@ -63,17 +63,25 @@ from .approval import (
     CARD_CSS,
     DECIDED_BY_AI,
     DECIDED_BY_USER,
+    VERBOSITIES,
+    VERBOSITY_STANDARD,
     ApprovalGateway,
+    advice_text,
     build_authorize_actions,
     build_authorize_html,
     build_card_actions,
     build_card_html,
+    build_explain_actions,
     build_explain_html,
     build_result_html,
     explain_request,
     is_known_advice_state,
 )
 from .broadcast import Broadcaster, describe_actor, render_text
+from .commands import (
+    CONCLUSION_UNSURE,
+    conclusion_for,
+)
 from .events import UnifiedEvent, attribute, delegated_server
 from .hooksetup import (
     install_hook,
@@ -92,7 +100,6 @@ from .model_advice import (
     STATE_TIMEOUT,
     STATE_UNAUTHORIZED,
     ModelAdvisor,
-    suggestion_text,
 )
 from .rules import (
     Coalescer,
@@ -321,6 +328,13 @@ def _command_of(request: Any) -> str:
     if name and summary.startswith(f"{name}:"):
         return summary[len(name) + 1:].strip()
     return summary
+
+
+def _verbosity_of(config: dict[str, Any]) -> str:
+    """「这是什么」讲多细。认不出的值按 standard——不猜用户想要多细。"""
+    raw = str(_approval_section(config).get("explain_verbosity")
+              or VERBOSITY_STANDARD).strip().lower()
+    return raw if raw in VERBOSITIES else VERBOSITY_STANDARD
 
 
 def _advisor_from_config(config: dict[str, Any]) -> ModelAdvisor:
@@ -595,15 +609,22 @@ class AgentDeskmatePlugin(NekoPluginBase):
             )
 
     def _check_installed_hook_port(self, port: int) -> None:
-        """已装进 Claude Code settings 的那条 hook，端口和配置不一致时大声报警。
+        """启动自检：已装进 Claude Code settings 的那条 hook 还好不好用。
 
-        改过 ``approval.port`` 之后必须重跑 ``hook_install`` 入口——旧 hook 还在
-        打旧端口，症状是"插件没反应"，不明确指出来能查一小时。
-        没装过 hook 也在这里说一句：5a 实测发现没人装 hook 是"卡片永远不来"
-        的头号原因，启动时提醒比让用户自己发现好。
+        四件事分开说，不合成一句"hook 坏了"——用户看到"坏了"不知道该干什么：
+
+        1. 没装过 → 提示去调 ``hook_install``；
+        2. 残留旧的 http 形状 → 提示替换（那个形状插件没开时会卡死一切）；
+        3. **hook 里的中继文件不存在** → 明确报"中继文件已丢失 + 路径 + 重跑
+           （2026-11-22 真机事故：宿主清空了安装副本，hook 指向死链接，
+           症状是卡片永不出现而用户无感知，只剩一条莫名的"端口不一致"）；
+        4. 端口解析不出 / 与配置不一致 → 分别说清楚。
+
+        端口解析不出时**不许在日志里输出 None**——那看起来像"端口就是 None"，
+        而不是"我没解析出来"。
         """
         target = settings_path()
-        installed = installed_hook(target, self.plugin_dir)
+        installed = installed_hook(target, self.data_path())
         if installed is None:
             self.logger.warning(
                 "Claude Code settings 里没有装配审批中继（{} 未找到我们的 hook）。"
@@ -612,7 +633,6 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 target,
             )
             return
-        port = installed.get("port")
         if installed.get("kind") == "http":
             # 残留的旧形状：既不清它也不提它，用户就完全不知情，
             # 而那个形状在插件没开时会把该目录下所有权限请求卡死。
@@ -623,12 +643,38 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 target,
             )
             return
-        if port != self._approval.port:
+
+        script = installed.get("script")
+        if not script:
             self.logger.error(
-                "端口不一致：配置 approval.port={} 但已装配的 hook 用的是 {}。"
+                "无法从已装配的 hook 命令里解析出中继脚本路径（{}）。"
+                "请重跑 hook_install 入口重写这条 hook",
+                target,
+            )
+            return
+        if not Path(script).is_file():
+            self.logger.error(
+                "审批中继文件已丢失（{}）。它可能被宿主清理或手动删除了——"
+                "PermissionRequest 会打不通，卡片永远不会出现。"
+                "请调一次 hook_install 入口，它会重新放好这份文件并重写 hook",
+                script,
+            )
+            return
+
+        hooked = installed.get("port")
+        if hooked is None:
+            self.logger.error(
+                "无法从已装配的 hook 命令中解析端口（{}）。"
+                "请重跑 hook_install 入口重写这条 hook",
+                target,
+            )
+            return
+        if hooked != self._approval.port:
+            self.logger.error(
+                "端口不一致：配置里是 {}，但已装配的 hook 用的是 {}。"
                 "PermissionRequest 会打到旧端口上，请重跑 hook_install 入口"
                 "（它会替换成新端口，不会多出一条）",
-                self._approval.port, port,
+                self._approval.port, hooked,
             )
 
     def _log_first_run_hint(self, config: dict[str, Any]) -> None:
@@ -866,13 +912,14 @@ class AgentDeskmatePlugin(NekoPluginBase):
         body = request.tool_summary or request.tool_name or "未知工具"
         timeout = self._approval.timeout_seconds
         advice = await self._advice_for_card(pending)
+        # 整份建议留在记录上：解释卡要显示模型的理由与依据（规格 P3）。
+        pending.advice = advice
         html = build_card_html(
             subject=subject, tool_summary=body, session_id=request.session_id,
             working_directory=request.working_directory, timeout_seconds=timeout,
             advice_state=advice["state"],
-            suggestion=advice["suggestion"], reason=advice["reason"],
-            basis=advice["basis"],
             risk=pending.severity, action_class=pending.action_class,
+            command=_command_of(request), conclusion=advice["conclusion"],
             logger=self.logger,
         )
         try:
@@ -936,17 +983,23 @@ class AgentDeskmatePlugin(NekoPluginBase):
         if not advice.ok:
             self.logger.info("模型建议降级：state={} detail={}",
                              advice.state, advice.detail)
-            return self._degraded_advice(_DISPLAY_STATE_FOR_OUTCOME.get(
+            degraded = self._degraded_advice(_DISPLAY_STATE_FOR_OUTCOME.get(
                 advice.state, ADVICE_STATE_FALLBACK))
+            # 没有模型结论时，结论行落最保守的第三态——那正是"该有人决定"的
+            # 时刻，插件不替用户判断（规格 §8）。
+            degraded["conclusion"] = CONCLUSION_UNSURE
+            return degraded
 
         basis = (f"工具 {request.tool_name or '未知'}；"
                  f"工作目录 {request.working_directory or '未知'}；"
                  f"本地规则风险档 {pending.severity}"
                  f"（{pending.rule or '未命中'}）；模型 {advice.model}")
+        # 结论行只准三种写法（规格 P2）：建议允许 / 建议拒绝 /
+        # 无法判断，需要你决定。模型的 allow / deny / unsure token 在这里
+        # 翻译成人话，绝不上卡片。理由与依据不进主卡（规格 P3：折叠进
+        # 「这是什么」），但它们要留在记录上，解释卡用。
         return {"state": _DISPLAY_STATE_FOR_OUTCOME[STATE_OK],
-                # 建议取值也要翻译成人话再上卡片：直接显示 token 的话
-                # 卡片上会出现"建议：allow"这种机器词（同族第二例）。
-                "suggestion": suggestion_text(advice.suggestion),
+                "conclusion": conclusion_for(advice.suggestion),
                 "reason": advice.reason, "basis": basis}
 
     def _degraded_advice(self, state: str,
@@ -962,7 +1015,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
             self.logger.warning(
                 "模型建议给出了卡片不认识的展示状态 {!r}，按「无建议」渲染", chosen)
             chosen = ADVICE_STATE_FALLBACK
-        return {"state": chosen, "suggestion": "", "reason": "", "basis": ""}
+        return {"state": chosen, "conclusion": CONCLUSION_UNSURE,
+                "reason": "", "basis": ""}
 
     async def _settle_approval_card(self, pending: Any) -> None:
         """用户点完（或到期）后把卡片改成结果态，并清掉按钮防重复点。"""
@@ -1023,26 +1077,90 @@ class AgentDeskmatePlugin(NekoPluginBase):
         ),
     )
     async def approval_explain(self, request_id: str, _ctx: dict):
-        """「这是什么」按钮的落点。L0 级解释，不猜意图。"""
+        """「这是什么」按钮的落点：解释，只说事实，不猜意图。
+
+        解释卡**自带允许 / 拒绝 / 返回审批三个按钮**（2026-11-22 真机反馈）：
+        原来它把审批卡的按钮整个替换掉，用户看完解释只能干等到期。
+        """
         if self._approval is None:
             return Err(SdkError("审批服务未运行"))
         pending = self._approval.find(request_id)
         if pending is None:
             return Err(SdkError("找不到这个审批请求（可能已过期并被清理）"))
+        advice = getattr(pending, "advice", None) or {}
         explanation = explain_request(
             tool_name=pending.request.tool_name,
             tool_summary=pending.request.tool_summary,
             working_directory=pending.request.working_directory,
             rule=pending.rule,
             severity=pending.severity,
+            command=_command_of(pending.request),
+            model_reason=advice.get("reason", ""),
+            basis=advice.get("basis", ""),
+            # 没接入模型/没签字时那句陈述。主卡不放它（正文固定四行），
+            # 但用户点「这是什么」时该看到。
+            model_note=(advice_text(advice.get("state", ADVICE_STATE_FALLBACK))
+                        if advice.get("state") != ADVICE_STATE_READY else ""),
+            verbosity=_verbosity_of(getattr(self, "_last_config", {}) or {}),
         )
         try:
             card = self.ctx.get_card(_ctx["card_id"], target_lanlan=_ctx.get("lanlan_name"))
-            await card.update(html=build_explain_html(explanation),
-                              summary=explanation["title"], actions={})
+            await card.update(html=build_explain_html(explanation, request_id),
+                              summary=explanation["title"],
+                              actions=build_explain_actions(request_id))
         except (CardSubmissionError, KeyError) as exc:
             self.logger.warning("解释卡片更新失败（{}）：请求 {}", exc, request_id)
         return Ok(explanation)
+
+    @plugin_entry(
+        id="approval_show",
+        name=tr("entry.approval_show.name", default="回到审批"),
+        description=tr(
+            "entry.approval_show.description",
+            default="解释卡上「返回审批」按钮的落点：把卡片还原成审批态。"
+                    "正常不会手动调用它。",
+        ),
+    )
+    async def approval_show(self, request_id: str, _ctx: dict):
+        """「返回审批」：把解释卡还原成审批态。
+
+        没有这个入口，用户在解释态里没有任何路可以回到做决定——
+        只能干等到期，而那正是规格要避免的。
+        """
+        if self._approval is None:
+            return Err(SdkError("审批服务未运行"))
+        pending = self._approval.find(request_id)
+        if pending is None:
+            return Err(SdkError("找不到这个审批请求（可能已过期并被清理）"))
+        if pending.settled():
+            return Ok({"message": "这个请求已经决定过了"})
+        request = pending.request
+        advice = getattr(pending, "advice", None) or {}
+        subject = describe_actor(
+            executor=request.agent or "claude-code",
+            requester_evidence="", requester=None,
+        )
+        html = build_card_html(
+            subject=subject,
+            tool_summary=request.tool_summary or request.tool_name or "未知工具",
+            session_id=request.session_id,
+            working_directory=request.working_directory,
+            timeout_seconds=self._approval.timeout_seconds,
+            advice_state=advice.get("state", ADVICE_STATE_FALLBACK),
+            risk=pending.severity, action_class=pending.action_class,
+            command=_command_of(request),
+            conclusion=advice.get("conclusion", ""),
+            logger=self.logger,
+        )
+        try:
+            card = self.ctx.get_card(_ctx["card_id"], target_lanlan=_ctx.get("lanlan_name"))
+            await card.update(html=html,
+                              summary=f"审批：{subject} 请求执行 "
+                                      f"{request.tool_summary}"[:80],
+                              actions=build_card_actions(request_id))
+        except (CardSubmissionError, KeyError) as exc:
+            self.logger.warning("审批卡片还原失败（{}）：请求 {}", exc, request_id)
+        return Ok({"message": "已回到审批态"})
 
     # ── hook 装配（5a 实测：没人装 hook，卡片永远不来） ────────────────────
 
@@ -1074,6 +1192,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
             self.plugin_dir, port,
             settings=settings_path(),
             backup_dir=self.data_path("hook-backups"),
+            data_dir=self.data_path(),
         )
         if not result.get("ok"):
             self.logger.error("hook 装配失败：{}", result.get("reason"))
@@ -1088,6 +1207,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
             "backup": result.get("backup"),
             "port": port,
             "command": result["command"],
+            "relay_file": result.get("relay_file"),
             "message": ("已写入。重启 Claude Code 后生效；"
                         "插件没启动时中继会输出空对象，Claude Code 回退原生权限弹窗。"),
         })
@@ -1274,12 +1394,17 @@ class AgentDeskmatePlugin(NekoPluginBase):
     def _hook_status(self) -> dict[str, Any]:
         """审批 hook 装没装、装的是哪个端口。只读，不发起任何请求。"""
         target = settings_path()
-        found = installed_hook(target, self.plugin_dir)
+        found = installed_hook(target, self.data_path())
+        script = (found or {}).get("script")
         return {
             "installed": found is not None,
             "kind": (found or {}).get("kind"),
             "settings_file": str(target),
             "port": (found or {}).get("port"),
+            # 中继文件在不在也报出来：真机事故就是它被宿主清掉，
+            # 而症状只是"卡片不来"，不报这个字段用户查不到这一步。
+            "relay_file": script,
+            "relay_present": bool(script) and Path(script).is_file(),
         }
 
     def _model_status(self) -> dict[str, Any]:

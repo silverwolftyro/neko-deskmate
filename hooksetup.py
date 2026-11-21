@@ -61,13 +61,10 @@ def settings_path() -> Path:
     return Path.home() / ".claude" / "settings.json"
 
 
-def relay_script_path(plugin_dir: Any) -> Path:
-    """中继脚本的绝对路径。
+def source_relay_path(plugin_dir: Any) -> Path:
+    """插件目录里那份中继脚本（源码）。
 
-    刻意**总是绝对路径**：hook 触发时的 cwd 是 Claude Code 的工作目录，
-    不是插件目录。万一宿主传进来的 plugin_dir 是相对路径（真机实测见过
-    开发模式下传相对路径的情况），相对路径装进去就是一个永远找不到脚本的 hook，
-    而症状是"每次权限请求都失败"——所以这里兜底解析成绝对路径。
+    **不要把它装进 hook**：发布后插件会被复制到别处，源码目录可能不存在。
     """
     root = Path(plugin_dir).expanduser()
     if not root.is_absolute():
@@ -75,18 +72,120 @@ def relay_script_path(plugin_dir: Any) -> Path:
     return root / RELAY_SCRIPT_NAME
 
 
-def relay_command(plugin_dir: Any, port: int) -> str:
+def installed_relay_path(data_dir: Any) -> Path:
+    """装配进 hook 的那份中继脚本——放在插件自己的数据目录里。
+
+    **为什么不指源码目录、也不指安装副本**（2026-11-22 真机事故）：
+
+    * 指向 ``.neko-plugin-installations\\...``：宿主会清空并重建那个安装副本，
+      插件一重启/重载，hook 就指向一个死链接。症状是
+      ``can't open file '...hook_relay.py': [Errno 2]``，
+      卡片永不出现，而用户完全无感知——只剩一条莫名的"端口不一致"。
+    * 指向源码目录：发布后源码目录不在用户机器上。
+
+    数据目录（``self.data_path()``）归插件自己管，宿主不碰，所以放这里。
+    """
+    return Path(data_dir) / RELAY_SCRIPT_NAME
+
+
+def sync_relay(source: Any, target: Any) -> tuple[bool, str]:
+    """把中继脚本同步到数据目录。返回 ``(是否可用, 原因)``。
+
+    每次装配与每次启动都调：副本不在、内容与源码不一致，都重写。
+    "不一致"要当故障处理——半份脚本跑起来的症状是每次权限请求都报错。
+    """
+    src, dst = Path(source), Path(target)
+    if not src.is_file():
+        return False, f"插件目录里没有中继脚本：{src}"
+    try:
+        payload = src.read_bytes()
+    except OSError as exc:
+        return False, f"读不了中继脚本 {src}（{type(exc).__name__}）：{exc}"
+    try:
+        if dst.is_file() and dst.read_bytes() == payload:
+            return True, ""
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        # 先写临时文件再替换：写一半的脚本比没有脚本更难查。
+        temp = dst.with_name(dst.name + ".neko-tmp")
+        temp.write_bytes(payload)
+        temp.replace(dst)
+    except OSError as exc:
+        return False, f"写不进中继副本 {dst}（{type(exc).__name__}）：{exc}"
+    return True, ""
+
+
+def relay_command(relay_path: Any, port: int) -> str:
     """装配进 settings 的那条 command。
 
     脚本路径用绝对路径：hook 触发时的 cwd 是 Claude Code 的工作目录，
     不是插件目录，相对路径一定找不到。
 
-    末尾的标记注释是**识别用的唯一凭据**：卸载与重复装配都靠它认"这是我的"，
-    不按端口认（端口会变），也不按脚本路径认（插件目录可能被搬走）。
-    中继脚本会忽略这个多余的参数。
+    标记写成 ``--marker <值>`` 这种**真正的 argv 参数**，不用 ``#`` 注释——
+    Windows 的 cmd 不把 ``#`` 当注释，它会被当成一个普通参数传进去，
+    白白多两个 argv。中继脚本会忽略这个多余的参数（见 ``hook_relay.py``）。
+
+    标记是识别用的唯一凭据：卸载与重复装配都靠它认"这是我的"，
+    不按端口认（端口会变），也不按脚本路径认（插件可能被搬到别处）。
     """
-    return (f'{RELAY_INTERPRETER} "{relay_script_path(plugin_dir)}" {int(port)}'
-            f"  # {RELAY_MARKER}")
+    return (f'{RELAY_INTERPRETER} "{Path(relay_path)}" {int(port)}'
+            f" --marker {RELAY_MARKER}")
+
+
+def parse_relay_command(command: Any) -> dict[str, Any]:
+    """从一条 command hook 里解析出脚本路径与端口。
+
+    返回 ``{"script": str|None, "port": int|None}``——**两个都可能是 None**，
+    调用方必须分别给出不同的说法（"文件丢了"和"端口解析不出"是两件事，
+    合成一句"hook 坏了"用户不知道该干什么）。
+
+    解析规则：
+    1. 有 ``--marker`` 就把它及其后的内容整个丢掉（那是我们的标记，不是参数）；
+    2. 剩下的开头是解释器，丢掉；
+    3. 脚本路径可能带引号（路径里有空格时必须引），按引号配对取出；
+    4. 端口取脚本路径**紧后面那个参数**；它若不是纯数字，再退回
+       "后面第一个纯数字参数"。
+
+    第 4 条刻意不按"最后一个数值参数"实现：那种规则下，将来命令里多一个
+    带数值的选项（``--verbose 2``、``--retry 3``）就会被误当成端口——
+    装配时写对、解析时读错，症状是"端口不一致"但两边配置明明一样。
+    "紧后面那个"既不受标记位置影响，也不会被别的选项的值拐走。
+    """
+    if not isinstance(command, str) or not command.strip():
+        return {"script": None, "port": None}
+    body = command
+    marker_at = body.find(f"--marker {RELAY_MARKER}")
+    if marker_at != -1:
+        body = body[:marker_at]
+    tokens = body.strip().split()
+    if not tokens:
+        return {"script": None, "port": None}
+    tokens = tokens[1:] if tokens[0] == RELAY_INTERPRETER else tokens
+    if not tokens:
+        return {"script": None, "port": None}
+
+    script: str | None = None
+    rest: list[str] = []
+    if tokens[0].startswith('"'):
+        # 带引号的路径：找到配对的收引号
+        joined = " ".join(tokens)
+        end = joined.find('"', 1)
+        if end == -1:
+            return {"script": None, "port": None}
+        script = joined[1:end]
+        rest = joined[end + 1:].split()
+    else:
+        script = tokens[0]
+        rest = tokens[1:]
+
+    port: int | None = None
+    if rest and rest[0].isdigit():
+        port = int(rest[0])
+    else:
+        for token in rest:
+            if token.isdigit():
+                port = int(token)
+                break
+    return {"script": script, "port": port}
 
 
 def is_ours(command: Any) -> bool:
@@ -148,70 +247,59 @@ def _entries_of(data: dict[str, Any]) -> list[Any]:
     return list(entries) if isinstance(entries, list) else []
 
 
-def installed_hook(path: Any, plugin_dir: Any) -> dict[str, Any] | None:
+def installed_hook(path: Any, data_dir: Any) -> dict[str, Any] | None:
     """已装配的那条 hook 的详情；没装过返回 None。
 
     **两种形状都认**（``is_our_hook``）：command 带标记 / 老的 http 指向本机。
     老形状必须认：用户机器上可能残留一份过期的 http hook，只认 command 的话
     启动核对会报"没有装配审批中继"——既不清它也不提它，用户完全不知情。
 
-    返回 ``{"kind": "command"|"http", "port": int|None}``。
+    返回 ``{"kind": "command"|"http", "script": str|None, "port": int|None}``。
+    ``script`` / ``port`` 分开返回：启动核对要对"文件丢了"和"端口解析不出"
+    说不同的话，合成一句用户不知道该干什么。
     """
     data, error = read_settings(path)
     if error:
         return None
-    script = str(relay_script_path(plugin_dir))
     for entry in _entries_of(data):
         if not isinstance(entry, dict):
             continue
         for hook in entry.get("hooks") or []:
             if not isinstance(hook, dict) or not is_our_hook(hook):
                 continue
-            kind = "http" if hook.get("type") == "http" else "command"
-            port = _port_of_hook(hook, script)
-            return {"kind": kind, "port": port}
+            if hook.get("type") == "http":
+                url = hook.get("url")
+                port = None
+                if isinstance(url, str):
+                    host_port = url.split("://", 1)[-1].split("/", 1)[0]
+                    _, _, port_text = host_port.rpartition(":")
+                    try:
+                        port = int(port_text)
+                    except ValueError:
+                        port = None
+                return {"kind": "http", "script": url, "port": port}
+            parsed = parse_relay_command(hook.get("command"))
+            return {"kind": "command", "script": parsed["script"],
+                    "port": parsed["port"]}
     return None
 
 
-def _port_of_hook(hook: dict[str, Any], script: str) -> int | None:
-    """从一条 hook 里取出端口。command 从命令参数取，http 从 URL 取。"""
-    if hook.get("type") == "http":
-        url = hook.get("url")
-        if not isinstance(url, str):
-            return None
-        # http://127.0.0.1:48921/hook/permission → 冒号后、斜杠前那段
-        tail = url.split("://", 1)[-1]
-        host_port = tail.split("/", 1)[0]
-        _, _, port_text = host_port.rpartition(":")
-        try:
-            return int(port_text)
-        except ValueError:
-            return None
-    command = hook.get("command")
-    if not isinstance(command, str) or script not in command:
-        return None
-    # 脚本路径在命令里是带引号的，所以切完之后第一个 token 可能是 "。
-    # 引号一律当空白处理，再取第一个纯数字 token；
-    # 标记注释里的 token 不是数字，自然被跳过。
-    for token in command.rsplit(script, 1)[-1].replace('"', " ").split():
-        if token.isdigit():
-            return int(token)
-    return None
-
-
-def installed_port(path: Any, plugin_dir: Any) -> int | None:
+def installed_port(path: Any, data_dir: Any) -> int | None:
     """已装配的那条 hook 用的端口；没装过返回 None。"""
-    found = installed_hook(path, plugin_dir)
+    found = installed_hook(path, data_dir)
     return found["port"] if found else None
 
 
-def selfcheck(plugin_dir: Any) -> tuple[bool, str]:
+def selfcheck(relay_path: Any) -> tuple[bool, str]:
     """真跑一次中继脚本，确认这条 command 在本机能跑起来。
+
+    **验的是即将装进 hook 的那一份**（数据目录里的副本），不是源码目录那份——
+    装进去的既然是副本，跑不通的也可能是副本。
 
     不碰网络（``--selfcheck`` 只打印 ok）。解释器不在 PATH、脚本有语法错，
     都会在这里暴露——装配前拦住，比装完让用户每次权限请求都看报错好。
     """
-    script = relay_script_path(plugin_dir)
+    script = Path(relay_path)
     if not script.is_file():
         return False, f"中继脚本不在：{script}"
     try:
@@ -295,11 +383,14 @@ def _strip_ours(path: Path, backup_dir: Any) -> tuple[int, Path | None, str]:
 
 
 def install_hook(plugin_dir: Any, port: int, *, settings: Any = None,
-                 backup_dir: Any = None,
+                 backup_dir: Any = None, data_dir: Any = None,
                  extra_locations: list[Any] | None = None) -> dict[str, Any]:
     """把中继 hook 装进 Claude Code 的 settings.json。
 
     幂等：已装过就**替换**（端口改了照样正确），不会追加出第二条。
+
+    **中继脚本装在插件自己的数据目录**，hook 指向那一份，不指源码目录、
+    也不指宿主的安装副本（宿主会清空安装副本，2026-11-22 真机事故）。
 
     会顺带清掉别处的旧 hook：真机验收时用户手写进项目 settings 的是
     ``http + onFailure:"block"`` 形状，那个形状在插件没开时会把该目录下所有
@@ -309,8 +400,14 @@ def install_hook(plugin_dir: Any, port: int, *, settings: Any = None,
     自检不过就不写任何文件——返回值里 ``ok`` 为 False 并带原因。
     """
     path = Path(settings) if settings is not None else settings_path()
-    plugin = Path(plugin_dir)
-    ok, why = selfcheck(plugin)
+    target = installed_relay_path(data_dir if data_dir is not None
+                                  else Path(path).parent / "agent_deskmate-data")
+    ok, why = sync_relay(source_relay_path(plugin_dir), target)
+    if not ok:
+        return {"ok": False, "action": "install", "settings_file": str(path),
+                "reason": why}
+    # 自检跑的是**即将装进 hook 的那一份**：副本写坏了也要在这里拦住。
+    ok, why = selfcheck(target)
     if not ok:
         return {"ok": False, "action": "install", "settings_file": str(path),
                 "reason": why}
@@ -321,7 +418,7 @@ def install_hook(plugin_dir: Any, port: int, *, settings: Any = None,
                 "reason": error}
 
     backup = _backup(path, backup_dir) if backup_dir is not None else None
-    command = relay_command(plugin, port)
+    command = relay_command(target, port)
 
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
@@ -362,6 +459,7 @@ def install_hook(plugin_dir: Any, port: int, *, settings: Any = None,
         "ok": True, "action": "install", "settings_file": str(path),
         "backup": str(backup) if backup else None,
         "command": command, "port": int(port),
+        "relay_file": str(target),
         "entries_for_event": len(entries),
         "replaced_here": replaced,
         "cleaned_elsewhere": cleaned,

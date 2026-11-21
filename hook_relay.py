@@ -103,7 +103,20 @@ def main(argv: list[str]) -> int:
         _emit({"ok": True, "script": __file__})
         return 0
 
-    positional = [item for item in argv if not item.startswith("--")]
+    # ``--marker <值>`` 是装配方写进来的识别凭据（Windows 的 cmd 不把 ``#``
+    # 当注释，所以不能用注释）。它对本脚本没有任何意义，连值一起丢掉。
+    args: list[str] = []
+    skip_next = False
+    for item in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if item == "--marker":
+            skip_next = True
+            continue
+        args.append(item)
+
+    positional = [item for item in args if not item.startswith("--")]
     if not positional:
         # 没给端口：什么都不做，交还原生流程。不猜端口。
         _emit({})

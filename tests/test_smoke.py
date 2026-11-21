@@ -67,7 +67,8 @@ def test_events_registered() -> None:
     assert set(registered) == {
         "startup", "shutdown", "config_change", "status", "dump_events", "scan_now",
         "watch", "approval", "approval_decide", "approval_explain",
-        "approval_authorize", "hook_install", "hook_uninstall", "model_test",
+        "approval_authorize", "approval_show", "hook_install", "hook_uninstall",
+        "model_test",
         "pending_list", "audit_list",
     }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"

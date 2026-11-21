@@ -20,12 +20,18 @@ build_card_html() → ctx.create_card()`` 这条完整链路。
 翻译错了当然看不出来。
 
 所以这里补的正是**链路测试**，外加一条针对未知状态的 property 式测试。
+
+2026-11-22 第二轮：主卡正文改成固定四行（规格 P3：动作 / 后果 / 范围 /
+结论），模型的理由与依据折叠进「这是什么」。下面这些测试跟着改了形状，
+但核心不变——**卡片必须出得来**。
 """
 
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import json
+import re as _re
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,9 +49,25 @@ from plugin.plugins.agent_deskmate.approval import (
     PendingApproval,
     build_card_html,
 )
+from plugin.plugins.agent_deskmate.commands import (
+    CONCLUSION_ALLOW,
+    CONCLUSION_DENY,
+    CONCLUSION_UNSURE,
+    CONCLUSIONS,
+)
 from plugin.plugins.agent_deskmate.model_advice import Advice, ModelAdvisor
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
+
+
+def _visible(markup: str) -> str:
+    """剥掉标签与实体之后的纯文本。
+
+    断言"某个词有没有泄到界面上"时必须看**可见文本**：按钮上的
+    ``data-neko-action="deskmate_deny"`` 是内部 id，不是给用户看的字，
+    按整个 HTML 搜会把这种合法内容误判成泄漏（第一版就这么误报过）。
+    """
+    return _html.unescape(_re.sub(r"<[^>]+>", "", markup))
 
 
 class ListLogger:
@@ -129,15 +151,13 @@ def _plugin(gateway: ApprovalGateway, advisor: ModelAdvisor | None,
 
 def _live_advisor(reply: str) -> tuple[ModelAdvisor, Any]:
     """起一个假模型服务，返回指向它的 advisor（协议形状走 openai）。"""
-    recorder = {"bodies": []}
-
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args: Any) -> None:  # noqa: A002
             return
 
         def do_POST(self) -> None:  # noqa: N802  标准库命名
             length = int(self.headers.get("Content-Length") or 0)
-            recorder["bodies"].append(json.loads(self.rfile.read(length)))
+            self.rfile.read(length)
             body = json.dumps({"choices": [{"message": {"content": reply}}]},
                               ensure_ascii=False).encode("utf-8")
             self.send_response(200)
@@ -159,7 +179,7 @@ def _live_advisor(reply: str) -> tuple[ModelAdvisor, Any]:
 # ── 回归 1：完整链路，模型成功给出建议 ───────────────────────────────────
 
 def test_successful_advice_survives_the_whole_card_path() -> None:
-    """真机故障的回归：模型成功 → 卡片必须出得来，且带建议。
+    """真机故障的回归：模型成功 → 卡片必须出得来，且带结论。
 
     走完整链路：真 advisor（假 HTTP）→ _advice_for_card →
     build_card_html → ctx.create_card。任何一步抛异常这里都会红。
@@ -176,22 +196,26 @@ def test_successful_advice_survives_the_whole_card_path() -> None:
 
         assert len(ctx.cards) == 1, "卡片没建出来——这就是真机上那个故障"
         html = ctx.cards[0]["html"]
-        # 建议正文真的在卡片里，而且是**人话**，不是机器 token
-        assert "建议：倾向放行" in html
-        assert "理由：只读命令，无副作用" in html
+        # 主卡正文是固定四行，结论行是三种合法写法之一，且是**人话**
+        assert "<strong>建议允许</strong>" in html
+        # 四行正文：动作行以 ⚠️ 开头（这条是未识别命令，所以走兜底文案），
+        # 后果行与范围行必须都在
+        assert "⚠️" in html
+        assert "后果：" in html and "范围：" in html
         # 同族第二例的守护：卡片上不许出现 allow / deny / unsure 这种 token
-        for token in ("建议：allow", "建议：deny", "建议：unsure"):
-            assert token not in html, f"卡片泄了机器词 {token}"
-        # 依据引用的是真实字段，不是编的
-        assert "Bash" in html
-        assert r"D:\workspace" in html
-        assert "deepseek-chat" in html
+        visible = _visible(html)
+        for token in ("allow", "deny", "unsure"):
+            assert f"建议：{token}" not in visible, f"卡片泄了机器词 {token}"
+        assert "倾向" not in visible
         # 三个按钮一个都不能少
         for action in ("deskmate_approve", "deskmate_deny", "deskmate_explain"):
             assert f'data-neko-action="{action}"' in html
-        # 建议块在按钮上方（规格 §16.1）
-        assert html.index("建议：倾向放行") < html.index(
+        # 结论行在按钮上方（规格 P2：置于最上）
+        assert html.index("<strong>建议允许</strong>") < html.index(
             'data-neko-action="deskmate_approve"')
+        # 依据不进主卡（规格 P3：折叠进「这是什么」），但必须留在记录上
+        basis = pending.advice.get("basis", "")
+        assert "Bash" in basis and "deepseek-chat" in basis
         # 没有 warning：这条路不该有任何降级
         assert not [line for line in logger.lines if line[0] == "warning"], logger.lines
     finally:
@@ -201,10 +225,7 @@ def test_successful_advice_survives_the_whole_card_path() -> None:
 
 
 def test_advice_state_reaching_the_card_is_a_known_one() -> None:
-    """_advice_for_card 交出来的 state 必须是卡片认得的那个词。
-
-    这条直接钉死"两套词表"：翻译点产出物必须落在 ADVICE_STATES 里。
-    """
+    """_advice_for_card 交出来的 state 必须是卡片认得的那个词。"""
     advisor, server = _live_advisor("建议：别放行\n理由：会影响工作区")
     gateway = _gateway(ai_judgement=True, has_api_key=True)
     try:
@@ -217,9 +238,9 @@ def test_advice_state_reaching_the_card_is_a_known_one() -> None:
 
         assert advice["state"] == ADVICE_STATE_READY
         assert advice["state"] in ADVICE_STATES
-        # 建议取值已被翻译成人话，且不是机器 token
-        assert advice["suggestion"] == "倾向别放行"
-        assert advice["suggestion"] not in ("allow", "deny", "unsure")
+        # 结论是三种合法写法之一，且由模型取值翻译而来
+        assert advice["conclusion"] == CONCLUSION_DENY
+        assert advice["conclusion"] in CONCLUSIONS
         assert advice["reason"] == "会影响工作区"
     finally:
         server.shutdown()
@@ -256,8 +277,9 @@ def test_every_failure_outcome_still_produces_a_card(
         html = ctx.cards[0]["html"]
         assert "同桌猫 · 审批请求" in html
         assert 'data-neko-action="deskmate_approve"' in html
-        # 失败档位不编造建议
+        # 失败档位不编造结论
         assert "建议：" not in html
+        assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
     finally:
         gateway.stop()
 
@@ -286,7 +308,7 @@ def test_advisor_exploding_still_produces_a_card() -> None:
 
 
 def test_zero_key_still_produces_a_card() -> None:
-    """零 key（默认态）下建议块降级，卡片照常。"""
+    """零 key（默认态）下结论落第三态，卡片照常。"""
     gateway = _gateway()
     try:
         logger, ctx = ListLogger(), FakeCtx()
@@ -296,7 +318,8 @@ def test_zero_key_still_produces_a_card() -> None:
 
         assert len(ctx.cards) == 1
         html = ctx.cards[0]["html"]
-        assert "安全兜底与模型无关" in html
+        assert "同桌猫 · 审批请求" in html
+        assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
         assert "建议：" not in html
     finally:
         gateway.stop()
@@ -330,7 +353,7 @@ def test_unknown_advice_state_never_raises(state: str) -> None:
     """随便喂什么 state 给 build_card_html，都不许抛异常。
 
     property 式：不枚举"我们认为会出现的坏值"，而是把一整类可疑输入
-    （大小写变体、前后空格、空串、中文、另一种拼写、注入串）全扫一遍。
+    （大小写变体、前后空格、空串、中文、注入串）全扫一遍。
     真正的判据只有一条：**它永远返回一段能渲染的 HTML**。
     """
     html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
@@ -339,21 +362,21 @@ def test_unknown_advice_state_never_raises(state: str) -> None:
     assert html.startswith("<section>")
     assert "同桌猫 · 审批请求" in html
     # 按钮永远在——卡片的核心功能不依赖建议
-    assert 'data-neko-action="deskmate_approve"' in html
-    assert 'data-neko-action="deskmate_deny"' in html
-    assert 'data-neko-action="deskmate_explain"' in html
+    for action in ("deskmate_approve", "deskmate_deny", "deskmate_explain"):
+        assert f'data-neko-action="{action}"' in html
+    # 结论行永远有值：三种合法结论之一
+    assert any(f"<strong>{text}</strong>" in html for text in CONCLUSIONS)
 
 
 @pytest.mark.parametrize("state", UNKNOWN_STATES)
 def test_unknown_advice_state_falls_back_and_logs(state: str) -> None:
-    """未知状态 → 用 disabled 的陈述句 + 记一条 warning。"""
+    """未知状态 → 结论落最保守的第三态 + 记一条 warning。"""
     logger = ListLogger()
     html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
                            session_id="sess-xyz", working_directory=None,
                            timeout_seconds=570, advice_state=state,
                            logger=logger)
-    # 走兜底文案，不编建议
-    assert "安全兜底与模型无关" in html
+    assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
     assert "建议：" not in html
     if state in ADVICE_STATES:
         # 合法状态不该触发 warning
@@ -376,20 +399,55 @@ def test_known_states_do_not_warn() -> None:
             f"合法状态 {state!r} 触发了 warning")
 
 
-def test_every_known_state_renders_something() -> None:
-    """ADVICE_STATES 里每个状态都必须渲染出非空的建议块。"""
+def test_every_known_state_renders_a_legal_conclusion() -> None:
+    """ADVICE_STATES 里每个状态都必须渲染出一个合法结论。
+
+    主卡正文是固定四行，所以这里验的是结论行：ready 态可以用调用方给的
+    结论，其余状态一律第三态——两条都有测试盯着。
+    """
     for state in sorted(ADVICE_STATES):
         html = build_card_html(subject="c", tool_summary="Bash: ls",
                                session_id="s", working_directory=None,
                                timeout_seconds=570, advice_state=state,
-                               suggestion="放行", reason="只读", basis="无副作用")
+                               conclusion=CONCLUSION_ALLOW)
+        assert any(f"<strong>{text}</strong>" in html for text in CONCLUSIONS), state
         if state == ADVICE_STATE_READY:
-            assert "建议：放行" in html
+            assert f"<strong>{CONCLUSION_ALLOW}</strong>" in html
         else:
-            assert "安全兜底与模型无关" in html
+            assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
 
 
 def test_fallback_state_is_itself_known() -> None:
     """兜底态必须合法——否则未知状态会掉进另一个未知状态里。"""
     assert ADVICE_STATE_FALLBACK in ADVICE_STATES
     assert ADVICE_STATE_READY in ADVICE_STATES
+
+
+def test_conclusion_cannot_appear_without_a_ready_state() -> None:
+    """建议层降级时，结论只能是第三态——哪怕调用方误传了一个结论。
+
+    这是防"没有依据的建议允许出现在卡片上"。
+    """
+    for state in ("disabled", "unauthorized", "no_key", "pending_backend"):
+        html = build_card_html(subject="c", tool_summary="Bash: ls",
+                               session_id="s", working_directory=None,
+                               timeout_seconds=570, advice_state=state,
+                               conclusion=CONCLUSION_ALLOW)
+        assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html, state
+        assert CONCLUSION_ALLOW not in _visible(html), state
+
+
+@pytest.mark.parametrize("conclusion", [
+    "倾向别放行", "不建议", "最好不", "可以但", "拒绝或允许都可以",
+    "allow", "deny", "", "建议放行", "同意", "批准", None,
+])
+def test_illegal_conclusion_never_reaches_the_card(conclusion: object) -> None:
+    """非法结论一律落最保守的第三态，原文不外溢。"""
+    html = build_card_html(subject="c", tool_summary="Bash: ls", session_id="s",
+                           working_directory=None, timeout_seconds=570,
+                           advice_state=ADVICE_STATE_READY,
+                           conclusion=conclusion)
+    assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
+    if isinstance(conclusion, str) and conclusion and conclusion != CONCLUSION_UNSURE:
+        assert conclusion not in _visible(html), (
+            f"非法结论 {conclusion!r} 外溢到卡片上了")

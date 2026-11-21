@@ -22,5 +22,7 @@
   "entry.hook_uninstall.name": "Uninstall Approval Hook",
   "entry.hook_uninstall.description": "Removes the approval relay from Claude Code's ~/.claude/settings.json. Only our own entry is touched.",
   "entry.model_test.name": "Test Model Connection",
-  "entry.model_test.description": "Sends a one-word ping to the model configured under [agent_deskmate.model] and reports the model name and elapsed time. No command or context is sent."
+  "entry.model_test.description": "Sends a one-word ping to the model configured under [agent_deskmate.model] and reports the model name and elapsed time. No command or context is sent.",
+  "entry.approval_show.name": "Back to approval",
+  "entry.approval_show.description": "Target of the Back button on the explanation card: restores the approval state. Not meant to be called by hand."
 }

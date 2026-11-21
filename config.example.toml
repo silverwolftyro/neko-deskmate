@@ -99,6 +99,10 @@ auto_decide = "off"
 # 调到 critical 也不会放行删除类——那是规则级排除，不是阈值问题。
 auto_decide_max_severity = "notice"
 
+# 「这是什么」讲多细：brief（只讲结论与最坏结果）|
+# standard（加上范围与规则判据，默认）| detailed（再叠加模型给的理由与依据）。
+explain_verbosity = "standard"
+
 # 模型用的 key。只用来判断"有没有 key"，**不写日志、不进卡片、不给模型看**。
 # 5b 起真正被使用；见下面 [agent_deskmate.model]。
 api_key = ""

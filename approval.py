@@ -69,6 +69,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
+from .commands import (
+    CONCLUSION_UNSURE,
+    CONCLUSIONS,
+    card_lines,
+)
+
 # 决策取值。只有用户点按钮、或 L2 在用户显式授权下自动放行，才能产生这两个值。
 APPROVE_ALLOW = "allow"
 APPROVE_DENY = "deny"
@@ -347,6 +353,9 @@ class PendingApproval:
         self.auto_announced = False
         # 已经进内存的审计行。投递失败时要把它改成最终状态（见 note_host_timeout）。
         self.audit_entry: AuditRecord | None = None
+        # 这一条拿到的模型建议。**只给「这是什么」卡用**——主卡只显示结论行，
+        # 理由与依据按规格 P3 折叠进解释卡，不让它们干扰扫读。
+        self.advice: dict[str, str] = {}
 
     @property
     def key(self) -> tuple[str, str]:
@@ -439,14 +448,18 @@ def hook_response(behavior: str, *, message: str = "") -> dict:
     """按官方 schema 组装回填体。
 
     ``message`` / ``interrupt`` 是 **deny 专属字段**（官方文档：deny 可带
-    message/interrupt；allow 只带 updatedInput）。给 allow 挂 message 不但是
-    无用信息，还是 schema 外的字段——L2 自动放行的说明走通知与审计，不回填。
+    message/interrupt）。给 allow 挂 message 不但是无用信息，还是 schema 外的
+    字段——L2 自动放行的说明走通知与审计，不回填。
+
+    **allow 时刻意不带 ``updatedInput`` / ``updatedPermissions``**
+    （规格 P5.2）：实测无害，但某些版本可能把空对象理解成"把参数清空"。
+    我们没有要改写的参数，那就什么都别带——少给一个字段比多给一个
+    可能被误解的字段安全。deny 仍按官方示例带齐。
     """
-    decision: dict[str, Any] = {
-        "behavior": behavior,
-        "updatedInput": {},
-        "updatedPermissions": [],
-    }
+    decision: dict[str, Any] = {"behavior": behavior}
+    if behavior != APPROVE_ALLOW:
+        decision["updatedInput"] = {}
+        decision["updatedPermissions"] = []
     if message:
         decision["message"] = message
         # 刻意不设 interrupt=True：拒绝这一次调用就好，
@@ -490,11 +503,24 @@ def no_decision_response(*, reason: str, timeout_seconds: float) -> dict:
 ACTION_APPROVE = "deskmate_approve"
 ACTION_DENY = "deskmate_deny"
 ACTION_EXPLAIN = "deskmate_explain"
+# 「这是什么」卡上的"返回审批"：看完解释能当场回到审批态，
+# 不然解释卡把按钮抢光了，用户只能干等到期（2026-11-22 真机反馈）。
+ACTION_BACK = "deskmate_back"
+# 「这是什么」讲多细（规格 P5.3）。三档，默认 standard。
+#   brief     只讲结论与最坏结果
+#   standard  加上范围与规则判据
+#   detailed  再叠加模型给的理由与依据
+VERBOSITY_BRIEF = "brief"
+VERBOSITY_STANDARD = "standard"
+VERBOSITY_DETAILED = "detailed"
+VERBOSITIES = (VERBOSITY_BRIEF, VERBOSITY_STANDARD, VERBOSITY_DETAILED)
+DEFAULT_VERBOSITY = VERBOSITY_STANDARD
 ACTION_AUTH_CONFIRM = "deskmate_authorize_confirm"
 ACTION_AUTH_CANCEL = "deskmate_authorize_cancel"
 # 承载这四个按钮的入口 id。
 ENTRY_DECIDE = "approval_decide"
 ENTRY_EXPLAIN = "approval_explain"
+ENTRY_SHOW = "approval_show"
 ENTRY_AUTHORIZE = "approval_authorize"
 
 CARD_CSS = (
@@ -502,7 +528,13 @@ CARD_CSS = (
     "strong { display: block; margin-bottom: 6px; }"
     "p { margin: 4px 0; }"
     ".loc { color: #888; font-size: 12px; }"
+    # 动作行：第一行，说得最直白，稍微大一点
+    ".act { font-size: 14px; margin: 8px 0 6px; }"
+    # 结论行：独立成行、加粗、置上（规格 P2）
+    ".verdict { font-size: 15px; margin: 8px 0 2px; }"
+    ".verdict strong { display: inline; font-size: 15px; }"
     ".risk { color: #c0392b; font-size: 13px; margin: 6px 0; }"
+    ".src { color: #888; font-size: 12px; margin: 8px 0 2px; }"
     ".hint { color: #aaa; font-size: 12px; margin-top: 8px; }"
     "button { margin: 8px 8px 0 0; padding: 6px 18px; }"
 )
@@ -524,9 +556,9 @@ def _minutes(seconds: float) -> str:
 def build_card_html(*, subject: str, tool_summary: str, session_id: str,
                     working_directory: str | None, timeout_seconds: float,
                     advice_state: str = ADVICE_STATE_FALLBACK,
-                    suggestion: str = "", reason: str = "", basis: str = "",
                     risk: str = DEFAULT_RISK_SEVERITY,
                     action_class: str = DEFAULT_ACTION_CLASS,
+                    command: str = "", conclusion: str = "",
                     logger: Any = None) -> str:
     """审批卡片的 HTML。纯函数——卡片文案是验收项，必须能单测。
 
@@ -540,7 +572,7 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
     **任何 ``advice_state`` 都不能让这个函数抛异常。** 模型建议是锦上添花，
     卡片是核心功能——建议挂了也必须能正常审批。所以未知状态走
     ``advice_text`` 的兜底文案；传了 ``logger`` 就顺手记一条 warning，
-    让"为什么这张卡没有建议"有据可查（不传也不影响渲染）。
+    让"为什么这条没有结论"有据可查（不传也不影响渲染）。
     """
     location = f"会话 {session_id or '未知'}"
     if working_directory:
@@ -555,16 +587,6 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
             )
         advice_state = ADVICE_STATE_FALLBACK
 
-    # 建议块：没 key / 没签字 / 没开开关时降级成一行陈述，不编内容。
-    if advice_state == ADVICE_STATE_READY:
-        advice_lines = [
-            f"<p><strong>建议：{_escape(suggestion)}</strong></p>",
-            f"<p>理由：{_escape(reason)}</p>",
-            f"<p>依据：{_escape(basis)}</p>",
-        ]
-    else:
-        advice_lines = [f"<strong>{_escape(advice_text(advice_state))}</strong>"]
-
     # 极高危永远呈现（规格 §2 硬规则 3 + §17.2）：标红 + 明说任何配置都不会
     # 让它自动放行。判据是**动作类别或极高危档**，不是规则名（C3）——
     # 规则名会随规则库变，红条不能跟着漏。
@@ -576,13 +598,36 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
         if high_risk else ""
     )
 
+    # 主卡正文固定四行（规格 P3）：动作 / 后果 / 范围 / 结论。
+    # 前三行由命令翻译词典产出（本地、零 key），第四行结论由调用方填——
+    # 词典只描述事实，不给结论。
+    lines = card_lines(command=command or tool_summary,
+                       working_directory=working_directory)
+    # 结论行的取值受 advice_state 约束：**只有真的拿到了模型建议，
+    # 结论才可能是"建议允许/建议拒绝"**。建议层降级时（没 key、没签字、
+    # 调用失败、状态未知）一律落最保守的第三态——哪怕调用方误传了一个结论，
+    # 也不能让一个没有依据的"建议允许"出现在卡片上。
+    if advice_state == ADVICE_STATE_READY and conclusion in CONCLUSIONS:
+        conclusion_text = conclusion
+    else:
+        conclusion_text = CONCLUSION_UNSURE
+    body_lines = [
+        # 结论行**置于最上**（规格 P2）：快速扫读时眼睛先落在哪里，
+        # 结论就该在哪里。P3 的四行样例把结论排在最后，与 P2 的"置于最上"
+        # 冲突；这里按 P2 排，因为 P2 给了理由（误读），P3 只给了内容清单。
+        f'<p class="verdict"><strong>{_escape(conclusion_text)}</strong></p>',
+        f'<p class="act">{_escape(lines["action"])}</p>',
+        f"<p>{_escape(lines['consequence'])}</p>",
+        f"<p>{_escape(lines['scope'])}</p>",
+    ]
+
     return (
         "<section>"
         "<strong>同桌猫 · 审批请求</strong>"
-        f"<p>{_escape(subject)} 请求执行：{_escape(tool_summary)}</p>"
+        f"<p class=\"loc\">{_escape(location)}</p>"
+        + "".join(body_lines)
         + risk_html
-        + f"<p class=\"loc\">{_escape(location)}</p>"
-        + "".join(advice_lines)
+        + f"<p class=\"src\">{_escape(subject)} 请求执行</p>"
         + f"<p class=\"hint\">允许后 Claude Code 继续执行；拒绝则中止这次调用"
           f"（不掐掉整个回合）。{_minutes(timeout_seconds)}后无人决定，"
           "宿主会自行处理，届时这条视为未决定——插件不代你判断。</p>"
@@ -595,12 +640,17 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
 
 def explain_request(*, tool_name: str, tool_summary: str,
                     working_directory: str | None, rule: str,
-                    severity: str) -> dict[str, str]:
-    """「这是什么」按钮的落点：L0 级解释，只说事实，不猜意图。
+                    severity: str, command: str = "",
+                    model_reason: str = "", basis: str = "",
+                    model_note: str = "",
+                    verbosity: str = DEFAULT_VERBOSITY) -> dict[str, str]:
+    """「这是什么」按钮的落点：解释，只说事实，不猜意图。
 
-    5a 阶段不接模型，所以这里只讲三件能讲准的事：这条请求是什么、
-    L0 规则对它有什么判断、以及插件不会替你做决定。
-    模型生成的自然语言解释是 5b 的事。
+    主卡的正文只有固定四行（规格 P3），所以模型的理由与依据放在这里——
+    「这是什么」就是看细节的地方，主卡不是。
+
+    ``basis`` 那行按规格 P3 整行来自动生成（工具 / 目录 / 风险档 / 模型名），
+    不许手写：手写的内容迟早和实际字段不一致。
     """
     if rule == "delete":
         verdict = f"L0 规则判定为**删除类**（{severity}），属于高风险动作。"
@@ -614,19 +664,48 @@ def explain_request(*, tool_name: str, tool_summary: str,
         extra = ("即使风险低，只要没开 L2 自动决定，插件仍然只转发、不代判；"
                  "你一直不决定的话，到期后由宿主按 onFailure 策略处理。")
 
-    return {
+    explanation = {
         "title": "这是什么",
         "what": f"Claude Code 请求执行 {tool_name or '某个工具'}：{tool_summary}",
         "verdict": verdict,
         "extra": extra,
         "location": (f"会话工作目录 {working_directory}" if working_directory
                      else "会话工作目录未知"),
-        "note": "以上是规则层能讲准的事实；接模型后的自然语言解释在 5b。",
+        "note": ("以上是规则层能讲准的事实。看不出来历的地方不会替你猜——"
+                 "要不要放行由你定。"),
     }
+    # 讲多细由配置决定（规格 P5.3）。brief 只留结论与后果；standard 加范围
+    # 与规则判据；detailed 再叠加模型给的理由与依据。
+    if verbosity == VERBOSITY_BRIEF:
+        explanation.pop("location", None)
+        explanation.pop("extra", None)
+    elif verbosity != VERBOSITY_DETAILED:
+        model_reason, basis = "", ""
+    if model_note:
+        # 没接入模型时的那句陈述。放在解释卡而不是主卡：主卡正文是固定四行，
+        # 而这句话属于"细节"，正是「这是什么」该放的地方。
+        explanation["model_note"] = model_note
+    if model_reason:
+        explanation["model_reason"] = f"模型给的理由：{model_reason}"
+    if basis:
+        explanation["basis"] = f"依据：{basis}"
+    return explanation
 
 
-def build_explain_html(explanation: dict[str, str]) -> str:
-    """把 explain_request 的结果渲染成卡片用的 HTML。"""
+def build_explain_html(explanation: dict[str, str],
+                       request_id: str = "") -> str:
+    """把 explain_request 的结果渲染成卡片用的 HTML。
+
+    **自带三个按钮**（允许 / 拒绝 / 返回审批）。2026-11-22 真机反馈：
+    解释卡替换了审批卡之后按钮全没了，用户只能干等到期——看完解释
+    当然要能当场决定，所以按钮必须跟着解释一起出现。
+    """
+    buttons = (
+        f"<button data-neko-action=\"{ACTION_APPROVE}\">允许</button>"
+        f"<button data-neko-action=\"{ACTION_DENY}\">拒绝</button>"
+        f"<button data-neko-action=\"{ACTION_BACK}\">返回审批</button>"
+        if request_id else ""
+    )
     return (
         "<section>"
         f"<strong>{_escape(explanation['title'])}</strong>"
@@ -634,9 +713,28 @@ def build_explain_html(explanation: dict[str, str]) -> str:
         f"<p>{_escape(explanation['verdict'])}</p>"
         f"<p>{_escape(explanation['extra'])}</p>"
         f"<p class=\"loc\">{_escape(explanation['location'])}</p>"
-        f"<p class=\"hint\">{_escape(explanation['note'])}</p>"
-        "</section>"
+        + (f"<p class=\"src\">{_escape(explanation['model_note'])}</p>"
+           if explanation.get("model_note") else "")
+        + (f"<p><strong>{_escape(explanation['model_reason'])}</strong></p>"
+           if explanation.get("model_reason") else "")
+        + (f"<p class=\"hint\">{_escape(explanation['basis'])}</p>"
+           if explanation.get("basis") else "")
+        + f"<p class=\"hint\">{_escape(explanation['note'])}</p>"
+        + buttons
+        + "</section>"
     )
+
+
+def build_explain_actions(request_id: str) -> dict[str, dict[str, Any]]:
+    """解释卡的三个按钮 → 两个入口 + 一个返回。"""
+    return {
+        ACTION_APPROVE: {"entry": ENTRY_DECIDE,
+                         "args": {"request_id": request_id, "decision": APPROVE_ALLOW}},
+        ACTION_DENY: {"entry": ENTRY_DECIDE,
+                      "args": {"request_id": request_id, "decision": APPROVE_DENY}},
+        ACTION_BACK: {"entry": ENTRY_SHOW,
+                      "args": {"request_id": request_id}},
+    }
 
 
 def build_card_actions(request_id: str) -> dict[str, dict[str, Any]]:
@@ -874,12 +972,17 @@ class ApprovalGateway:
             target=server.serve_forever, name="deskmate-approval", daemon=True,
         )
         self._thread.start()
+        # 状态行拆成「配置怎么写」与「实际生不生效」两列（规格 P5.1）：
+        # 原来只有一个"L1建议=开/关"，而它按 advice_state() 算——授权没确认时
+        # 显示"关"，用户明明把配置打开了，看着像插件没听懂。
         self._logger.info(
             "审批服务就绪 http://127.0.0.1:{}{} 到期={}s 保留={}s "
-            "L1建议={} L2自动={} 授权={} 判断后端={}",
+            "配置=建议{}/自动{} 生效=建议{}/自动{} 授权={} 判断后端={}",
             self._port, HOOK_PATH, self._timeout_seconds, self._retention_seconds,
-            "开" if self._l1_ready() else "关",
+            "开" if self._ai_judgement else "关",
             self._auto_decide,
+            "是" if self._l1_ready() else "否",
+            "是" if self._auto_decide_live() else "否",
             "已确认" if self._authorization is not None else "未确认",
             "已接入" if self._judge is not None else "未接入（5b）",
         )
@@ -1359,6 +1462,13 @@ class ApprovalGateway:
             backend_ready=self._judge is not None,
             authorized=bool(self.authorized_scopes()),
         )
+
+    def _auto_decide_live(self) -> bool:
+        """L2 现在是否真的能自动放行（配置开 + 授权签了 + 有后端）。"""
+        if self._auto_decide != AUTO_LOW_RISK_ONLY or self._judge is None:
+            return False
+        scopes = self._authorization.scopes if self._authorization else ()
+        return AUTH_SCOPE_AUTO in scopes
 
     def _l1_ready(self) -> bool:
         return advice_state(

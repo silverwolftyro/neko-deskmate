@@ -30,12 +30,15 @@ from plugin.plugins.agent_deskmate.hooksetup import (
     install_hook,
     installed_hook,
     installed_port,
+    installed_relay_path,
     is_ours,
+    parse_relay_command,
     read_settings,
     relay_command,
-    relay_script_path,
     selfcheck,
     settings_path,
+    source_relay_path,
+    sync_relay,
     uninstall_hook,
 )
 
@@ -69,43 +72,56 @@ def test_settings_path_points_at_user_claude_config() -> None:
     assert path.parent.name == ".claude"
 
 
-def test_relay_command_uses_an_absolute_script_path() -> None:
+def test_relay_command_uses_an_absolute_script_path(tmp_path: Path) -> None:
     """hook 触发时的 cwd 是 Claude Code 的工作目录，相对路径一定找不到。"""
-    command = relay_command(PLUGIN_DIR, 48921)
-    assert relay_script_path(PLUGIN_DIR).is_absolute()
-    assert str(relay_script_path(PLUGIN_DIR)) in command
+    command = relay_command(tmp_path / "hook_relay.py", 48921)
+    assert (tmp_path / "hook_relay.py").is_absolute()
+    assert str(tmp_path / "hook_relay.py") in command
     assert "48921" in command
 
 
-def test_relay_command_absolutises_a_relative_plugin_dir() -> None:
-    """宿主万一传相对路径，也要装出绝对路径的命令。
+def test_relay_command_uses_a_real_marker_flag_not_a_comment() -> None:
+    """标记必须是 ``--marker <值>`` 这种真 argv 参数，不能是 ``#`` 注释。
 
-    开发模式下见过传相对路径的情况。装一条相对路径的 hook，症状是
-    "每次权限请求都失败"——脚本根本找不到，所以这里兜底。
+    Windows 的 cmd 不把 ``#`` 当注释，它会作为普通参数传进去——
+    白白多两个 argv，而且看起来像我们能控制它，其实不能。
     """
-    command = relay_command("plugin/plugins/agent_deskmate", 48921)
-    assert relay_script_path("plugin/plugins/agent_deskmate").is_absolute()
-    assert "\\" in command or "/" in command
-    assert not command.startswith("python \"plugin")
-
-
-def test_relay_command_carries_the_marker() -> None:
-    """卸载靠标记认自己，不靠端口——端口会变。"""
-    command = relay_command(PLUGIN_DIR, 48921)
+    command = relay_command(Path("D:/data/hook_relay.py"), 48921)
+    assert "#" not in command, "命令里还有 # 注释形式的标记"
+    assert f"--marker {RELAY_MARKER}" in command
     assert is_ours(command)
     assert not is_ours("python something_else.py")
     assert not is_ours(None)
     assert not is_ours("")
 
 
-def test_selfcheck_passes_for_the_shipped_relay() -> None:
-    """ shipped 的中继脚本必须真能跑起来——这条不过就不该去装 hook。"""
-    ok, why = selfcheck(PLUGIN_DIR)
+def test_relay_script_ignores_the_marker_argument() -> None:
+    """中继脚本要能吃掉 --marker 而不把它当端口。"""
+    import json
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, str(source_relay_path(PLUGIN_DIR)), "49999",
+         "--marker", RELAY_MARKER],
+        input=json.dumps({"tool_name": "Bash"}).encode(),
+        capture_output=True, timeout=30)
+    # 端口没人听 → 探活失败 → 输出空对象。关键是**不崩、不把 marker 当端口**。
+    assert proc.returncode == 0
+    assert json.loads(proc.stdout.decode()) == {}
+
+
+def test_selfcheck_passes_for_the_shipped_relay(tmp_path: Path) -> None:
+    """shipped 的中继脚本必须真能跑起来——这条不过就不该去装 hook。"""
+    ok, why = sync_relay(source_relay_path(PLUGIN_DIR),
+                         installed_relay_path(tmp_path))
+    assert ok, why
+    ok, why = selfcheck(installed_relay_path(tmp_path))
     assert ok, why
 
 
 def test_selfcheck_fails_when_the_script_is_missing(tmp_path: Path) -> None:
-    ok, why = selfcheck(tmp_path)
+    ok, why = selfcheck(tmp_path / "nope.py")
     assert ok is False
     assert "中继脚本不在" in why
 
@@ -204,10 +220,16 @@ def test_installed_hook_reports_the_legacy_http_shape(settings: Path) -> None:
 
 
 def test_installed_hook_reports_the_command_shape(settings: Path,
-                                                  backups: Path) -> None:
-    install_hook(PLUGIN_DIR, 51234, settings=settings, backup_dir=backups)
-    found = installed_hook(settings, PLUGIN_DIR)
-    assert found == {"kind": "command", "port": 51234}
+                                                  backups: Path,
+                                                  tmp_path: Path) -> None:
+    data_dir = tmp_path / "agent_deskmate-data"
+    install_hook(PLUGIN_DIR, 51234, settings=settings, backup_dir=backups,
+                 data_dir=data_dir)
+    found = installed_hook(settings, data_dir)
+    assert found["kind"] == "command"
+    assert found["port"] == 51234
+    # 脚本路径也报出来：启动核对要靠它判断"中继文件还在不在"
+    assert found["script"] == str(installed_relay_path(data_dir))
 
 
 def test_installed_hook_ignores_a_foreign_hook(settings: Path) -> None:
@@ -603,3 +625,132 @@ def test_relay_emits_empty_object_when_the_plugin_has_no_decision() -> None:
         assert json.loads(out) == {}
     finally:
         gateway.stop()
+
+
+# ── P0：中继脚本必须放在插件数据目录（2026-11-22 真机事故） ────────────────
+
+def test_install_points_the_hook_at_the_data_dir_not_the_install_copy(
+        settings: Path, backups: Path, tmp_path: Path) -> None:
+    r"""hook 必须指向插件数据目录里的副本。
+
+    真机事故：宿主把 hook 指向 ``.neko-plugin-installations\...``，
+    而那个安装副本会被宿主清空重建 → hook 指向死链接 →
+    ``can't open file ... hook_relay.py: [Errno 2]`` →
+    卡片永不出现，用户无感知，只剩一条莫名的"端口不一致"。
+    """
+    data_dir = tmp_path / "agent_deskmate-data"
+    result = install_hook(PLUGIN_DIR, 48921, settings=settings,
+                          backup_dir=backups, data_dir=data_dir)
+
+    assert result["ok"] is True
+    assert result["relay_file"] == str(installed_relay_path(data_dir))
+    # 副本真的落在那儿了
+    assert installed_relay_path(data_dir).is_file()
+    # hook 指向副本，不是源码目录、也不是宿主的安装副本
+    assert str(installed_relay_path(data_dir)) in result["command"]
+    assert "neko-plugin-installations" not in result["command"]
+    assert str(source_relay_path(PLUGIN_DIR)) not in result["command"]
+
+
+def test_install_rewrites_a_stale_relay_copy(settings: Path, backups: Path,
+                                             tmp_path: Path) -> None:
+    """副本内容与源码不一致时要重写——半份脚本跑起来更难查。"""
+    data_dir = tmp_path / "agent_deskmate-data"
+    copy = installed_relay_path(data_dir)
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    copy.write_text("# 被改坏了的一半脚本\n", encoding="utf-8")
+
+    result = install_hook(PLUGIN_DIR, 48921, settings=settings,
+                          backup_dir=backups, data_dir=data_dir)
+
+    assert result["ok"] is True
+    assert copy.read_bytes() == source_relay_path(PLUGIN_DIR).read_bytes()
+
+
+def test_sync_relay_is_a_noop_when_already_current(tmp_path: Path) -> None:
+    source = tmp_path / "src.py"
+    source.write_text("print('x')\n", encoding="utf-8")
+    target = tmp_path / "data" / "src.py"
+    assert sync_relay(source, target)[0] is True
+    before = target.stat().st_mtime_ns
+    assert sync_relay(source, target)[0] is True
+    assert target.stat().st_mtime_ns == before, "内容一致时不该重写"
+
+
+def test_sync_relay_reports_a_missing_source(tmp_path: Path) -> None:
+    ok, why = sync_relay(tmp_path / "nope.py", tmp_path / "d" / "x.py")
+    assert ok is False
+    assert "没有中继脚本" in why
+
+
+def test_installed_relay_lives_in_the_plugin_data_dir() -> None:
+    """数据目录归插件自己管，宿主不碰——这是选它的全部理由。"""
+    path = installed_relay_path("D:/some/data")
+    assert path == Path("D:/some/data/hook_relay.py")
+
+
+# ── 标记与端口解析 ─────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("command,expected_port", [
+    # 装配方生成的标准形状
+    ('python "D:/data/hook_relay.py" 48921 --marker neko-deskmate-approval-relay',
+     48921),
+    # 路径带空格（必须带引号才对）
+    ('python "D:/my plugins/agent_deskmate/hook_relay.py" 50000 '
+     '--marker neko-deskmate-approval-relay', 50000),
+    # 没有引号也认（容错：用户手改过）
+    ('python D:/data/hook_relay.py 48921 --marker neko-deskmate-approval-relay',
+     48921),
+    # 正斜杠路径
+    ('python "D:/data/hook_relay.py" 1234 --marker neko-deskmate-approval-relay',
+     1234),
+    # 后面又跟了带数值的选项：端口仍是紧挨路径的那个，不是 2
+    ('python "D:/data/hook_relay.py" 48921 --marker neko-deskmate-approval-relay '
+     '--verbose 2', 48921),
+    # 路径后第一个参数不是数字时，退回找后面第一个数字
+    ('python "D:/data/hook_relay.py" --port 48921 '
+     '--marker neko-deskmate-approval-relay', 48921),
+])
+def test_parse_relay_command_finds_the_port(command: str,
+                                            expected_port: int) -> None:
+    parsed = parse_relay_command(command)
+    assert parsed["port"] == expected_port
+    assert parsed["script"] is not None
+
+
+def test_parse_relay_command_handles_a_path_with_spaces() -> None:
+    command = ('python "D:/my plugins/agent_deskmate/hook_relay.py" 48921 '
+               '--marker neko-deskmate-approval-relay')
+    parsed = parse_relay_command(command)
+    assert parsed["script"] == "D:/my plugins/agent_deskmate/hook_relay.py"
+    assert parsed["port"] == 48921
+
+
+@pytest.mark.parametrize("command", [
+    None,
+    "",
+    "   ",
+    "python",                                  # 只有解释器
+    'python "" --marker neko-deskmate-approval-relay',
+    'python "D:/data/hook_relay.py" --marker neko-deskmate-approval-relay',
+    'python "D:/data/hook_relay.py" abc --marker neko-deskmate-approval-relay',
+    'python "D:/data/hook_relay.py --marker neko-deskmate-approval-relay',  # 引号不配对
+])
+def test_parse_relay_command_degrades_without_raising(command: object) -> None:
+    """解析不出来就返回 None，**不许抛异常**——启动自检还要靠它说话。"""
+    parsed = parse_relay_command(command)
+    assert set(parsed) == {"script", "port"}
+    assert parsed["port"] is None
+
+
+def test_parse_relay_command_strips_only_our_marker() -> None:
+    """别人的 --marker 不该被当成我们的（免得把别人的 hook 端口挖出来）。"""
+    parsed = parse_relay_command(
+        'python "D:/x.py" 777 --marker someone-else')
+    assert parsed["port"] == 777
+
+
+def test_marker_is_not_a_port() -> None:
+    """标记里没有数字，不会被误当成端口。"""
+    parsed = parse_relay_command(relay_command("D:/d/hook_relay.py", 48921))
+    assert parsed["port"] == 48921

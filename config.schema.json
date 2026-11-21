@@ -268,7 +268,10 @@
                 "zh-CN": "关闭：每次都由你点。仅低风险：低风险动作可以自动放行，高风险仍然每次都要你点，任何时候都不会自动拒绝。"
               },
               "default": "off",
-              "enum": ["off", "low_risk_only"]
+              "enum": [
+                "off",
+                "low_risk_only"
+              ]
             },
             "auto_decide_max_severity": {
               "type": "string",
@@ -283,7 +286,12 @@
                 "zh-CN": "从低到高四档。开到最高也不会自动放行高风险动作——那一层不归这个选项管。"
               },
               "default": "notice",
-              "enum": ["info", "notice", "warn", "critical"]
+              "enum": [
+                "info",
+                "notice",
+                "warn",
+                "critical"
+              ]
             },
             "api_key": {
               "type": "string",
@@ -299,6 +307,25 @@
               },
               "default": "",
               "writeOnly": true
+            },
+            "explain_verbosity": {
+              "type": "string",
+              "title": "Detail level for explanations",
+              "description": "How much the What-is-this card explains. Brief: only the conclusion and the worst outcome. Standard: adds the scope and the rule verdict. Detailed: also adds the model's reason and the evidence it cited.",
+              "x-title-i18n": {
+                "en": "Detail level for explanations",
+                "zh-CN": "解释的详细程度"
+              },
+              "x-description-i18n": {
+                "en": "How much the What-is-this card explains. Brief: only the conclusion and the worst outcome. Standard: adds the scope and the rule verdict. Detailed: also adds the model's reason and the evidence it cited.",
+                "zh-CN": "点「这是什么」时讲多细。简短：只讲结论和最坏结果。标准：再加上影响范围和规则判断。详细：再叠加模型给的理由和依据。"
+              },
+              "default": "standard",
+              "enum": [
+                "brief",
+                "standard",
+                "detailed"
+              ]
             }
           }
         },
@@ -328,7 +355,10 @@
                 "zh-CN": "两种请求格式，按你用的服务商要求选。"
               },
               "default": "openai",
-              "enum": ["openai", "anthropic"]
+              "enum": [
+                "openai",
+                "anthropic"
+              ]
             },
             "base_url": {
               "type": "string",

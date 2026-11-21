@@ -31,6 +31,7 @@ from plugin.plugins.agent_deskmate.approval import (
     ACTION_CLASS_RECOVERABLE,
     ACTION_DENY,
     ACTION_EXPLAIN,
+    ADVICE_STATE_READY,
     ADVICE_TEXT,
     APPROVE_ALLOW,
     APPROVE_DENY,
@@ -54,6 +55,7 @@ from plugin.plugins.agent_deskmate.approval import (
     AuthorizationRecord,
     PendingApproval,
     advice_state,
+    advice_text,
     assess_risk,
     auto_decide_gate,
     build_authorize_actions,
@@ -68,6 +70,14 @@ from plugin.plugins.agent_deskmate.approval import (
     hook_response,
     load_authorization,
     no_decision_response,
+)
+from plugin.plugins.agent_deskmate.commands import (
+    BANNED_INTERNAL,
+    BANNED_PHRASES,
+    CONCLUSION_ALLOW,
+    CONCLUSION_DENY,
+    CONCLUSION_UNSURE,
+    CONCLUSIONS,
 )
 
 PAYLOAD = {
@@ -1135,127 +1145,170 @@ def test_stop_settles_every_pending_as_expired(port: int) -> None:
 
 # ── 卡片四块（规格 §4） ─────────────────────────────────────────────────────
 
+def _visible(html: str) -> str:
+    """剥掉标签与实体之后的纯文本。
+
+    断言"某个词有没有泄到界面上"时必须看**可见文本**：按钮上的
+    ``data-neko-action="deskmate_deny"`` 是内部 id，不是给用户看的字，
+    按整个 HTML 搜会把这种合法内容误判成泄漏（第一版就这么误报过）。
+    """
+    import html as _html
+    import re as _re
+
+    return _html.unescape(_re.sub(r"<[^>]+>", "", html))
+
+
+def _card(**overrides) -> str:
+    base = dict(subject="claude-code", tool_summary="Bash: rm -f x.txt",
+                session_id="800257f3", working_directory=r"D:\workspace",
+                timeout_seconds=570, command="rm -f D:/other/x.txt",
+                conclusion=CONCLUSION_DENY, advice_state=ADVICE_STATE_READY)
+    base.update(overrides)
+    return build_card_html(**base)
+
+
 def test_card_html_has_all_four_blocks() -> None:
-    html = build_card_html(subject="claude-code",
-                           tool_summary="Bash: rm -rf build/",
-                           session_id="800257f3",
-                           working_directory=r"D:\workspace",
-                           timeout_seconds=570)
-    # 1) 标题/来源/命令
+    html = _card()
+    # 1) 标题
     assert "同桌猫 · 审批请求" in html
+    # 2) 定位
+    assert "会话 800257f3 @ D:\workspace" in html
+    # 3) 主卡正文固定四行（规格 P3）
+    assert "⚠️ 它要删除文件 D:/other/x.txt" in html
+    assert "后果：不进回收站，删了就找不回来" in html
+    assert "范围：这个文件在它的工作目录之外" in html
+    # 4) 结论行
+    assert "<strong>建议拒绝</strong>" in html
+    # 5) 来源与超时说明
     assert "claude-code 请求执行" in html
-    assert "rm -rf build/" in html
-    # 2) 会话与 cwd
-    assert "会话 800257f3 @ D:\\workspace" in html
-    # 3) 三个按钮
-    assert f'data-neko-action="{ACTION_APPROVE}"' in html
-    assert f'data-neko-action="{ACTION_DENY}"' in html
-    assert f'data-neko-action="{ACTION_EXPLAIN}"' in html
-    # 4) 超时说明：说清"宿主自行处理、视为未决定"，不写"已自动拒绝"
     assert "宿主会自行处理" in html
     assert "视为未决定" in html
     assert "插件不代你判断" in html
     assert "自动拒绝" not in html
+    # 6) 三个按钮
+    for action in (ACTION_APPROVE, ACTION_DENY, ACTION_EXPLAIN):
+        assert f'data-neko-action="{action}"' in html
 
 
-@pytest.mark.parametrize("rule_name", ["delete", "disk_root", "system_dir",
-                                        "shadow_copy", "format_volume"])
-def test_card_highlights_irreversible_in_red(rule_name: str) -> None:
-    """规格 §2 硬规则 3 + C3：不可恢复动作 → 标红 + 明说不自动放行。
+def test_card_conclusion_line_is_independent_and_first() -> None:
+    """规格 P2：结论独立成行、加粗，而且排在正文最前面。"""
+    html = _card()
+    verdict_at = html.index("<strong>建议拒绝</strong>")
+    for later in ("⚠️ 它要", "后果：", "范围："):
+        assert verdict_at < html.index(later), f"{later} 排在结论前面了"
 
-    红条判据是**动作类别**，不是规则名：规则名会随规则库变，红条不能跟着漏。
-    ``rule_name`` 在这个测试里**不传进 build_card_html**——故意让它无处可依，
-    以此锁住"红条只认类别"这件事。
+
+@pytest.mark.parametrize("conclusion", CONCLUSIONS)
+def test_card_accepts_only_the_three_legal_conclusions(conclusion: str) -> None:
+    """规格 P2：结论只准三种，一个不多一个不少。"""
+    html = _card(conclusion=conclusion, advice_state=ADVICE_STATE_READY)
+    assert f"<strong>{conclusion}</strong>" in html
+
+
+@pytest.mark.parametrize("conclusion", [
+    "倾向别放行", "不建议", "最好不", "可以但", "拒绝或允许都可以",
+    "allow", "deny", "", "建议放行", "同意", "批准", None,
+])
+def test_card_rejects_any_other_conclusion(conclusion: object) -> None:
+    """非法结论一律落最保守的第三态，原文不外溢。"""
+    html = _card(conclusion=conclusion, advice_state=ADVICE_STATE_READY)
+    assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
+    if isinstance(conclusion, str) and conclusion and conclusion != CONCLUSION_UNSURE:
+        assert conclusion not in _visible(html), (
+            f"非法结论 {conclusion!r} 外溢到卡片上了")
+
+
+def test_conclusion_requires_a_real_advice_state() -> None:
+    """建议层降级时，结论只能是第三态——哪怕调用方误传了一个结论。
+
+    这是防"没有依据的建议允许出现在卡片上"：调用方说 ready 却给了降级的
+    状态，或者状态是 disabled 却给了结论，两种都不许放行。
     """
-    html = build_card_html(subject="claude-code", tool_summary=f"Bash: {rule_name} x",
-                           session_id="s", working_directory=None,
-                           timeout_seconds=570, risk="notice",
-                           action_class=ACTION_CLASS_IRREVERSIBLE)
+    for state in ("disabled", "unauthorized", "no_key", "pending_backend"):
+        html = _card(conclusion=CONCLUSION_ALLOW, advice_state=state)
+        assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html, state
+        assert CONCLUSION_ALLOW not in _visible(html), state
+
+
+def test_card_has_no_banned_words() -> None:
+    """规格 P2：全文不出现 放行/倾向/不建议，也不出现内部词。"""
+    for phrase in BANNED_PHRASES + BANNED_INTERNAL:
+        assert phrase not in _visible(_card()), f"卡片出现了禁用词 {phrase!r}"
+
+
+def test_card_has_no_english_command_tokens() -> None:
+    """规格 P3：除路径外不许出现英文命令 token。"""
+    text = _visible(_card(command="rm -rf D:/other/dir"))
+    for token in ("rm -rf", "-rf", "--force", "rm -f", "sudo"):
+        assert token not in text, f"卡片泄了命令 token {token!r}"
+
+
+def test_card_scope_detects_a_system_directory() -> None:
+    html = _card(command=r"rm -rf C:\Windows\System32")
+    assert "这是系统目录" in html
+
+
+def test_card_scope_says_inside_the_working_directory() -> None:
+    html = _card(command="rm -rf D:/workspace/build")
+    assert "在它的工作目录之内" in html
+
+
+def test_card_unknown_command_is_not_guessed() -> None:
+    """未命中的命令原样显示 + 明说未识别，不许瞎猜。"""
+    html = _card(command="npm run build", conclusion="")
+    assert "未识别的命令" in html
+    assert "npm run build" in html
+    assert "看不出" in html
+
+
+def test_card_echo_of_a_delete_is_not_a_delete() -> None:
+    """规格 §5.2：echo "rm -rf C:\\" 不算删除——误报会训练用户无脑点确认。"""
+    html = _card(command='echo "rm -rf C:\\"')
+    assert "未识别的命令" in html
+    assert "清空整个磁盘" not in html
+
+
+def test_card_highlights_high_risk_in_red() -> None:
+    """规格 §2 硬规则 3：不可恢复动作 → 标红 + 明说不自动放行。"""
+    html = _card(action_class=ACTION_CLASS_IRREVERSIBLE)
     assert 'class="risk"' in html
     assert "必须由你亲自点允许或拒绝" in html
 
 
 def test_card_highlights_critical_even_without_a_class() -> None:
     """极高危档独立标红：万一将来某条规则忘了声明类别，红色也不能漏。"""
-    html = build_card_html(subject="claude-code", tool_summary="Write: /etc/hosts",
-                           session_id="s", working_directory=None,
-                           timeout_seconds=570, risk="critical")
+    html = _card(risk="critical")
     assert 'class="risk"' in html
 
 
 def test_card_low_risk_is_not_red() -> None:
     """低风险不红：把每张卡都标成高风险，红色就没有信息量了。"""
-    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
-                           session_id="s", working_directory=None,
-                           timeout_seconds=570, risk="notice")
-    assert 'class="risk"' not in html
+    assert 'class="risk"' not in _card(risk="notice")
 
 
 # ── C5：卡片文案不许泄配置键名与内部入口名 ─────────────────────────────────
 
 @pytest.mark.parametrize("state", ["disabled", "unauthorized", "no_key",
                                    "pending_backend"])
-def test_card_advice_is_a_plain_statement(state: str) -> None:
-    """规格 §16.1「覆盖 §12.1」：建议块只说现在是什么状态，不指挥用户去配什么。
+def test_model_state_copy_is_a_plain_statement(state: str) -> None:
+    """模型状态那句陈述：只说现在是什么状态，不指挥用户去配什么。
 
-    三条硬要求逐条盯着：
-      1. 不许出现配置键名（ai_judgement / auto_decide / api_key）；
-      2. 不许出现内部入口名（approval_authorize）；
-      3. 不许出现索取式文案（"填写 API key 即可…"）。
+    它现在渲染在「这是什么」卡上（主卡正文是固定四行，放不下它），
+    但性质不变：不许出现配置键名、不许出现内部入口名、不许索取。
     """
-    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
-                           session_id="s", working_directory=None,
-                           timeout_seconds=570, advice_state=state)
-    assert ADVICE_TEXT[state] in html
+    text = advice_text(state)
+    assert text in ADVICE_TEXT.values()
     for leaked in ("ai_judgement", "auto_decide", "api_key", "approval_authorize",
                    "key"):
-        assert leaked not in html, f"卡片泄了内部名词 {leaked!r}"
+        assert leaked not in text, f"{state} 泄了内部名词 {leaked!r}"
     for soliciting in ("填写", "即可", "配置后", "请调", "去确认"):
-        assert soliciting not in html, f"卡片出现了索取式措辞 {soliciting!r}"
-    # 没有假建议
-    assert "建议：" not in html
-    assert "理由" not in html
+        assert soliciting not in text, f"{state} 出现了索取式措辞 {soliciting!r}"
 
 
 @pytest.mark.parametrize("state", ["disabled", "no_key", "pending_backend"])
-def test_card_never_implies_the_gate_needs_a_key(state: str) -> None:
+def test_model_state_copy_never_implies_the_gate_needs_a_key(state: str) -> None:
     """零 key 时也不许暗示闸门不工作——安全兜底与模型无关（规格 §12）。"""
-    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
-                           session_id="s", working_directory=None,
-                           timeout_seconds=570, advice_state=state)
-    assert "安全兜底与模型无关" in html
-
-
-def test_card_advice_sits_above_the_buttons() -> None:
-    """建议块必须排在按钮**上方**（规格 §16.1）——用户点之前要看到。"""
-    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
-                           session_id="s", working_directory=None,
-                           timeout_seconds=570, advice_state="disabled")
-    advice_at = html.index(ADVICE_TEXT["disabled"])
-    buttons_at = html.index(f'data-neko-action="{ACTION_APPROVE}"')
-    assert advice_at < buttons_at, "建议块掉到按钮下面去了"
-
-
-def test_card_advice_placeholder_when_backend_pending() -> None:
-    """有 key 但后端没接（5a）：占位说明，不假装已经能建议。"""
-    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
-                           session_id="s", working_directory=None,
-                           timeout_seconds=570, advice_state="pending_backend")
-    assert "尚未接入" in html
-    assert "未配置 key" not in html
-
-
-def test_card_advice_blocks_when_ready() -> None:
-    """5b 之后：建议 + 理由 + 依据三行齐备。"""
-    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
-                           session_id="s", working_directory=None,
-                           timeout_seconds=570, advice_state="ready",
-                           suggestion="允许（低风险）",
-                           reason="只读命令，无副作用。",
-                           basis="命令无 -rf；cwd 不在项目根内。")
-    assert "建议：允许（低风险）" in html
-    assert "理由：只读命令，无副作用。" in html
-    assert "依据：命令无 -rf；cwd 不在项目根内。" in html
+    assert "安全兜底与模型无关" in advice_text(state)
 
 
 def test_card_actions_map_three_buttons() -> None:
@@ -1469,10 +1522,31 @@ def test_hook_response_shape() -> None:
     assert hook_response(APPROVE_ALLOW) == {
         "hookSpecificOutput": {
             "hookEventName": "PermissionRequest",
-            "decision": {"behavior": "allow", "updatedInput": {},
-                         "updatedPermissions": []},
+            "decision": {"behavior": "allow"},
         }
     }
+
+
+def test_allow_carries_no_rewrite_fields() -> None:
+    """规格 P5.2：allow 时不带 updatedInput / updatedPermissions。
+
+    我们没有要改写的参数，那就什么都别带。空对象在某些版本可能被理解成
+    "把参数清空"——少给一个字段比多给一个可能被误解的字段安全。
+    """
+    decision = hook_response(APPROVE_ALLOW)["hookSpecificOutput"]["decision"]
+    assert "updatedInput" not in decision
+    assert "updatedPermissions" not in decision
+    assert "message" not in decision
+
+
+def test_deny_still_carries_the_full_shape() -> None:
+    """deny 仍按官方示例带齐三个字段 + message + interrupt。"""
+    decision = hook_response(APPROVE_DENY,
+                             message="同桌猫：用户拒绝了")["hookSpecificOutput"]["decision"]
+    assert decision["updatedInput"] == {}
+    assert decision["updatedPermissions"] == []
+    assert decision["interrupt"] is False
+    assert "拒绝" in decision["message"]
 
 
 def test_no_decision_response_has_no_decision() -> None:
