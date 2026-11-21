@@ -707,7 +707,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
             subject=subject, tool_summary=body, session_id=request.session_id,
             working_directory=request.working_directory, timeout_seconds=timeout,
             advice_state=self._approval.advice_state(),
-            risk=pending.severity, rule=pending.rule,
+            risk=pending.severity, action_class=pending.action_class,
         )
         try:
             card = await self.ctx.create_card(

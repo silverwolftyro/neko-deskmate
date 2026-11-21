@@ -27,8 +27,11 @@ from plugin.plugins.agent_deskmate.approval import (
     ACTION_APPROVE,
     ACTION_AUTH_CANCEL,
     ACTION_AUTH_CONFIRM,
+    ACTION_CLASS_IRREVERSIBLE,
+    ACTION_CLASS_RECOVERABLE,
     ACTION_DENY,
     ACTION_EXPLAIN,
+    ADVICE_TEXT,
     APPROVE_ALLOW,
     APPROVE_DENY,
     AUTH_SCOPE_ADVICE,
@@ -60,6 +63,7 @@ from plugin.plugins.agent_deskmate.approval import (
     build_explain_html,
     build_request,
     build_result_html,
+    effective_max_severity,
     explain_request,
     hook_response,
     load_authorization,
@@ -148,6 +152,28 @@ def _gateway(port, timeout: float = 5.0, **kwargs) -> ApprovalGateway:
             return gateway
         last = gateway
     raise AssertionError(f"换了 5 个端口都绑不上，最后一个：{last}")
+
+
+def _wait_for_audit_file(path, expected_lines: int,
+                        timeout: float = 10.0) -> str:
+    """等审计 JSONL 真的落下来再读。
+
+    落盘**刻意晚于投递**：``host_timeout`` 是投递失败才知道的，JSONL 是追加写的，
+    只能写最终状态（见 submit 里的注释）。代价是客户端一收到回填，文件可能还没写。
+    所以这里等，而不是假设它在——"收到响应 = 文件已写"是个假等式，
+    实测会偶发 FileNotFoundError。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            written = path.read_text(encoding="utf-8")
+        except OSError:
+            written = ""
+        if len([line for line in written.splitlines() if line.strip()]) >= expected_lines:
+            return written
+        time.sleep(0.005)
+    raise AssertionError(
+        f"审计文件在 {timeout}s 内没落够 {expected_lines} 行：{path}")
 
 
 def _wait_for_pending(gateway: ApprovalGateway, timeout: float = 15.0) -> None:
@@ -249,23 +275,30 @@ def test_tool_summary_never_dumps_the_whole_input() -> None:
 # ── 风险判定（L0，不接模型） ────────────────────────────────────────────────
 
 def test_assess_risk_marks_delete_as_critical() -> None:
-    severity, rule = assess_risk("Bash", {"command": "rm -rf /tmp/x"})
+    severity, rule, action_class = assess_risk("Bash", {"command": "rm -rf /tmp/x"})
     assert severity == "critical"
     assert rule == "delete"
+    # 类别才是门控认的那一维；规则名会随规则库变，类别不会（规格 §16.3 C3）
+    assert action_class == ACTION_CLASS_IRREVERSIBLE
 
 
 @pytest.mark.parametrize("command", ["ls -la", "git status", "npm run build"])
 def test_assess_risk_defaults_to_notice(command: str) -> None:
-    severity, rule = assess_risk("Bash", {"command": command})
+    severity, rule, action_class = assess_risk("Bash", {"command": command})
     assert severity == "notice"
     assert rule == ""
+    # 未判定按**可恢复**算：宁可漏，不可错杀
+    assert action_class == ACTION_CLASS_RECOVERABLE
 
 
 def test_assess_risk_ignores_non_bash_tools() -> None:
     """Read/Glob 之类没有 command 字段；不猜它干什么。"""
-    assert assess_risk("Read", {"file_path": "x"}) == ("notice", "")
-    assert assess_risk("Bash", None) == ("notice", "")
-    assert assess_risk("Bash", {"command": "rm -rf x"}) == ("critical", "delete")
+    assert assess_risk("Read", {"file_path": "x"}) == (
+        "notice", "", ACTION_CLASS_RECOVERABLE)
+    assert assess_risk("Bash", None) == (
+        "notice", "", ACTION_CLASS_RECOVERABLE)
+    assert assess_risk("Bash", {"command": "rm -rf x"}) == (
+        "critical", "delete", ACTION_CLASS_IRREVERSIBLE)
 
 
 # ── 三层门控（规格 §1） ─────────────────────────────────────────────────────
@@ -276,14 +309,14 @@ SIGNED = AUTH_SCOPES
 
 def test_gate_defaults_to_closed() -> None:
     """默认全关：auto_decide=off 时其余参数怎么设都不放行。"""
-    assert auto_decide_gate(rule="", severity="notice", ai_judgement=True,
+    assert auto_decide_gate(severity="notice", ai_judgement=True,
                             has_key=True, auto_decide=AUTO_OFF,
                             max_severity="notice", authorized_scopes=SIGNED)[0] is False
 
 
 def test_gate_requires_l1_first() -> None:
     """不能跳级：没开 ai_judgement 就没有解释能力，此时自动决定是黑箱代办。"""
-    eligible, why = auto_decide_gate(rule="", severity="notice", ai_judgement=False,
+    eligible, why = auto_decide_gate(severity="notice", ai_judgement=False,
                                      has_key=True, auto_decide=AUTO_LOW_RISK_ONLY,
                                      max_severity="notice", authorized_scopes=SIGNED)
     assert eligible is False
@@ -291,7 +324,7 @@ def test_gate_requires_l1_first() -> None:
 
 
 def test_gate_requires_a_key() -> None:
-    eligible, why = auto_decide_gate(rule="", severity="notice", ai_judgement=True,
+    eligible, why = auto_decide_gate(severity="notice", ai_judgement=True,
                                      has_key=False, auto_decide=AUTO_LOW_RISK_ONLY,
                                      max_severity="notice", authorized_scopes=SIGNED)
     assert eligible is False
@@ -305,34 +338,84 @@ def test_gate_requires_an_explicit_authorization() -> None:
     """
     for scopes in ((), (AUTH_SCOPE_ADVICE,), (AUTH_SCOPE_AUTO,)):
         eligible, why = auto_decide_gate(
-            rule="", severity="notice", ai_judgement=True, has_key=True,
+            severity="notice", ai_judgement=True, has_key=True,
             auto_decide=AUTO_LOW_RISK_ONLY, max_severity="notice",
             authorized_scopes=scopes)
         assert eligible is False, f"授权范围 {scopes} 居然放行了"
         assert "授权" in why
 
 
-def test_gate_excludes_delete_forever() -> None:
-    """删除类永远不进 L2，无论阈值怎么设、授权多全。"""
+@pytest.mark.parametrize("rule_name", ["delete", "disk_root", "system_dir",
+                                        "shadow_copy", "format_volume", "boot_entry"])
+def test_gate_exclusion_does_not_depend_on_the_rule_name(rule_name: str) -> None:
+    """C3 的核心：排除判据是**动作类别**，不是规则名。
+
+    规则名会随规则库增删而变（C1 之后"删除类"会拆成好几条）。靠规则名排除，
+    每加一条规则都得回来改门控，漏改的那条配上阈值开到顶就被 L2 放行了。
+    所以这里用六个不同的规则名配同一个不可恢复类别，要求**全部**被挡住。
+    """
     for max_severity in ("info", "notice", "warn", "critical"):
         eligible, why = auto_decide_gate(
-            rule="delete", severity="critical", ai_judgement=True, has_key=True,
+            severity="critical", action_class=ACTION_CLASS_IRREVERSIBLE,
+            ai_judgement=True, has_key=True,
             auto_decide=AUTO_LOW_RISK_ONLY, max_severity=max_severity,
             authorized_scopes=SIGNED)
-        assert eligible is False, f"阈值 {max_severity} 居然放行了删除类"
+        assert eligible is False, f"规则 {rule_name} / 阈值 {max_severity} 居然放行了"
         assert "永不进入 L2" in why
 
 
+def test_critical_severity_is_never_auto_allowed() -> None:
+    """第二道墙：极高危档本身不可自动放行，与动作类别无关（规格 §3）。
+
+    防的是"将来某条规则忘了声明类别"——那时类别默认按可恢复算，
+    若没有这道墙，一个 critical 动作就能被 L2 放行。
+    """
+    for max_severity in ("info", "notice", "warn", "critical"):
+        eligible, why = auto_decide_gate(
+            severity="critical", action_class=ACTION_CLASS_RECOVERABLE,
+            ai_judgement=True, has_key=True,
+            auto_decide=AUTO_LOW_RISK_ONLY, max_severity=max_severity,
+            authorized_scopes=SIGNED)
+        assert eligible is False, f"阈值 {max_severity} 放行了 critical"
+        assert "极高危档" in why
+
+
+def test_gate_takes_no_rule_argument() -> None:
+    """门控签名里**刻意没有 rule**——收了就会有人顺着它写规则名判断。"""
+    import inspect
+
+    params = set(inspect.signature(auto_decide_gate).parameters)
+    assert "rule" not in params, "门控又收 rule 了，规则名排除会跟着回来"
+    assert "action_class" in params
+
+
+@pytest.mark.parametrize("configured,expected", [
+    ("notice", "notice"),
+    ("warn", "warn"),
+    ("critical", "warn"),        # 极高危档不可自动放行 → 压回 warn
+    ("CRITICAL", "warn"),
+    ("", "notice"),
+    ("不认识的档", "notice"),
+])
+def test_max_severity_is_clamped_below_critical(configured: str, expected: str) -> None:
+    """阈值旋钮最高只能开到 warn（规格 §3 + C3）。
+
+    开到 critical 要么是没理解这个旋钮管什么，要么是想绕过极高危墙；
+    两种情况下压回去并留日志，都比默默接受一个"开了却开不动"的配置好。
+    """
+    assert effective_max_severity(configured) == expected
+
+
 def test_gate_respects_the_severity_threshold() -> None:
-    eligible, why = auto_decide_gate(rule="", severity="warn", ai_judgement=True,
+    eligible, why = auto_decide_gate(severity="warn", ai_judgement=True,
                                      has_key=True, auto_decide=AUTO_LOW_RISK_ONLY,
                                      max_severity="notice", authorized_scopes=SIGNED)
     assert eligible is False
     assert "超过阈值" in why
 
 
-def test_gate_opens_when_all_five_hold() -> None:
-    eligible, why = auto_decide_gate(rule="", severity="notice", ai_judgement=True,
+def test_gate_opens_when_all_six_hold() -> None:
+    eligible, why = auto_decide_gate(severity="notice", ai_judgement=True,
                                      has_key=True, auto_decide=AUTO_LOW_RISK_ONLY,
                                      max_severity="notice", authorized_scopes=SIGNED)
     assert eligible is True
@@ -397,8 +480,7 @@ def test_every_decision_is_audited(port: int, tmp_path: Path) -> None:
         assert row["model"] == "-"
         assert "用户在" in row["reason"]
         # 落了一份 JSONL，插件重启后仍可查
-        assert (tmp_path / "audit.jsonl").is_file()
-        written = (tmp_path / "audit.jsonl").read_text(encoding="utf-8").strip()
+        written = _wait_for_audit_file(tmp_path / "audit.jsonl", 1).strip()
         assert len(written.splitlines()) == 1
     finally:
         gateway.stop()
@@ -485,7 +567,7 @@ def test_expiry_audit_never_says_deny(port: int, tmp_path: Path) -> None:
         assert "拒绝" not in text
         assert "无决定" in text          # 明写"没有决定"，不是"决定为拒绝"
         # 落盘的 JSONL 同样不能有
-        written = audit.read_text(encoding="utf-8")
+        written = _wait_for_audit_file(audit, 1)
         assert "deny" not in written
         assert "拒绝" not in written
     finally:
@@ -1040,58 +1122,90 @@ def test_card_html_has_all_four_blocks() -> None:
     assert "自动拒绝" not in html
 
 
-def test_card_highlights_high_risk_in_red() -> None:
-    """规格 §2 硬规则 3：critical / 删除类 / 危险写 → 标红 + 明说不自动放行。"""
-    # 删除类：规则命中就要红，哪怕 severity 参数没给
-    html = build_card_html(subject="claude-code", tool_summary="Bash: rm -rf x",
+@pytest.mark.parametrize("rule_name", ["delete", "disk_root", "system_dir",
+                                        "shadow_copy", "format_volume"])
+def test_card_highlights_irreversible_in_red(rule_name: str) -> None:
+    """规格 §2 硬规则 3 + C3：不可恢复动作 → 标红 + 明说不自动放行。
+
+    红条判据是**动作类别**，不是规则名：规则名会随规则库变，红条不能跟着漏。
+    ``rule_name`` 在这个测试里**不传进 build_card_html**——故意让它无处可依，
+    以此锁住"红条只认类别"这件事。
+    """
+    html = build_card_html(subject="claude-code", tool_summary=f"Bash: {rule_name} x",
                            session_id="s", working_directory=None,
-                           timeout_seconds=570, risk="notice", rule="delete")
+                           timeout_seconds=570, risk="notice",
+                           action_class=ACTION_CLASS_IRREVERSIBLE)
     assert 'class="risk"' in html
     assert "必须由你亲自点允许或拒绝" in html
 
-    # critical 但没命中已知规则（危险写等 M0-lite-3b 落地后会补规则）
+
+def test_card_highlights_critical_even_without_a_class() -> None:
+    """极高危档独立标红：万一将来某条规则忘了声明类别，红色也不能漏。"""
     html = build_card_html(subject="claude-code", tool_summary="Write: /etc/hosts",
                            session_id="s", working_directory=None,
-                           timeout_seconds=570, risk="critical", rule="")
+                           timeout_seconds=570, risk="critical")
     assert 'class="risk"' in html
 
-    # 低风险不红：不能把所有卡片都标成高风险，那样红色就没有信息量了
+
+def test_card_low_risk_is_not_red() -> None:
+    """低风险不红：把每张卡都标成高风险，红色就没有信息量了。"""
     html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
                            session_id="s", working_directory=None,
-                           timeout_seconds=570, risk="notice", rule="")
+                           timeout_seconds=570, risk="notice")
     assert 'class="risk"' not in html
 
 
-def test_card_degraded_advice_when_no_key() -> None:
-    """没 key：建议块降级成一行说明，不编内容。"""
-    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
-                           session_id="s", working_directory=None,
-                           timeout_seconds=570, advice_state="no_key")
-    assert "未配置 key，无法给出建议" in html
-    assert "建议：" not in html          # 没有假建议
-    assert "理由" not in html
+# ── C5：卡片文案不许泄配置键名与内部入口名 ─────────────────────────────────
 
+@pytest.mark.parametrize("state", ["disabled", "unauthorized", "no_key",
+                                   "pending_backend"])
+def test_card_advice_is_a_plain_statement(state: str) -> None:
+    """规格 §16.1「覆盖 §12.1」：建议块只说现在是什么状态，不指挥用户去配什么。
 
-def test_card_advice_blocked_without_authorization() -> None:
-    """配置开了但用户没签字：必须说"未确认授权"，并指路授权入口。
-
-    不能显示成"没有 key"——那是另一件事，混起来用户不知道该去哪补。
+    三条硬要求逐条盯着：
+      1. 不许出现配置键名（ai_judgement / auto_decide / api_key）；
+      2. 不许出现内部入口名（approval_authorize）；
+      3. 不许出现索取式文案（"填写 API key 即可…"）。
     """
     html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
                            session_id="s", working_directory=None,
-                           timeout_seconds=570, advice_state="unauthorized")
-    assert "未确认授权" in html
-    assert "approval_authorize" in html
+                           timeout_seconds=570, advice_state=state)
+    assert ADVICE_TEXT[state] in html
+    for leaked in ("ai_judgement", "auto_decide", "api_key", "approval_authorize",
+                   "key"):
+        assert leaked not in html, f"卡片泄了内部名词 {leaked!r}"
+    for soliciting in ("填写", "即可", "配置后", "请调", "去确认"):
+        assert soliciting not in html, f"卡片出现了索取式措辞 {soliciting!r}"
+    # 没有假建议
     assert "建议：" not in html
-    assert "未配置 key" not in html
+    assert "理由" not in html
 
 
-def test_card_advice_placeholder_when_key_present() -> None:
+@pytest.mark.parametrize("state", ["disabled", "no_key", "pending_backend"])
+def test_card_never_implies_the_gate_needs_a_key(state: str) -> None:
+    """零 key 时也不许暗示闸门不工作——安全兜底与模型无关（规格 §12）。"""
+    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
+                           session_id="s", working_directory=None,
+                           timeout_seconds=570, advice_state=state)
+    assert "安全兜底与模型无关" in html
+
+
+def test_card_advice_sits_above_the_buttons() -> None:
+    """建议块必须排在按钮**上方**（规格 §16.1）——用户点之前要看到。"""
+    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
+                           session_id="s", working_directory=None,
+                           timeout_seconds=570, advice_state="disabled")
+    advice_at = html.index(ADVICE_TEXT["disabled"])
+    buttons_at = html.index(f'data-neko-action="{ACTION_APPROVE}"')
+    assert advice_at < buttons_at, "建议块掉到按钮下面去了"
+
+
+def test_card_advice_placeholder_when_backend_pending() -> None:
     """有 key 但后端没接（5a）：占位说明，不假装已经能建议。"""
     html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
                            session_id="s", working_directory=None,
                            timeout_seconds=570, advice_state="pending_backend")
-    assert "待接入" in html
+    assert "尚未接入" in html
     assert "未配置 key" not in html
 
 
@@ -1353,6 +1467,44 @@ def test_policy_snapshot_reflects_config() -> None:
     # 签字后快照要能反映出来——用户要能从 status 入口看到自己授了什么
     gateway.grant_authorization(AUTH_SCOPES)
     assert gateway.policy_snapshot()["authorized_scopes"] == list(AUTH_SCOPES)
+
+
+def test_gateway_clamps_the_threshold_at_construction() -> None:
+    """配置写成 critical 时，网关建起来就是 warn（规格 §3 + C3）。
+
+    只夹纯函数不够：配置是从文件读进来的，必须确认网关真的用了夹过的值，
+    否则 `auto_decide_max_severity = "critical"` 会原样进 policy_snapshot，
+    用户在 status 入口看到的是一个"开了却开不动"的假象。
+    """
+    gateway = ApprovalGateway(ListLogger(), port=_free_port(),
+                              auto_decide_max_severity="critical")
+    assert gateway.policy_snapshot()["auto_decide_max_severity"] == "warn"
+
+
+def test_audit_records_the_action_class(port: int) -> None:
+    """审计要能看出"当时判定这是不可恢复动作"——不能只剩一个规则名。
+
+    规则名会随规则库改（C1 之后"delete"可能变成"disk_root"），
+    事后翻审计时类别才是稳定的那一维。
+    """
+    gateway = _gateway(port, timeout=0.3)
+    try:
+        _post_status(port, PAYLOAD)          # rm -rf build/ → 删除类
+        row = gateway.audit_rows()[0]
+        assert row["action_class"] == ACTION_CLASS_IRREVERSIBLE
+        assert row["severity"] == "critical"
+        assert "class=irreversible" in gateway.audit_text()
+
+        gateway2 = _gateway(_free_port(), timeout=0.3)
+        try:
+            _post_status(gateway2.port, dict(PAYLOAD,
+                                             tool_input={"command": "ls -la"}))
+            row = gateway2.audit_rows()[0]
+            assert row["action_class"] == ACTION_CLASS_RECOVERABLE
+        finally:
+            gateway2.stop()
+    finally:
+        gateway.stop()
 
 
 def test_authorization_record_round_trips_through_json() -> None:

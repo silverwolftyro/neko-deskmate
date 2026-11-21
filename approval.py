@@ -124,22 +124,44 @@ AUTO_OFF = "off"
 AUTO_LOW_RISK_ONLY = "low_risk_only"
 AUTO_DECIDE_VALUES = (AUTO_OFF, AUTO_LOW_RISK_ONLY)
 
+# ── 动作类别：不可恢复 vs 可恢复 ────────────────────────────────────────────
+# 闸门的排除判据是**动作类别**，不是规则名（规格 §16.3 C3）。
+#
+# 为什么不能按规则名排：规则名会随规则库增删而变——C1 之后"删除类"很可能拆成
+# disk_root / system_dir / shadow_copy 好几条。靠 `rule == "delete"` 排除，
+# 就等于每加一条规则都得回来改一遍门控；漏改的那条，配上
+# `auto_decide_max_severity = "critical"` 就被 L2 自动放行了。按类别排，
+# 新规则只要声明自己"不可恢复"就自动继承排除，不需要有人记得改门控。
+ACTION_CLASS_RECOVERABLE = "recoverable"      # 可恢复：删了重建得回来
+ACTION_CLASS_IRREVERSIBLE = "irreversible"    # 不可恢复：删盘 / 格式化 / 引导项…
+# 只列"不可恢复"这一类。**未判定时按可恢复算**——宁可漏，不可错杀，
+# 与闸门"精度优先"同向；这也意味着将来新规则要显式声明自己不可恢复。
+IRREVERSIBLE_CLASSES = frozenset({ACTION_CLASS_IRREVERSIBLE})
+DEFAULT_ACTION_CLASS = ACTION_CLASS_RECOVERABLE
+
 # 严重度阶梯。与 rules.py 的取值一致，这里只用来比大小。
 SEVERITY_ORDER = {"info": 0, "notice": 1, "warn": 2, "critical": 3}
 
-# **永远不进 L2** 的规则（规格 §2 硬规则 3）。删除类先挡住；
-# 危险写等 M0-lite-3b 落地后加进来——那时这条集合要跟着扩，并有测试守着。
-L2_EXCLUDED_RULES = frozenset({"delete"})
+# **极高危档本身不可被自动放行**（规格 §3 表：极高危"任何配置不得自动放行"）。
+# 这是独立于动作类别的第二道墙：万一将来某条规则忘了声明类别，
+# severity=critical 也照样挡住。于是 auto_decide_max_severity 这个旋钮
+# 最高只能开到 warn——开到 critical 会被压回 warn 并在启动日志里说明。
+AUTO_DECIDE_MAX_SEVERITY_CEILING = "warn"
+DEFAULT_MAX_SEVERITY = "notice"
 
 # 风险判定用的默认档：L0 规则没命中就当低风险。
 DEFAULT_RISK_SEVERITY = "notice"
 
 
-def assess_risk(tool_name: str, tool_input: Any) -> tuple[str, str]:
-    """评估一次工具调用的风险。纯函数，不接模型。
+def assess_risk(tool_name: str, tool_input: Any) -> tuple[str, str, str]:
+    """评估一次工具调用。纯函数，不接模型。
 
-    返回 ``(severity, rule)``。5a 阶段只跑 L0 规则（删除类）——
+    返回 ``(severity, rule, action_class)``。5a 阶段只跑 L0 规则（删除类）——
     没命中就按 ``notice``（低风险）算，**不猜**。模型判定是 5b 的事。
+
+    ``action_class`` 是**独立于规则名**的一维：规则名会随规则库变，类别不会。
+    C1 把闸门规则重写成精度优先之后，这里会多返回几条规则，但门控只认类别，
+    不需要跟着改（规格 §16.3 C3）。
 
     刻意不看 ``tool_input`` 里除命令以外的字段：猜动作是归因错的高发区。
     """
@@ -152,19 +174,42 @@ def assess_risk(tool_name: str, tool_input: Any) -> tuple[str, str]:
         from .rules import match_delete
 
         if match_delete(command):
-            return "critical", "delete"
-    return DEFAULT_RISK_SEVERITY, ""
+            return "critical", "delete", ACTION_CLASS_IRREVERSIBLE
+    return DEFAULT_RISK_SEVERITY, "", DEFAULT_ACTION_CLASS
 
 
-def auto_decide_gate(*, rule: str, severity: str, ai_judgement: bool,
+def effective_max_severity(configured: str) -> str:
+    """把配置里的 L2 阈值夹到合法上限。纯函数，便于单测。
+
+    极高危档不可被自动放行（规格 §3），所以阈值开到 ``critical`` 是没有意义的——
+    它要么是用户没理解这个旋钮管什么，要么是想绕过极高危墙。压回 ``warn``
+    并让调用方打日志，比默默接受一个"看起来开了其实开不动"的配置好。
+    """
+    wanted = str(configured or "").strip().lower()
+    if wanted not in SEVERITY_ORDER:
+        return DEFAULT_MAX_SEVERITY
+    if SEVERITY_ORDER[wanted] > SEVERITY_ORDER[AUTO_DECIDE_MAX_SEVERITY_CEILING]:
+        return AUTO_DECIDE_MAX_SEVERITY_CEILING
+    return wanted
+
+
+DEFAULT_MAX_SEVERITY = "notice"
+
+
+def auto_decide_gate(*, severity: str, ai_judgement: bool,
                      has_key: bool, auto_decide: str,
                      max_severity: str,
-                     authorized_scopes: tuple[str, ...] = ()) -> tuple[bool, str]:
+                     authorized_scopes: tuple[str, ...] = (),
+                     action_class: str = DEFAULT_ACTION_CLASS) -> tuple[bool, str]:
     """L2 门控。返回 ``(是否放行, 原因)``。纯函数，便于单测。
 
-    五条全中才放行，缺任何一条都给出**具体原因**——原因要能写进审计，
+    六条全中才放行，缺任何一条都给出**具体原因**——原因要能写进审计，
     不能只回一个 False 让人猜。授权检查排在 ai_judgement 之后、key 之前：
     配置说"要开"只是意愿，用户在授权入口签了字才算数。
+
+    排除判据按**动作类别**与**极高危档**，不按规则名（规格 §16.3 C3）：
+    规则名会随规则库增删而变，靠它排除就意味着每加一条规则都得回来改门控。
+    所以这个函数**刻意不收 ``rule`` 参数**——收了就会有人顺着它写规则名判断。
     """
     if auto_decide != AUTO_LOW_RISK_ONLY:
         return False, f"auto_decide={auto_decide!r} 未开启"
@@ -177,8 +222,12 @@ def auto_decide_gate(*, rule: str, severity: str, ai_judgement: bool,
         return False, "未确认 auto_decide 授权（见 approval_authorize）"
     if not has_key:
         return False, "未配置 api_key（没 key 不判断）"
-    if rule in L2_EXCLUDED_RULES:
-        return False, f"{rule} 类动作永不进入 L2（无论阈值怎么设）"
+    # 第一道墙：动作类别。不可恢复的一律排除，阈值开到顶也一样。
+    if action_class in IRREVERSIBLE_CLASSES:
+        return False, f"{action_class} 类动作永不进入 L2（无论阈值怎么设）"
+    # 第二道墙：极高危档。独立于类别，防将来某条规则忘了声明类别。
+    if SEVERITY_ORDER.get(severity, 99) >= SEVERITY_ORDER["critical"]:
+        return False, f"风险 {severity} 属极高危档，任何配置不得自动放行"
     if SEVERITY_ORDER.get(severity, 99) > SEVERITY_ORDER.get(max_severity, 0):
         return False, f"风险 {severity} 超过阈值 {max_severity}，回落为 L1"
     return True, "L2 门控通过"
@@ -203,10 +252,16 @@ def advice_state(*, ai_judgement: bool, has_key: bool, backend_ready: bool,
 
 
 ADVICE_TEXT = {
-    "disabled": "未开启 AI 建议（ai_judgement = false）",
-    "unauthorized": "未确认授权，无法给出建议（调 approval_authorize 确认）",
-    "no_key": "未配置 key，无法给出建议",
-    "pending_backend": "已配置 key，建议能力待接入（5b）",
+    # 全部是**陈述句**：只说现在是什么状态，不指挥用户去配什么。
+    # 规格 §16.1「覆盖 §12.1」三条硬要求：
+    #   1. 严禁「填写 API key 即可…」这类索取式文案；
+    #   2. 不准暗示零 key 时闸门不工作——安全兜底与模型无关；
+    #   3. 不许把配置键名（ai_judgement）或内部入口名（approval_authorize）
+    #      泄到用户界面，用户不知道那是什么（这是 698d4a9 的 C5 缺陷）。
+    "disabled": "当前只做提醒，未接入模型。安全兜底与模型无关。",
+    "unauthorized": "尚未确认授权，暂不给出建议。安全兜底与模型无关。",
+    "no_key": "当前只做提醒，未接入模型。安全兜底与模型无关。",
+    "pending_backend": "当前只做提醒，模型能力尚未接入。安全兜底与模型无关。",
 }
 
 
@@ -240,9 +295,11 @@ class PendingApproval:
         self.decided_by: str | None = None
         self.card_id: str | None = None
         self.card_announced = False
-        # 风险与规则命中：建请求时就由 L0 定好，供 L2 门控与审计用。
+        # 风险、规则命中与**动作类别**：建请求时就由 L0 定好。
+        # 类别是独立于规则名的一维，门控与红条都只认它（规格 §16.3 C3）。
         self.severity: str = DEFAULT_RISK_SEVERITY
         self.rule: str = ""
+        self.action_class: str = DEFAULT_ACTION_CLASS
         # L2 决定时填。
         self.judge_model: str = ""
         self.judge_reason: str = ""
@@ -284,6 +341,7 @@ class PendingApproval:
             "state": "pending" if self.is_pending() else "settled",
             "risk": self.severity,
             "rule": self.rule,
+            "action_class": self.action_class,
             "decision": self.decision,
             "decided_by": self.decided_by,
             "auto": self.auto,
@@ -424,19 +482,22 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
                     working_directory: str | None, timeout_seconds: float,
                     advice_state: str = "disabled",
                     suggestion: str = "", reason: str = "", basis: str = "",
-                    risk: str = DEFAULT_RISK_SEVERITY, rule: str = "") -> str:
+                    risk: str = DEFAULT_RISK_SEVERITY,
+                    action_class: str = DEFAULT_ACTION_CLASS) -> str:
     """审批卡片的 HTML。纯函数——卡片文案是验收项，必须能单测。
 
-    五块内容（规格 §4 + §2 硬规则 3）：标题/来源/命令、**高风险红条**、
-    会话与 cwd、建议+理由+依据、三个按钮、超时说明。
+    六块内容：标题/来源/命令、**极高危红条**、会话与 cwd、
+    建议（陈述句）、超时说明、三个按钮。
     ``subject`` 由调用方用归因语法生成（``describe_actor``），
     这样播报和卡片说的是同一套话。
+
+    建议块刻意排在按钮**上方**（规格 §16.1「覆盖 §12.1」）：用户点之前要看到。
     """
     location = f"会话 {session_id or '未知'}"
     if working_directory:
         location += f" @ {working_directory}"
 
-    # 建议块：没 key / 没签字 / 没开开关时降级成一行说明，不编内容。
+    # 建议块：没 key / 没签字 / 没开开关时降级成一行陈述，不编内容。
     if advice_state == "ready":
         advice_lines = [
             f"<p><strong>建议：{_escape(suggestion)}</strong></p>",
@@ -446,9 +507,10 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
     else:
         advice_lines = [f"<strong>{_escape(ADVICE_TEXT[advice_state])}</strong>"]
 
-    # 高风险永远呈现（规格 §2 硬规则 3）：标红 + 明说任何配置都不会让它自动放行。
-    # 判据用规则命中**或** severity——两条独立，任一成立就要红。
-    high_risk = (rule in L2_EXCLUDED_RULES
+    # 极高危永远呈现（规格 §2 硬规则 3 + §17.2）：标红 + 明说任何配置都不会
+    # 让它自动放行。判据是**动作类别或极高危档**，不是规则名（C3）——
+    # 规则名会随规则库变，红条不能跟着漏。
+    high_risk = (action_class in IRREVERSIBLE_CLASSES
                  or SEVERITY_ORDER.get(risk, 0) >= SEVERITY_ORDER["critical"])
     risk_html = (
         '<p class="risk"><strong>高风险动作：任何配置都不会让它自动放行，'
@@ -622,6 +684,8 @@ class AuditRecord(BaseModel):
     reason: str = Field(default="", description="一句话理由")
     rule: str = Field(default="", description="命中的 L0 规则；空 = 未命中")
     severity: str = Field(default="", description="L0 风险档")
+    action_class: str = Field(
+        default="", description="动作类别：recoverable / irreversible；空 = 未涉及")
     authorization: str = Field(default="", description="生效中的授权溯源；空 = 未涉及授权")
 
     def as_dict(self) -> dict[str, Any]:
@@ -638,12 +702,14 @@ class AuditRecord(BaseModel):
             "reason": self.reason,
             "rule": self.rule or "-",
             "severity": self.severity or "-",
+            "action_class": self.action_class or "-",
             "authorization": self.authorization or "-",
         }
 
     def as_text(self) -> str:
         return (f"{_iso(self.ts)} | {self.kind} | {self.decision or '无决定'} | "
                 f"by={self.decided_by} | rule={self.rule or '-'} | "
+                f"class={self.action_class or '-'} | "
                 f"auth={self.authorization or '-'} | model={self.model or '-'} | "
                 f"req={self.request_id or '-'} | "
                 f"session={self.session_id or '无'} | {self.tool_summary} | {self.reason}")
@@ -675,7 +741,10 @@ class ApprovalGateway:
         # 门控开关：**只能由用户写配置**，运行期不可改（见 policy_snapshot 的测试）。
         self._ai_judgement = bool(ai_judgement)
         self._auto_decide = str(auto_decide)
-        self._auto_decide_max_severity = str(auto_decide_max_severity)
+        # 极高危档不可被自动放行（规格 §3），所以阈值开到 critical 是无意义的，
+        # 夹到 warn 并留一条日志——默默接受一个"开了却开不动"的配置更难查。
+        self._auto_decide_max_severity = effective_max_severity(
+            auto_decide_max_severity)
         self._has_api_key = bool(has_api_key)
         self._audit_path = audit_path
         self._authorization_path = authorization_path
@@ -804,7 +873,7 @@ class ApprovalGateway:
         """
         request = build_request(payload)
         record = PendingApproval(request)
-        record.severity, record.rule = assess_risk(
+        record.severity, record.rule, record.action_class = assess_risk(
             request.tool_name, (payload or {}).get("tool_input")
             if isinstance(payload, dict) else None,
         )
@@ -871,7 +940,7 @@ class ApprovalGateway:
             authorization = self._authorization
         scopes = authorization.scopes if authorization is not None else ()
         eligible, why = auto_decide_gate(
-            rule=record.rule, severity=record.severity,
+            severity=record.severity, action_class=record.action_class,
             ai_judgement=self._ai_judgement, has_key=self._has_api_key,
             auto_decide=self._auto_decide,
             max_severity=self._auto_decide_max_severity,
@@ -1000,6 +1069,7 @@ class ApprovalGateway:
             model=record.judge_model,
             rule=record.rule,
             severity=record.severity,
+            action_class=record.action_class,
             authorization=record.authorization,
             reason=self._audit_reason(record),
         )
