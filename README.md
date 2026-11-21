@@ -106,22 +106,27 @@ slogan：**替你看着 Agent，大事问你。**
 
 ## 当前状态
 
-**M0-lite-1：骨架能加载。** 只有一个 `status` 入口，不观测任何 Agent，不播报。
+**M0-lite-4：SDK 播报已通，真机验收中。** 观测轮询跑在 3 秒 timer 上，
+另有 `scan_now` 只读诊断入口可手动触发一次（不播报）。
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| M0-lite-1 | 骨架能加载 | ✅ 官方四条验收全过 |
+| M0-lite-1 | 骨架能加载 | ✅ 官方四条验收全过，真机确认「运行中」 |
 | M0-lite-2 | Claude Code 转录 tail + 网关元数据观测，统一事件 schema | ✅ 34 个单测 + 真实数据验过 |
-| M0-lite-3 | L0 规则层（删除类/危险写/停滞/失败），零 key 可用 | 未开始 |
-| M0-lite-4 | SDK 播报（`source` + `ai_behavior="blind"`） | 未开始 |
+| M0-lite-3a | L0 规则层：删除类 + 失败类，零 key 可用 | ✅ 真实数据 25 命中，0 误报 |
+| M0-lite-3b | L0 规则层：危险写 + 停滞 | 未开始（单独一轮） |
+| M0-lite-4 | SDK 播报（`source` + `ai_behavior="blind"`） | ✅ 代码完成，真机验收中 |
 | M0-lite-5 | 审批中继（`create_card` + hook 回填，超时默认拒绝） | 未开始 |
 | M0-lite-6 | 零 key 行为 | 未开始 |
 
 ## 观测层怎么用
 
 ```bash
-# 一次性读两个观测源，返回最近 N 条统一事件（确认解析对不对劲）
-uv run neko-plugin check agent_deskmate   # 或真机上调 dump_events 入口
+# 真机上三个入口：
+#   status     —— 插件自身状态（运行时长 / 阶段 / 适配器就绪）
+#   scan_now   —— 立即读一次观测源 + 跑规则，只读诊断，不播报
+#   dump_events—— 返回最近 N 条统一事件，确认解析对不对劲
+uv run neko-plugin check agent_deskmate
 ```
 
 数据源路径在 `config.example.toml` 的 `[agent_deskmate.watch]`，代码里不写死绝对路径：
