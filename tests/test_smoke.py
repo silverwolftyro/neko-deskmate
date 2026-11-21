@@ -66,7 +66,8 @@ def test_events_registered() -> None:
 
     assert set(registered) == {
         "startup", "shutdown", "config_change", "status", "dump_events", "scan_now",
-        "watch", "approval", "approval_decide",
+        "watch", "approval", "approval_decide", "approval_explain",
+        "pending_list", "audit_list",
     }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"
     assert registered["shutdown"].event_type == "lifecycle"
@@ -76,6 +77,10 @@ def test_events_registered() -> None:
     assert registered["scan_now"].event_type == "plugin_entry"
     # M0-lite-5：审批卡片按钮的落点，必须是 plugin_entry（@ui.action 叠加在它上面）
     assert registered["approval_decide"].event_type == "plugin_entry"
+    assert registered["approval_explain"].event_type == "plugin_entry"
+    # 5a：审批待办与审计两个查询入口
+    assert registered["pending_list"].event_type == "plugin_entry"
+    assert registered["audit_list"].event_type == "plugin_entry"
     # 常驻观测轮询必须是 timer，不能是 entry——entry 只在被调用时跑
     assert registered["watch"].event_type == "timer"
     # 审批卡片也走 timer：create_card 是 async SDK 调用，hook handler 在纯线程里

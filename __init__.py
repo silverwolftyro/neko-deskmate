@@ -52,12 +52,17 @@ from .adapters.claude_code import (
 from .adapters.gateway import current_watermark, read_new_gateway_events
 from .approval import (
     APPROVE_ALLOW,
-    APPROVE_DENY,
+    AUTO_LOW_RISK_ONLY,
+    AUTO_OFF,
     CARD_CSS,
-    DECIDED_BY_TIMEOUT,
+    DECIDED_BY_AI,
+    DECIDED_BY_USER,
     ApprovalGateway,
     build_card_actions,
     build_card_html,
+    build_explain_html,
+    build_result_html,
+    explain_request,
 )
 from .broadcast import Broadcaster, describe_actor, render_text
 from .events import UnifiedEvent, attribute, delegated_server
@@ -87,8 +92,13 @@ SCAN_EVENT_COUNT = 50
 # scan_now 回显几条"将要播报"的原文，超过就截断。
 SCAN_SAMPLE_LIMIT = 3
 
-# hooks.json 里写死的端口。改 approval_port 必须同步改它，否则 hook 打不进来。
+# hooks.json 里写死的端口。改 approval.port 必须同步改它，否则 hook 打不进来。
 HOOKS_DEFAULT_PORT = 48921
+# hooks.json 里写死的 hook 超时。我们的到期时间必须明显小于它。
+HOOK_TIMEOUT_SECONDS = 600
+# 审批默认到期：hook 600s 前 30 秒。只标记 expired，不发任何决定。
+DEFAULT_TIMEOUT_SECONDS = 570.0
+DEFAULT_RETENTION_SECONDS = 3600.0
 
 
 def _escape(text: str) -> str:
@@ -117,6 +127,22 @@ class DumpEventsReply(BaseModel):
     count: int = Field(description="实际返回的事件条数")
     events: list[dict] = Field(description="统一事件列表，最新在最后")
     sources: dict[str, str] = Field(default_factory=dict, description="各数据源的读取情况")
+
+
+class PendingListReply(BaseModel):
+    """pending_list 入口的输出契约：未决 + 已了结未删的。"""
+
+    count: int = Field(description="返回的条数")
+    pending: int = Field(description="其中还没决定的条数")
+    items: list[dict] = Field(description="最新在前")
+
+
+class AuditListReply(BaseModel):
+    """audit_list 入口的输出契约。"""
+
+    count: int = Field(description="返回的条数")
+    items: list[dict] = Field(description="最新在前")
+    text: str = Field(description="同一份审计的纯文本，便于直接复制导出")
 
 
 class ScanNowReply(BaseModel):
@@ -168,6 +194,12 @@ def _to_bool(value: object, default: bool) -> bool:
 def _watch_section(config: dict[str, Any]) -> dict[str, Any]:
     """从 ``[agent_deskmate]`` 整节里取 ``watch`` 子表；没有就是空 dict。"""
     section = config.get("watch")
+    return section if isinstance(section, dict) else {}
+
+
+def _approval_section(config: dict[str, Any]) -> dict[str, Any]:
+    """从 ``[agent_deskmate]`` 整节里取 ``approval`` 子表（规格 §5）。"""
+    section = config.get("approval")
     return section if isinstance(section, dict) else {}
 
 
@@ -339,6 +371,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._broadcaster: Broadcaster | None = None
         self._approval: ApprovalGateway | None = None
         self._hint_logged = False
+        self._last_hud_count = -1
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     # startup 用 async def、shutdown 用 def，刻意对齐官方 memo_reminder 的写法：
@@ -367,21 +400,46 @@ class AgentDeskmatePlugin(NekoPluginBase):
         })
 
     def _start_approval_service(self, config: dict[str, Any]) -> None:
-        """起审批 HTTP 服务（M0-lite-5）。
+        """起审批 HTTP 服务（M0-lite-5 / 5a 门控）。
 
         刻意**不用 asyncio 任务**：AGENTS.md 说 startup 返回时它创建的任务会被
         取消，而审批要活到用户点按钮那一刻。守护线程不受影响。
         端口绑不上只让审批中继不可用，观测与播报照常跑。
+
+        ``api_key`` 只用来判断"有没有 key"，**不落日志、不进卡片、不给模型**。
         """
-        port = int(_to_number(config.get("approval_port"), HOOKS_DEFAULT_PORT))
-        timeout = _to_number(config.get("approval_timeout_seconds"), 60.0)
+        section = _approval_section(config)
+        port = int(_to_number(section.get("port"), HOOKS_DEFAULT_PORT))
+        timeout = _to_number(section.get("timeout_mark_expired"), DEFAULT_TIMEOUT_SECONDS)
+        retention = _to_number(section.get("retention_seconds"), DEFAULT_RETENTION_SECONDS)
+        auto_decide = str(section.get("auto_decide") or AUTO_OFF).strip().lower()
+        if auto_decide not in (AUTO_OFF, AUTO_LOW_RISK_ONLY):
+            self.logger.warning(
+                "approval.auto_decide 取值不明（{}），按 off 处理", auto_decide,
+            )
+            auto_decide = AUTO_OFF
         self._approval = ApprovalGateway(
-            self.logger, port=port, timeout_seconds=max(1.0, timeout),
+            self.logger,
+            port=port,
+            timeout_seconds=max(1.0, timeout),
+            retention_seconds=max(60.0, retention),
+            ai_judgement=_to_bool(section.get("ai_judgement"), False),
+            auto_decide=auto_decide,
+            auto_decide_max_severity=str(
+                section.get("auto_decide_max_severity") or "notice").strip().lower(),
+            has_api_key=bool(str(section.get("api_key") or "").strip()),
+            audit_path=self.data_path("audit.jsonl"),
         )
         if not self._approval.start():
             self._approval = None
             return
         self._check_hooks_port(port)
+        if timeout >= HOOK_TIMEOUT_SECONDS:
+            self.logger.error(
+                "approval.timeout_mark_expired={}s 不小于 hooks.json 的 hook 超时 {}s，"
+                "我们还没到期宿主就先断开了，pending 会永远等不到标记",
+                timeout, HOOK_TIMEOUT_SECONDS,
+            )
 
     def _check_hooks_port(self, port: int) -> None:
         """hooks.json 里的端口和配置不一致时大声报警。
@@ -545,7 +603,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
     @timer_interval(id="approval", seconds=1)
     async def approval_tick(self, **_):
-        """把新来的审批请求变成卡片，并把已决定的结果写回卡片。
+        """把新来的审批请求变成卡片、把已了结的结果写回卡片、按需推 HUD。
 
         单独一个 1 秒 timer，不并进 3 秒的观测轮询：审批是"人在等"的交互，
         晚 3 秒才弹出卡片，体感就是插件坏了。
@@ -560,8 +618,35 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 await self._create_approval_card(pending)
             for pending in self._approval.settle_pending_cards():
                 await self._settle_approval_card(pending)
+            await self._push_hud_if_changed()
         except Exception as exc:  # noqa: BLE001  一轮失败不能杀死 timer
             self.logger.warning("审批卡片处理异常（{}）：{}", type(exc).__name__, exc)
+
+    async def _push_hud_if_changed(self) -> None:
+        """未决数量进 HUD。**只在数量变化时发一次**——每轮都发就是刷屏。
+
+        走 push_message（红线 1）：source 显式、ai_behavior="blind"，
+        只报"有 N 条待判断"这一句，不带命令原文。
+        """
+        count = self._approval.undecided_count()
+        if count == self._last_hud_count:
+            return
+        self._last_hud_count = count
+        if count == 0:
+            # 归零也值得说一声：用户可能正等着"是不是清了"。
+            text = "同桌猫：没有待判断的审批了"
+        else:
+            text = f"同桌猫：有 {count} 条审批待判断"
+        try:
+            self.push_message(
+                source=SOURCE,
+                visibility=["hud"],
+                ai_behavior="blind",
+                parts=[{"type": "text", "text": text}],
+                priority=4,
+            )
+        except Exception as exc:  # noqa: BLE001  HUD 推不出去不影响审批
+            self.logger.warning("HUD 推送失败（{}）：{}", type(exc).__name__, exc)
 
     async def _create_approval_card(self, pending: Any) -> None:
         request = pending.request
@@ -571,11 +656,11 @@ class AgentDeskmatePlugin(NekoPluginBase):
             requester_evidence="", requester=None,
         )
         body = request.tool_summary or request.tool_name or "未知工具"
-        timeout = _to_number(self._last_config.get("approval_timeout_seconds"), 60.0) \
-            if self._last_config else 60.0
+        timeout = self._approval.timeout_seconds
         html = build_card_html(
             subject=subject, tool_summary=body, session_id=request.session_id,
             working_directory=request.working_directory, timeout_seconds=timeout,
+            advice_state=self._approval.advice_state(),
         )
         try:
             card = await self.ctx.create_card(
@@ -585,29 +670,29 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 summary=f"审批：{subject} 请求执行 {body}"[:80],
             )
         except CardSubmissionError as exc:
-            # 卡片发不出去≠审批不存在：hook 还在等，超时后会按拒绝收尾。
-            self.logger.warning("审批卡片提交失败（{}），请求 {} 将走超时拒绝",
+            # 卡片发不出去≠审批不存在：hook 还在等，到期后会按 expired 收尾。
+            self.logger.warning("审批卡片提交失败（{}），请求 {} 将走到期标记",
                                 exc, request.request_id)
-            self._approval.resolve(request.request_id, APPROVE_DENY,
-                                   decided_by=DECIDED_BY_TIMEOUT)
             return
         self._approval.attach_card(request.request_id, card.id)
         self.logger.info("审批卡片已弹出 {}（请求 {}）", card.id, request.request_id)
 
     async def _settle_approval_card(self, pending: Any) -> None:
-        """用户点完（或超时）后把卡片改成结果态，并清掉按钮防重复点。"""
+        """用户点完（或到期）后把卡片改成结果态，并清掉按钮防重复点。"""
         request = pending.request
         if not pending.card_id:
             return
-        if pending.decision == APPROVE_ALLOW:
-            note = "已允许，Claude Code 继续执行。"
-        else:
-            note = ("已拒绝（超时默认拒绝）。" if pending.decided_by == DECIDED_BY_TIMEOUT
+        if pending.decided_by == DECIDED_BY_USER:
+            note = ("已允许，Claude Code 继续执行。" if pending.decision == APPROVE_ALLOW
                     else "已拒绝，这次调用被中止。")
+        elif pending.decided_by == DECIDED_BY_AI:
+            note = f"已由 L2 自动决定：{pending.decision}（{pending.judge_reason}）"
+        else:
+            note = ("已过期：无人决定，插件不代你判断，本次调用交由宿主按 "
+                    "onFailure 策略处理。")
         try:
             card = self.ctx.get_card(pending.card_id)
-            await card.update(html=f"<section><p>{_escape(note)}</p></section>",
-                              summary=note[:60], actions={})
+            await card.update(html=build_result_html(note), summary=note[:60], actions={})
         except CardSubmissionError as exc:
             self.logger.warning("审批结果卡片更新失败（{}）：请求 {}",
                                 exc, request.request_id)
@@ -627,12 +712,47 @@ class AgentDeskmatePlugin(NekoPluginBase):
         """卡片按钮的落点。幂等：重复点击只有第一次算数。"""
         if self._approval is None:
             return Err(SdkError("审批服务未运行"))
-        outcome = self._approval.resolve(request_id, decision, decided_by="user")
+        outcome = self._approval.resolve(request_id, decision, decided_by=DECIDED_BY_USER)
         if outcome == "unknown":
-            return Err(SdkError("找不到这个审批请求（可能已超时）"))
+            return Err(SdkError("找不到这个审批请求（可能已过期并被清理）"))
+        if outcome == "expired":
+            # 过期卡片：不回填，明确告诉用户这条已经不算数了。
+            return Ok({"message": "这条已过期（宿主已拦截），不再回填"})
         if outcome == "already-resolved":
             return Ok({"message": "这个请求已经决定过了"})
         return Ok({"message": "已允许" if decision == APPROVE_ALLOW else "已拒绝"})
+
+    @ui.action(id="approval_explain", label=tr("entry.approval_explain.name", default="这是什么"))
+    @plugin_entry(
+        id="approval_explain",
+        name=tr("entry.approval_explain.name", default="这是什么"),
+        description=tr(
+            "entry.approval_explain.description",
+            default="解释这条审批请求是什么、L0 规则对它有什么判断。"
+                    "不接模型，只说规则层能讲准的事实。",
+        ),
+    )
+    async def approval_explain(self, request_id: str, _ctx: dict):
+        """「这是什么」按钮的落点。L0 级解释，不猜意图。"""
+        if self._approval is None:
+            return Err(SdkError("审批服务未运行"))
+        pending = self._approval.find(request_id)
+        if pending is None:
+            return Err(SdkError("找不到这个审批请求（可能已过期并被清理）"))
+        explanation = explain_request(
+            tool_name=pending.request.tool_name,
+            tool_summary=pending.request.tool_summary,
+            working_directory=pending.request.working_directory,
+            rule=pending.rule,
+            severity=pending.severity,
+        )
+        try:
+            card = self.ctx.get_card(_ctx["card_id"], target_lanlan=_ctx.get("lanlan_name"))
+            await card.update(html=build_explain_html(explanation),
+                              summary=explanation["title"], actions={})
+        except (CardSubmissionError, KeyError) as exc:
+            self.logger.warning("解释卡片更新失败（{}）：请求 {}", exc, request_id)
+        return Ok(explanation)
 
     # ── 入口 ───────────────────────────────────────────────────────────────
 
@@ -736,6 +856,44 @@ class AgentDeskmatePlugin(NekoPluginBase):
         """
         config = await self._plugin_config()
         return await asyncio.to_thread(diagnose, config, log=self.logger)
+
+    @plugin_entry(
+        id="pending_list",
+        name=tr("entry.pending_list.name", default="审批待办"),
+        description=tr(
+            "entry.pending_list.description",
+            default="返回未决与已了结（未清理）的审批：会话、命令、建立时间、状态、"
+                    "decided_by。过期不删，保留一段时间供事后查。",
+        ),
+        llm_result_fields=["count", "pending"],
+    )
+    async def pending_list(self, limit: int = 50, **_) -> PendingListReply:
+        """审批待办清单。过期条目也在里面——它们正是"当时到底问过什么"的证据。"""
+        if self._approval is None:
+            return PendingListReply(count=0, pending=0, items=[])
+        items = self._approval.snapshot()[: max(1, min(int(limit), 200))]
+        pending = self._approval.undecided_count()
+        self.logger.info("pending_list：{} 条（其中未决 {}）", len(items), pending)
+        return PendingListReply(count=len(items), pending=pending, items=items)
+
+    @plugin_entry(
+        id="audit_list",
+        name=tr("entry.audit_list.name", default="审批审计"),
+        description=tr(
+            "entry.audit_list.description",
+            default="返回每次审批决定的审计：时间、命令、决定、decided_by"
+                    "（user/ai/expired）、模型、理由。附带纯文本便于导出。",
+        ),
+        llm_result_fields=["count"],
+    )
+    async def audit_list(self, limit: int = 100, **_) -> AuditListReply:
+        """审批审计。每次决定都写一条；text 字段可直接复制走。"""
+        if self._approval is None:
+            return AuditListReply(count=0, items=[], text="# 同桌猫审批审计（共 0 条）")
+        rows = self._approval.audit_rows()[: max(1, min(int(limit), 500))]
+        self.logger.info("audit_list：{} 条", len(rows))
+        return AuditListReply(count=len(rows), items=rows,
+                              text=self._approval.audit_text())
 
     # ── 一次性读取（不走增量水位） ──────────────────────────────────────────
 
