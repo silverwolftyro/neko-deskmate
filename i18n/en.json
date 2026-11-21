@@ -9,5 +9,8 @@
   "entry.dump_events.description": "Reads the observation sources once and returns the most recent N unified events, to confirm the parsing is correct.",
 
   "entry.scan_now.name": "Scan Now",
-  "entry.scan_now.description": "Reads the observation sources once and runs the rules, returning event count / hit count / expected broadcast count and the rule breakdown. Read-only diagnostics: it sends no broadcast."
+  "entry.scan_now.description": "Reads the observation sources once and runs the rules, returning event count / hit count / expected broadcast count and the rule breakdown. Read-only diagnostics: it sends no broadcast.",
+
+  "entry.approval_decide.name": "Approval Decision",
+  "entry.approval_decide.description": "Target of the approval card buttons: feeds the user's Allow/Reject back to the waiting Claude Code. Not meant to be called by hand."
 }

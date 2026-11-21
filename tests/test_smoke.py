@@ -65,7 +65,8 @@ def test_events_registered() -> None:
             registered[meta.id] = meta
 
     assert set(registered) == {
-        "startup", "shutdown", "config_change", "status", "dump_events", "scan_now", "watch",
+        "startup", "shutdown", "config_change", "status", "dump_events", "scan_now",
+        "watch", "approval", "approval_decide",
     }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"
     assert registered["shutdown"].event_type == "lifecycle"
@@ -73,8 +74,13 @@ def test_events_registered() -> None:
     assert registered["status"].event_type == "plugin_entry"
     assert registered["dump_events"].event_type == "plugin_entry"
     assert registered["scan_now"].event_type == "plugin_entry"
+    # M0-lite-5：审批卡片按钮的落点，必须是 plugin_entry（@ui.action 叠加在它上面）
+    assert registered["approval_decide"].event_type == "plugin_entry"
     # 常驻观测轮询必须是 timer，不能是 entry——entry 只在被调用时跑
     assert registered["watch"].event_type == "timer"
+    # 审批卡片也走 timer：create_card 是 async SDK 调用，hook handler 在纯线程里
+    # 没有事件循环可 await，只能由 timer 代劳。
+    assert registered["approval"].event_type == "timer"
 
 
 def test_observation_lives_in_the_timer_not_in_an_entry() -> None:
@@ -95,7 +101,10 @@ def test_observation_lives_in_the_timer_not_in_an_entry() -> None:
         )
         if meta is not None and meta.event_type == "timer"
     ]
-    assert timers == ["watch"]
+    # 两个 timer：watch 做观测，approval 把挂起的审批请求变成卡片。
+    # 审批必须是 timer 而不是塞进 watch：create_card 是 async SDK 调用，
+    # 而 hook 的 handler 跑在纯线程里，没有事件循环可 await。
+    assert sorted(timers) == ["approval", "watch"]
 
     for entry_name in ("status", "dump_events", "scan_now"):
         source = inspect.getsource(getattr(cls, entry_name))

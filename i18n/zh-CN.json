@@ -9,5 +9,8 @@
   "entry.dump_events.description": "读一次观测源，返回最近 N 条统一事件，用于确认解析是否正确。",
 
   "entry.scan_now.name": "立即扫描一次",
-  "entry.scan_now.description": "同步读一次观测源并跑规则判定，返回事件数 / 命中数 / 预计播报数与规则分布。只读诊断，不发送任何播报。"
+  "entry.scan_now.description": "同步读一次观测源并跑规则判定，返回事件数 / 命中数 / 预计播报数与规则分布。只读诊断，不发送任何播报。",
+
+  "entry.approval_decide.name": "审批决定",
+  "entry.approval_decide.description": "审批卡片的按钮落点：把用户点的「允许 / 拒绝」回填给正在等待的 Claude Code。正常不会手动调用它。"
 }
