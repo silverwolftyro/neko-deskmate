@@ -268,3 +268,43 @@ def test_scan_now_delegates_to_diagnose() -> None:
     assert "to_thread" in source            # 读盘不能堵住 entry loop
     assert "broadcaster" not in source      # 不碰播报器
     assert "_poll_once" not in source       # 不碰常驻轮询
+
+
+# ── 首启引导（B） ───────────────────────────────────────────────────────────
+# 只打日志、不播报：这是配置建议，不是观测结果。
+
+from plugin.plugins.agent_deskmate import _mine_roots, _to_bool, _watch_section  # noqa: E402
+
+
+def test_mine_roots_empty_by_default() -> None:
+    assert _mine_roots({}) == []
+    assert _mine_roots({"mine": {}}) == []
+    assert _mine_roots({"mine": {"roots": None}}) == []
+    assert _mine_roots({"mine": {"roots": r"D:\workspace"}}) == []   # 不是列表，忽略
+
+
+def test_mine_roots_expands_user_and_vars(tmp_path: Path) -> None:
+    roots = _mine_roots({"mine": {"roots": [str(tmp_path), "", "  "]}})
+    assert roots == [tmp_path]          # 空串被丢掉，不当成"当前目录"
+
+
+def test_mine_roots_ignores_bad_types() -> None:
+    assert _mine_roots({"mine": {"roots": [None, 5]}}) == [Path("5")]  # 5 → "5"，不崩
+    assert _mine_roots({"mine": "not a dict"}) == []
+
+
+def test_watch_section_tolerates_junk() -> None:
+    assert _watch_section({}) == {}
+    assert _watch_section({"watch": None}) == {}
+    assert _watch_section({"watch": "x"}) == {}
+
+
+def test_to_bool_defaults() -> None:
+    assert _to_bool(None, True) is True
+    assert _to_bool(None, False) is False
+    assert _to_bool("true", False) is True
+    assert _to_bool("FALSE", True) is False
+    assert _to_bool("1", False) is True
+    assert _to_bool("0", True) is False
+    assert _to_bool("瞎写", True) is True      # 坏值不猜，退回默认
+    assert _to_bool(True, False) is True

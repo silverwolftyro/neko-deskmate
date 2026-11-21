@@ -54,6 +54,10 @@ cc_switch_db = "~/.cc-switch/cc-switch.db"
 # 可能已退出、中间常隔一层 shell/node。
 # 所以这里要**你自己声明**：这是用户给的事实，不是插件的猜测。
 # 不声明 = 全部按未知处理（宁可少说，不错说）。
+# 留空时插件启动会在日志里打一条提示（只在日志，不播报）。
 [agent_deskmate.mine]
 roots = []
+# 示例（TOML 里反斜杠要转义，写两个）：
 # roots = ["D:\\workspace", "C:\\Users\\alpha\\projects"]
+# 也可以直接用正斜杠，Windows 同样认：
+# roots = ["D:/workspace", "C:/Users/alpha/projects"]

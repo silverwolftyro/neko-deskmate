@@ -318,12 +318,34 @@ class AgentDeskmatePlugin(NekoPluginBase):
             "同桌猫启动 plugin_id={} source={} stage={}",
             self.plugin_id, SOURCE, STAGE,
         )
+        await self._log_first_run_hint()
         return Ok({
             "status": "running",
             "plugin_id": self.plugin_id,
             "source": SOURCE,
             "stage": STAGE,
         })
+
+    async def _log_first_run_hint(self) -> None:
+        """首启引导：没声明 mine roots 就在日志里提示一次。
+
+        **只打日志，不播报**——这是配置建议，不是观测结果，按红线 1
+        不能走 push_message 打扰用户。也不猜归因：提示只告诉用户
+        "想显示『你自己开的』需要声明什么"，不替他声明。
+        """
+        try:
+            config = await self._plugin_config()
+        except Exception as exc:  # noqa: BLE001  引导失败绝不能拖垮 startup
+            self.logger.warning("首启引导跳过（读配置失败：{}）", type(exc).__name__)
+            return
+        if _mine_roots(config):
+            return
+        self.logger.info(
+            "提示：未配置 [agent_deskmate.mine] roots，删除类播报的主语将显示为"
+            "「发起者未知」。想让它显示「你自己开的 claude-code」，在配置里声明"
+            "你常开会话的目录（例如 roots = [\"D:\\\\workspace\"]）。"
+            "这是你自己给的事实，插件不猜；详见 config.example.toml。"
+        )
 
     @lifecycle(id="shutdown")
     def on_shutdown(self, **_):
