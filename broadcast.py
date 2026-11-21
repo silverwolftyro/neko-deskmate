@@ -15,8 +15,15 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
+from .events import (
+    ATTRIBUTION_KNOWN,
+    EVIDENCE_SIDECHAIN,
+    EVIDENCE_USER_DECLARED,
+    REQUESTER_USER,
+)
 from .rules import SEVERITY_CRITICAL, SEVERITY_INFO, SEVERITY_NOTICE, SEVERITY_WARN, RuleHit
 
 # 严重度 → N.E.K.O priority（0-10，越大越重要）
@@ -37,16 +44,138 @@ SEVERITY_LABEL = {
 
 _PUSH_REJECTION_INFO = frozenset({"backpressure", "transport_error", "transport_unavailable"})
 
+# 会话短 id 的长度。全 UUID 有 36 字符，在一行播报里纯属噪音。
+SESSION_SHORT_LEN = 8
+
+UNKNOWN_EXECUTOR = "未知执行者"
+
 
 def priority_for(severity: str) -> int:
     return SEVERITY_PRIORITY.get(severity, 5)
 
 
+# ── 归因文案（2026-11-21 决策记录 §1/§2） ──────────────────────────────────
+# 核心原则：主语位只放「可证的请求源」；执行者降级到括号里；拿不准就写未知。
+# 用户会把播报的主语读成「发起者」，主语位一旦放执行者，就等于把锅扣给手——
+# 真实事故：DSH spawn 的 claude -p 删了文件，播报说「claude-code 删除」，
+# 用户第一反应是"我什么时候让 Claude 删东西了？"
+
+
+def _split_summary(summary: str) -> tuple[str, str]:
+    """把 ``删除文件：rm -rf x`` 拆成 ``("删除文件", "rm -rf x")``。
+
+    规则层的 summary 一律是「短语：细节」形状，这里只切第一个冒号。
+    没有冒号时整句当短语、细节为空——不猜。
+    """
+    phrase, separator, detail = summary.partition("：")
+    if not separator:
+        return summary.strip(), ""
+    return phrase.strip(), detail.strip()
+
+
+def _executor_of(hit: RuleHit) -> str:
+    return hit.executor or hit.agent or UNKNOWN_EXECUTOR
+
+
+def _short_session(session: str) -> str:
+    return session[:SESSION_SHORT_LEN] if session else ""
+
+
+def _session_of(hit: RuleHit) -> str:
+    """显示用会话 id。优先 ``session``，缺失时退回 ``chain_id``。
+
+    两者今天恒等（``chain_id`` 就是从源事件的 session 带过来的），但调用方
+    可能只传了其中一个——退回一下，免得定位三件套因为一个漏传的 kwargs
+    就少一块，而那正是用户 3 秒内自证的依据。
+    """
+    return hit.session or hit.chain_id
+
+
+def _subject(hit: RuleHit) -> str:
+    """主语位放谁。四种情况，判据全部可证（决策记录 §2）。"""
+    executor = _executor_of(hit)
+
+    # 贵脑 + 廉价手：本会话是大脑，它把活下派给了外部 worker。
+    # 主语是大脑（用户对话的对象），worker 降级成"手"。
+    if hit.delegated_to:
+        return f"{executor} 让 {hit.delegated_to} 执行"
+
+    # 父子代理：动手的是子代理，责任仍在父会话。
+    if hit.requester_evidence == EVIDENCE_SIDECHAIN:
+        return f"{executor}（经子代理）"
+
+    # 用户自己声明过这个目录里的会话是他开的——这是用户给的事实，不是猜测。
+    if hit.requester == REQUESTER_USER and hit.requester_evidence == EVIDENCE_USER_DECLARED:
+        return f"你自己开的 {executor}"
+
+    return executor
+
+
+def _locator(hit: RuleHit) -> str:
+    """定位三件套：会话短 id + 工作目录。让用户 3 秒内自己判断"这是我开的吗"。
+
+    只有 cwd 时不要写成 `（@ C:\…）`——那个 @ 是给"会话 + 目录"配对用的，
+    单独挂着很怪。缺什么就不写什么，不留空壳。
+    """
+    short = _short_session(_session_of(hit))
+    cwd = hit.working_directory
+    if short and cwd:
+        return f"（会话 {short} @ {cwd}）"
+    if short:
+        return f"（会话 {short}）"
+    if cwd:
+        return f"（{cwd}）"
+    return ""
+
+
+# 主语以拉丁字符结尾时才补空格（"claude-code 删除文件"）；
+# 以中文结尾时不补（"（经子代理）删除文件"、"…执行 删除文件"会多一个空）。
+_NEEDS_SPACE = re.compile(r"[0-9A-Za-z_-]$")
+
+
+def _glue(subject: str, phrase: str) -> str:
+    return f"{subject} {phrase}" if _NEEDS_SPACE.search(subject) else f"{subject}{phrase}"
+
+
+def _hedged(hit: RuleHit) -> bool:
+    """要不要走「发起者未知」模版。
+
+    按后果分级（决策记录 §2）：主语的可信度要与动作后果成正比。
+    critical 不把主语交给推测；notice/warn 可以直接写可见的 agent——
+    没人会为一条 429 限流播报质疑"是我让它请求的吗"。
+    """
+    return hit.severity == SEVERITY_CRITICAL and hit.attribution != ATTRIBUTION_KNOWN
+
+
 def render_text(hit: RuleHit) -> str:
-    """一行给人看的文本。带严重度前缀与来源 Agent，便于判断是谁的事。"""
-    label = SEVERITY_LABEL.get(hit.severity, "【信息】")
-    agent = f"{hit.agent} " if hit.agent else ""
-    return f"{label}{agent}{hit.summary}"
+    """一行（严重时两行）给人看的文本。
+
+    四种模版，见 ``_subject`` / ``_hedged``：
+      1. 单 Agent        【严重】Claude Code 删除文件：rm -f …（会话 800257f3 @ D:\\…）
+      2. 父子代理        【严重】Claude Code（经子代理）删除文件：…
+      3. 贵脑+廉价手     【严重】Claude Code 让 deepseek-worker 执行删除：…
+      4. 未知发起者      【严重】删除文件，发起者未知：rm -f …
+                         由 Claude Code 会话 800257f3 执行 @ C:\\…\\Temp
+
+    第 4 种是 critical 的默认。刻意**不写免责声明腔**（"无法确定发起者，请自行核实"）——
+    那是把举证责任推给用户；写成陈述句加线索，用户自己就能在 3 秒内补上最后一跳。
+    """
+    label = SEVERITY_LABEL.get(hit.severity, SEVERITY_LABEL[SEVERITY_INFO])
+    phrase, detail = _split_summary(hit.summary)
+    body = f"{phrase}：{detail}" if detail else phrase
+
+    if _hedged(hit):
+        line = f"{label}{body}，发起者未知"
+        trailer = f"由 {_executor_of(hit)}"
+        short = _short_session(_session_of(hit))
+        if short:
+            trailer += f" 会话 {short}"
+        trailer += " 执行"
+        if hit.working_directory:
+            trailer += f" @ {hit.working_directory}"
+        return f"{line}\n{trailer}"
+
+    return f"{label}{_glue(_subject(hit), body)}{_locator(hit)}"
 
 
 class Broadcaster:
