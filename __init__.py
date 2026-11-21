@@ -45,10 +45,11 @@ from .adapters.claude_code import (
 )
 from .adapters.gateway import current_watermark, read_new_gateway_events
 from .broadcast import Broadcaster, render_text
-from .events import UnifiedEvent, attribute
+from .events import UnifiedEvent, attribute, delegated_server
 from .rules import (
     Coalescer,
     RuleHit,
+    evaluate_delegation,
     evaluate_delete,
     evaluate_failure,
     evaluate_transcript_error,
@@ -198,14 +199,21 @@ def _hits_for_event(event: UnifiedEvent, mine_roots: list[Path] = ()) -> list[Ru
     attributed = attribute(event, mine_roots=mine_roots)
     hits: list[RuleHit] = []
 
-    if attributed.event == "tool_use" and attributed.command:
-        hit = evaluate_delete(
-            attributed.command,
-            agent=attributed.agent, session=attributed.session, ts=attributed.ts,
-            source=attributed,
-        )
-        if hit is not None:
-            hits.append(hit)
+    if attributed.event == "tool_use":
+        # MCP 下派与删除类互斥：MCP 工具没有 Bash 的 command 字段，
+        # 删除规则本来就无从判起。先看下派，命中就不再判别的。
+        if delegated_server(attributed.tool):
+            hit = evaluate_delegation(attributed)
+            if hit is not None:
+                hits.append(hit)
+        elif attributed.command:
+            hit = evaluate_delete(
+                attributed.command,
+                agent=attributed.agent, session=attributed.session, ts=attributed.ts,
+                source=attributed,
+            )
+            if hit is not None:
+                hits.append(hit)
 
     elif attributed.event == "error":
         if attributed.source_type == "proxy_request_logs":

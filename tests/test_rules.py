@@ -19,6 +19,7 @@ from plugin.plugins.agent_deskmate.events import (
     attribute,
 )
 from plugin.plugins.agent_deskmate.rules import (
+    RULE_DELEGATION,
     RULE_DELETE,
     RULE_FAILURE,
     SEVERITY_CRITICAL,
@@ -26,6 +27,7 @@ from plugin.plugins.agent_deskmate.rules import (
     SEVERITY_WARN,
     Coalescer,
     _attribution_of,
+    evaluate_delegation,
     evaluate_delete,
     evaluate_failure,
     evaluate_transcript_error,
@@ -297,3 +299,76 @@ def test_attribution_never_enters_the_coalesce_key() -> None:
 
 def test_attribution_of_none_is_empty() -> None:
     assert _attribution_of(None) == {}
+
+
+# ── 下派观测（C / 归因第 4 步） ─────────────────────────────────────────────
+# 只认转录工具名的 mcp__ 前缀；不读 args、不猜动作、不判危险。
+
+
+def _mcp_event(**overrides) -> UnifiedEvent:
+    base = dict(agent="claude-code", session="800257f3-aaaa", event="tool_use",
+                tool="mcp__deepseek-worker__deepseek_task", command=None, ts="t",
+                executor="claude-code", working_directory=r"D:\workspace\N.E.K.O")
+    base.update(overrides)
+    return UnifiedEvent(**base)
+
+
+def test_delegation_fires_on_mcp_tool() -> None:
+    hit = evaluate_delegation(_mcp_event())
+    assert hit is not None
+    assert hit.rule == RULE_DELEGATION
+    assert hit.severity == SEVERITY_NOTICE      # 可见性，不是事故
+    assert hit.summary == "通过 deepseek-worker 下派了一次任务"
+    assert hit.matched == "deepseek-worker"
+    assert hit.delegated_to == "deepseek-worker"
+
+
+def test_delegation_ignores_non_mcp_tools() -> None:
+    assert evaluate_delegation(_mcp_event(tool="Bash")) is None
+    assert evaluate_delegation(_mcp_event(tool=None)) is None
+    assert evaluate_delegation(_mcp_event(tool="Read")) is None
+
+
+def test_delegation_ignores_non_tool_use_events() -> None:
+    assert evaluate_delegation(_mcp_event(event="error")) is None
+    assert evaluate_delegation(_mcp_event(event="turn_end")) is None
+
+
+def test_delegation_never_reads_args() -> None:
+    """判据只有工具名——不读 tool_input，所以参数里藏什么都不会影响判定。"""
+    hit = evaluate_delegation(_mcp_event())
+    assert "task" not in hit.summary
+    assert hit.matched == "deepseek-worker"
+
+
+def test_delegation_coalesces_by_session_and_server() -> None:
+    """同一会话反复调同一个 worker，窗口内只报一条——否则批量任务刷屏。"""
+    coalescer = Coalescer(window_seconds=60.0)
+    first = evaluate_delegation(_mcp_event())
+    same_server = evaluate_delegation(_mcp_event(ts="t2"))
+    other_server = evaluate_delegation(_mcp_event(tool="mcp__hermit__run_task"))
+    other_session = evaluate_delegation(_mcp_event(session="s2"))
+
+    assert coalescer.offer(first, now=1000.0) is first
+    assert coalescer.offer(same_server, now=1001.0) is None       # 同会话同 server → 合并
+    assert coalescer.offer(other_server, now=1002.0) is other_server   # 换 server → 放行
+    assert coalescer.offer(other_session, now=1003.0) is other_session # 换会话 → 放行
+
+
+def test_delegation_coalesce_key_is_session_scoped() -> None:
+    a = evaluate_delegation(_mcp_event(session="s1"))
+    b = evaluate_delegation(_mcp_event(session="s2"))
+    assert a.coalesce_key != b.coalesce_key
+    assert a.coalesce_key == "delegation|s1|claude-code|deepseek-worker"
+
+
+def test_delegation_carries_attribution() -> None:
+    """MCP 事件的证据是 mcp-delegation（不是 user-declared）——
+    哪怕 cwd 落在用户声明的目录里，这条事件的归因依据也是"它下派了"。
+    """
+    source = attribute(_mcp_event(), mine_roots=[r"D:\workspace"])
+    hit = evaluate_delegation(source)
+    assert hit.attribution == ATTRIBUTION_KNOWN
+    assert hit.requester == "session:800257f3-aaaa"
+    assert hit.requester_evidence == EVIDENCE_MCP_DELEGATION
+    assert hit.chain_id == source.session

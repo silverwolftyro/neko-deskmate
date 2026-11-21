@@ -24,7 +24,14 @@ from .events import (
     EVIDENCE_USER_DECLARED,
     REQUESTER_USER,
 )
-from .rules import SEVERITY_CRITICAL, SEVERITY_INFO, SEVERITY_NOTICE, SEVERITY_WARN, RuleHit
+from .rules import (
+    RULE_DELEGATION,
+    SEVERITY_CRITICAL,
+    SEVERITY_INFO,
+    SEVERITY_NOTICE,
+    SEVERITY_WARN,
+    RuleHit,
+)
 
 # 严重度 → N.E.K.O priority（0-10，越大越重要）
 SEVERITY_PRIORITY = {
@@ -140,24 +147,42 @@ def _session_of(hit: RuleHit) -> str:
     return hit.session or hit.chain_id
 
 
-def _subject(hit: RuleHit) -> str:
-    """主语位放谁。四种情况，判据全部可证（决策记录 §2）。"""
-    executor = _executor_of(hit)
+def describe_actor(*, executor: str, delegated_to: str | None = None,
+                   requester: str | None = None, requester_evidence: str = "",
+                   rule: str = "") -> str:
+    """主语位放谁。四种情况，判据全部可证（决策记录 §2）。
 
+    单独抽成函数而不是埋在 ``_subject`` 里：审批卡片（M0-lite-5）要用同一套
+    语法，否则用户会在播报里看到"你的 Claude 让 worker 执行"、
+    在卡片里又看到"DeepSeek 请求删除"，两套说法自相矛盾。
+
+    ``rule`` 用来排除"下派观测"：那条规则的正文已经说明"通过 X 下派了一次任务"，
+    主语再写"让 X 执行"就重复了。
+    """
     # 贵脑 + 廉价手：本会话是大脑，它把活下派给了外部 worker。
     # 主语是大脑（用户对话的对象），worker 降级成"手"。
-    if hit.delegated_to:
-        return f"{executor} 让 {hit.delegated_to} 执行"
+    if rule != RULE_DELEGATION and delegated_to:
+        return f"{executor} 让 {delegated_to} 执行"
 
     # 父子代理：动手的是子代理，责任仍在父会话。
-    if hit.requester_evidence == EVIDENCE_SIDECHAIN:
+    if requester_evidence == EVIDENCE_SIDECHAIN:
         return f"{executor}（经子代理）"
 
     # 用户自己声明过这个目录里的会话是他开的——这是用户给的事实，不是猜测。
-    if hit.requester == REQUESTER_USER and hit.requester_evidence == EVIDENCE_USER_DECLARED:
+    if requester == REQUESTER_USER and requester_evidence == EVIDENCE_USER_DECLARED:
         return f"你自己开的 {executor}"
 
     return executor
+
+
+def _subject(hit: RuleHit) -> str:
+    return describe_actor(
+        executor=_executor_of(hit),
+        delegated_to=hit.delegated_to,
+        requester=hit.requester,
+        requester_evidence=hit.requester_evidence,
+        rule=hit.rule,
+    )
 
 
 def _locator(hit: RuleHit) -> str:

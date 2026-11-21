@@ -41,6 +41,9 @@ SEVERITIES = (SEVERITY_INFO, SEVERITY_NOTICE, SEVERITY_WARN, SEVERITY_CRITICAL)
 
 RULE_DELETE = "delete"
 RULE_FAILURE = "failure"
+# 下派观测（M0-lite-4 补 / 归因第 4 步）：只记录"本会话把活交给了外部 worker"，
+# 不读 args、不猜动作、不判危险——那是归因错的高发区。
+RULE_DELEGATION = "delegation"
 
 # 任务书点名的六个模式。大小写不敏感（PowerShell 本身不敏感）。
 DELETE_TOKENS = frozenset({"rm", "rmdir", "del", "remove-item"})
@@ -233,6 +236,34 @@ def evaluate_failure(*, status_code: Any = None, error_message: str = "",
         # 不合并就会刷屏。这与删除类刻意不同。
         coalesce_key=f"{RULE_FAILURE}|{session}|{agent}|{matched}",
         **_attribution_of(source),
+    )
+
+
+def evaluate_delegation(event: UnifiedEvent) -> RuleHit | None:
+    """MCP 下派观测：本会话把活交给了外部 worker。纯函数。
+
+    **只认转录里的工具名**（``mcp__<server>__<tool>``）。不读 args、不猜它要干什么、
+    不判危险——猜动作是归因错的高发区（决策记录 §7 第 4 步的取舍）。
+    hint headers 在自定义 base URL 下默认关闭，所以网关元数据这条路走不通，
+    只有转录工具名可用。
+
+    notice 级：这是"你的 Agent 背后调了谁"的可见性，不是事故。
+    """
+    server = delegated_server(event.tool)
+    if event.event != "tool_use" or not server:
+        return None
+    return RuleHit(
+        rule=RULE_DELEGATION,
+        severity=SEVERITY_NOTICE,
+        summary=f"通过 {server} 下派了一次任务",
+        matched=server,
+        agent=event.agent,
+        session=event.session,
+        ts=event.ts,
+        # 合并键按 会话+server：同一会话反复调同一个 worker 在窗口内只报一次，
+        # 否则一次批量任务能刷出几十条。换 server 才算新事件。
+        coalesce_key=f"{RULE_DELEGATION}|{event.session}|{event.agent}|{server}",
+        **_attribution_of(event),
     )
 
 

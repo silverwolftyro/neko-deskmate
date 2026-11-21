@@ -12,7 +12,9 @@ import pytest
 
 from plugin.plugins.agent_deskmate.broadcast import (
     Broadcaster,
+    for_log,
     priority_for,
+    redact,
     render_text,
 )
 from plugin.plugins.agent_deskmate.events import UnifiedEvent, attribute
@@ -23,6 +25,7 @@ from plugin.plugins.agent_deskmate.rules import (
     Coalescer,
     RuleHit,
     _attribution_of,
+    evaluate_delegation,
     evaluate_delete,
     evaluate_failure,
 )
@@ -376,7 +379,6 @@ def test_severity_and_attribution_stay_orthogonal() -> None:
 # 聊天窗给人看原文，落盘日志必须先打码：AGENTS.md 要求不得记录会话文本/密钥。
 # 这里不删日志（排查要靠它确认播了什么），只脱敏。
 
-from plugin.plugins.agent_deskmate.broadcast import for_log, redact  # noqa: E402
 
 
 @pytest.mark.parametrize("command,secret", [
@@ -446,3 +448,70 @@ def test_broadcast_log_honours_log_commands_false() -> None:
     joined = " ".join(message for _, message in logger.lines)
     assert "y" * 200 not in joined
     assert "命令 " in joined
+
+
+# ── 下派观测的文案（C / 归因第 4 步） ───────────────────────────────────────
+
+
+
+def _delegation_hit(**overrides):
+    source = UnifiedEvent(
+        agent="claude-code", session="800257f3-aaaa-bbbb", event="tool_use",
+        tool="mcp__deepseek-worker__deepseek_task", command=None, ts="t",
+        executor="claude-code", working_directory=CWD,
+    )
+    source = attribute(source, mine_roots=[CWD])
+    return evaluate_delegation(source)
+
+
+def test_delegation_broadcast_text() -> None:
+    """notice 级，主语写大脑，worker 降级成"手"——不出现"DeepSeek 请求"这种主语。
+
+    主语就是可见的 claude-code：MCP 事件的归因证据是 mcp-delegation，
+    即使用户声明过 cwd 所属目录，这条的判据也是"它下派了"，不是"你开的"。
+    """
+    text = render_text(_delegation_hit())
+    assert text == (
+        "【提示】claude-code 通过 deepseek-worker 下派了一次任务"
+        f"（会话 800257f3 @ {CWD}）"
+    )
+
+
+def test_delegation_subject_is_not_doubled() -> None:
+    """正文已说明"通过 X 下派"，主语不能再写"让 X 执行"，否则一句话说两遍。"""
+    text = render_text(_delegation_hit())
+    assert "让 deepseek-worker 执行" not in text
+    assert text.count("deepseek-worker") == 1
+
+
+def test_delegation_unknown_requester_still_names_the_brain() -> None:
+    """notice 级按后果分级可以直接写可见 agent，不套"发起者未知"。"""
+    source = UnifiedEvent(
+        agent="claude-code", session="800257f3-aaaa-bbbb", event="tool_use",
+        tool="mcp__hermit__run_task", command=None, ts="t",
+        executor="claude-code", working_directory=r"C:\Temp",
+    )
+    hit = evaluate_delegation(attribute(source))
+    text = render_text(hit)
+    assert "发起者未知" not in text
+    assert text.startswith("【提示】claude-code 通过 hermit 下派了一次任务")
+
+
+def test_delegation_severity_is_notice_not_critical() -> None:
+    assert priority_for(_delegation_hit().severity) == 4
+
+
+def test_describe_actor_is_reusable_for_cards() -> None:
+    """M0-lite-5 的审批卡片要用同一套主语语法，不能另写一套。"""
+    from plugin.plugins.agent_deskmate.broadcast import describe_actor
+
+    assert describe_actor(executor="claude-code") == "claude-code"
+    assert describe_actor(executor="claude-code", delegated_to="deepseek-worker") == \
+        "claude-code 让 deepseek-worker 执行"
+    assert describe_actor(executor="claude-code", requester_evidence="sidechain") == \
+        "claude-code（经子代理）"
+    assert describe_actor(executor="claude-code", requester="user",
+                          requester_evidence="user-declared") == "你自己开的 claude-code"
+    # 下派观测例外：正文已说明下派，主语不重复
+    assert describe_actor(executor="claude-code", delegated_to="deepseek-worker",
+                          rule="delegation") == "claude-code"

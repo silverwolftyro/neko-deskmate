@@ -387,3 +387,23 @@ def test_delegated_server_extraction() -> None:
 
 def test_check_attribution_accepts_both_empty() -> None:
     check_attribution(None, EVIDENCE_NONE)   # 不抛即通过
+
+
+def test_api_request_blob_tool_use_is_not_parsed_twice() -> None:
+    """``api-request-blob`` 记录里带同样的 tool_use 块，是请求回显，不是第二次动作。
+
+    实测：全部 45 个 blob 里的 mcp tool_use id 都同时出现在 assistant 记录里
+    （77 个 assistant id 的超集）。这里也解析一次的话，每次 MCP 下派都会
+    被记两遍——下派播报会翻倍，合并也救不回来（合并键相同，但配额会错）。
+    """
+    blob = {
+        "type": "api-request-blob",
+        "sessionId": SESSION,
+        "isSidechain": False,
+        "timestamp": "2026-11-21T06:00:00Z",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "mcp__deepseek-worker__deepseek_task",
+             "input": {"task": "x"}},
+        ]},
+    }
+    assert parse_transcript_line(json.dumps(blob, ensure_ascii=False)) == []

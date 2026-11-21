@@ -12,6 +12,10 @@
 其余 ``system`` 子类型（``turn_duration`` / ``away_summary`` / ``stop_hook_summary`` /
 ``compact_boundary``）暂不映射：一个事件类型只用一个信号，避免同一件事报多次。
 
+``api-request-blob`` 也不映射：实测它带的 tool_use 块与 ``assistant`` 记录**完全重复**
+（45 个 blob id 全是 77 个 assistant id 的子集），是请求回而不是第二次动作。
+这里也解析的话每次 MCP 下派都会被记两遍——有单测守着。
+
 本模块只放纯函数，不做任何 I/O，方便单测。
 """
 
