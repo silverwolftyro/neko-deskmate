@@ -93,6 +93,11 @@ def sync_relay(source: Any, target: Any) -> tuple[bool, str]:
 
     每次装配与每次启动都调：副本不在、内容与源码不一致，都重写。
     "不一致"要当故障处理——半份脚本跑起来的症状是每次权限请求都报错。
+
+    **启动时也要调**（2026-11-22 第三轮）：改了中继的协议（这一轮加了
+    上游进程链）之后，用户机器上还躺着一份旧副本。只查"文件在不在"的话
+    它照样能跑，只是**再也不发新字段**——症状是卡片上永远没有「上游」
+    那一行，而没有任何一条报错。所以启动自检必须比内容，不一致就重写。
     """
     src, dst = Path(source), Path(target)
     if not src.is_file():
@@ -112,6 +117,22 @@ def sync_relay(source: Any, target: Any) -> tuple[bool, str]:
     except OSError as exc:
         return False, f"写不进中继副本 {dst}（{type(exc).__name__}）：{exc}"
     return True, ""
+
+
+def relay_matches(source: Any, target: Any) -> bool:
+    """数据目录里那份中继是不是插件里这一份的**逐字节副本**。
+
+    单独抽出来而不在 ``sync_relay`` 里返第三种状态：调用方要区分
+    "本来就一致"和"刚刚重写过"——后者值得记一条日志，让用户知道
+    为什么行为变了。
+    """
+    src, dst = Path(source), Path(target)
+    if not src.is_file() or not dst.is_file():
+        return False
+    try:
+        return dst.read_bytes() == src.read_bytes()
+    except OSError:
+        return False
 
 
 def relay_command(relay_path: Any, port: int) -> str:

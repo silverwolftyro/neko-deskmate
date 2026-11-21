@@ -10,7 +10,7 @@
   "entry.approval_decide.name": "审批决定",
   "entry.approval_decide.description": "审批卡片的按钮落点：把用户点的「允许 / 拒绝」回填给正在等待的 Claude Code。正常不会手动调用它。",
   "entry.approval_explain.name": "这是什么",
-  "entry.approval_explain.description": "解释这条审批请求是什么、L0 规则对它有什么判断。不接模型，只说规则层能讲准的事实。",
+  "entry.approval_explain.description": "在审批卡旁边追加一张说明卡：讲清这次请求是什么、后果与影响范围、会话与工作目录、超时后会怎样。原审批卡不会被替换，三个按钮始终可点。不接模型时只讲规则层能讲准的事实。",
   "entry.approval_authorize.name": "授权确认",
   "entry.approval_authorize.description": "L1/L2 的授权入口：弹出授权文案让用户确认（含「模型判断可能出错，决定由你授权并承担后果」）。用户点「确认授权」后才写入授权记录并写进审计；插件永不会自行调用它。",
   "entry.pending_list.name": "审批待办",
@@ -22,7 +22,5 @@
   "entry.hook_uninstall.name": "卸载审批 hook",
   "entry.hook_uninstall.description": "从 Claude Code 的 ~/.claude/settings.json 里摘掉审批中继。只摘我们装的那条，别人的 hook 不动。",
   "entry.model_test.name": "测试模型连接",
-  "entry.model_test.description": "向 [agent_deskmate.model] 配置的模型发一句最短的招呼，回显模型名与耗时。不发送任何命令或上下文。",
-  "entry.approval_show.name": "回到审批",
-  "entry.approval_show.description": "解释卡上「返回审批」按钮的落点：把卡片还原成审批态。正常不会手动调用它。"
+  "entry.model_test.description": "向 [agent_deskmate.model] 配置的模型发一句最短的招呼，回显模型名与耗时。不发送任何命令或上下文。"
 }

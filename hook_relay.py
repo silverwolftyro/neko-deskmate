@@ -18,6 +18,13 @@ command hook 的失败语义正好是我们要的：命令退出码 0 且不给 
 * 插件死了 / 转发失败 / 插件回 503（= 插件没有决定）→ 打印空对象 ``{}``，
   交还 Claude Code 原生流程。
 
+**上游进程链**（规格 §11）：转发前顺手从本进程的父进程往上爬 2–3 层，
+把 ``[{name, path}]`` 塞进请求体的 ``upstream`` 字段。理由：真实链路常常是
+DSH 的 agent → 起 pwsh → 起 ``claude -p`` → 它调 Bash，而卡片原来只写
+「claude-code 请求执行」，用户看不到"是谁拉起的 claude"。中继自己就在这条链上，
+所以由它爬比插件爬准。**只上报事实，不给结论**——爬不到就什么都不加，
+由插件显示「上游未知」，绝不猜一个发起者。
+
 用法::
 
     python hook_relay.py <port>          # 正常模式，从 stdin 读 hook 载荷
@@ -29,10 +36,154 @@ command hook 的失败语义正好是我们要的：命令退出码 0 且不给 
 
 from __future__ import annotations
 
+import ctypes
 import json
 import sys
 import urllib.error
 import urllib.request
+from typing import Any
+
+# 探活路径。必须与 approval.py 里的 HEALTH_PATH 一致——两边各写一份是因为
+# 中继是独立脚本，不能 import 插件包（hook 触发时的 sys.path 里没有它）。
+# 一致性由 test_hooksetup 里的一条测试盯着。
+HEALTH_PATH = "/health"
+
+# 探活超时。1s：插件在本机，活的话几十毫秒就应；慢了说明它卡住了，
+# 那时交还原生流程比让用户干等好。
+HEALTH_TIMEOUT = 1.0
+# 转发超时。必须 ≥ 插件的到期时间（默认 570s），否则我们还没到期中继先断。
+# 官方 command hook 默认 timeout 就是 600s，这里对齐。
+FORWARD_TIMEOUT = 600.0
+
+# ── 上游进程链（规格 §11：只展示，不参与任何决策）────────────────────────
+# 往上爬几层。3 层是因为再往上通常是终端/资源管理器，对"这是我自己开的吗"
+# 这个问题没有增量；也够覆盖 DSH → pwsh → claude 这条真实链路。
+UPSTREAM_DEPTH = 3
+# 快照里最多读多少个进程。工具枚举是全量的，理论上成千条；
+# 我们只按 ppid 查几次，但给个上限防异常环境。
+MAX_PROCESSES = 4096
+# 进程链写进请求体的键名。**刻意带前缀**：这是中继与插件之间的私有协议，
+# 而请求体本身是 Claude Code 的——将来它要是加了一个叫 ``upstream`` 的字段，
+# 不带前缀的我们就会把它的内容当成自己爬的进程链显示给用户，那是错归因。
+UPSTREAM_FIELD = "deskmate_upstream"
+
+# Toolhelp32 的常量与结构。**零依赖**：只用 ctypes 调 kernel32，
+# 不引 psutil / wmi 之类的东西（hook 在任何机器上都得能跑）。
+_TH32CS_SNAPPROCESS = 0x00000002
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_MAX_PATH = 260
+# (HANDLE)-1。快照失败时返回的就是它；``c_void_p`` 会把 -1 报成这个值。
+_INVALID_HANDLE = (1 << 64) - 1
+
+
+class _ProcessEntry32(ctypes.Structure):
+    """PROCESSENTRY32W。字段顺序与宽度必须和 Win32 一致，错一位就全错。"""
+
+    _fields_ = [
+        ("dwSize", ctypes.c_ulong),
+        ("cntUsage", ctypes.c_ulong),
+        ("th32ProcessID", ctypes.c_ulong),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", ctypes.c_ulong),
+        ("cntThreads", ctypes.c_ulong),
+        ("th32ParentProcessID", ctypes.c_ulong),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.c_ulong),
+        ("szExeFile", ctypes.c_wchar * _MAX_PATH),
+    ]
+
+
+def _kernel32() -> Any:
+    """拿 kernel32，并把两个返回句柄的函数的返回类型说清楚。
+
+    **不设 restype 的话默认按 ``c_int`` 截断成 32 位**，而句柄是 64 位的：
+    截断之后 INVALID_HANDLE_VALUE 有可能变成 0，也可能把一个合法句柄
+    误判成无效。这种事只会偶发，查起来能查一天，所以一开始就写对。
+    """
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    return kernel32
+
+
+def _process_table() -> dict[int, tuple[int, str]]:
+    """``{pid: (ppid, exe 名)}``。任何失败都返回空表——上游是可选信息。"""
+    kernel32 = _kernel32()
+    snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if not snapshot or int(snapshot) == _INVALID_HANDLE:
+        return {}
+    table: dict[int, tuple[int, str]] = {}
+    try:
+        entry = _ProcessEntry32()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry32)
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok and len(table) < MAX_PROCESSES:
+            table[int(entry.th32ProcessID)] = (
+                int(entry.th32ParentProcessID), entry.szExeFile)
+            entry = _ProcessEntry32()
+            entry.dwSize = ctypes.sizeof(_ProcessEntry32)
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return table
+
+
+def _image_path(pid: int) -> str:
+    """进程可执行文件的完整路径。拿不到就返回空串。"""
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        buffer = ctypes.create_unicode_buffer(_MAX_PATH + 1)
+        size = ctypes.c_ulong(_MAX_PATH + 1)
+        # 2 == QueryFullProcessImageNameW（问路径，不问设备路径）
+        if not kernel32.QueryFullProcessImageNameW(handle, 2, buffer,
+                                                  ctypes.byref(size)):
+            # 某些受保护的进程只给得出查询 0 的短形式，退一步再试。
+            size = ctypes.c_ulong(_MAX_PATH + 1)
+            kernel32.QueryFullProcessImageNameW(handle, 0, buffer,
+                                                ctypes.byref(size))
+        return buffer.value or ""
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _upstream() -> list[dict[str, str]]:
+    """从父进程往上爬，返回 ``[{name, path}]``（从近到远）。
+
+    任何一步失败都**就地停**，把已经拿到的返回——半条链比没有好，
+    而编一段完整的比半条危险得多。非 Windows 直接返回空表。
+    """
+    if not hasattr(ctypes, "windll"):
+        return []
+    try:
+        table = _process_table()
+    except Exception:  # noqa: BLE001  归因是可选信息，任何异常都不该冒出去
+        return []
+    if not table:
+        return []
+
+    kernel32 = _kernel32()
+    pid = int(kernel32.GetCurrentProcessId())
+    seen = {pid}
+    chain: list[dict[str, str]] = []
+    for _ in range(UPSTREAM_DEPTH):
+        row = table.get(pid)
+        if row is None:
+            break
+        ppid = row[0]
+        if ppid in seen or ppid <= 0:
+            break
+        seen.add(ppid)
+        # **名字要查 ppid 那一行**：``table[pid]`` 里存的是 pid 自己的名字，
+        # 拿它当父进程的名字会把"python.exe 的父亲是 python.exe"报上去
+        # （第一版就这么错的，真机一看就露馅）。
+        parent = table.get(ppid)
+        chain.append({"name": (parent[1] if parent else "") or "",
+                      "path": _image_path(ppid)})
+        pid = ppid
+    return chain
 
 # 探活路径。必须与 approval.py 里的 HEALTH_PATH 一致——两边各写一份是因为
 # 中继是独立脚本，不能 import 插件包（hook 触发时的 sys.path 里没有它）。
@@ -71,6 +222,28 @@ def _alive(port: str) -> bool:
         return False
 
 
+def _with_upstream(body: bytes) -> bytes:
+    """把上游进程链塞进请求体。**塞不进去就原样转发**——归因是可选信息。
+
+    体不是 JSON、或者带上 ``upstream`` 之后序列化失败，都按原样发：
+    为了一个展示字段把整个审批请求搞坏，是本末倒置。
+    """
+    chain = _upstream()
+    if not chain:
+        return body
+    try:
+        payload = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return body
+    if not isinstance(payload, dict):
+        return body
+    payload[UPSTREAM_FIELD] = chain
+    try:
+        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError):
+        return body
+
+
 def _forward(port: str, body: bytes) -> None:
     """转发给插件，并把它的应答原样交给 Claude Code。
 
@@ -79,7 +252,7 @@ def _forward(port: str, body: bytes) -> None:
     """
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/hook/permission",
-        data=body,
+        data=_with_upstream(body),
         headers={"Content-Type": "application/json"},
         method="POST",
     )

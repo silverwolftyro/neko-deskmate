@@ -1161,30 +1161,35 @@ def _visible(html: str) -> str:
 def _card(**overrides) -> str:
     base = dict(subject="claude-code", tool_summary="Bash: rm -f x.txt",
                 session_id="800257f3", working_directory=r"D:\workspace",
-                timeout_seconds=570, command="rm -f D:/other/x.txt",
+                command="rm -f D:/other/x.txt",
                 conclusion=CONCLUSION_DENY, advice_state=ADVICE_STATE_READY)
     base.update(overrides)
     return build_card_html(**base)
 
 
 def test_card_html_has_all_four_blocks() -> None:
+    """主卡只有决策需要的东西（规格 Q2）：结论 / 动作 / 后果 / 范围 + 三按钮。
+
+    会话 id 压成一行小字，工作目录与超时说明**不在主卡上**——
+    它们搬到「这是什么」了（规格 Q2）。这条测试两头都盯：
+    该在的必须在，不该在的不许在。
+    """
     html = _card()
     # 1) 标题
     assert "同桌猫 · 审批请求" in html
-    # 2) 定位
-    assert "会话 800257f3 @ D:\workspace" in html
-    # 3) 主卡正文固定四行（规格 P3）
+    # 2) 主卡正文固定四行（规格 P3）
     assert "⚠️ 它要删除文件 D:/other/x.txt" in html
     assert "后果：不进回收站，删了就找不回来" in html
     assert "范围：这个文件在它的工作目录之外" in html
-    # 4) 结论行
+    # 3) 结论行
     assert "<strong>建议拒绝</strong>" in html
-    # 5) 来源与超时说明
-    assert "claude-code 请求执行" in html
-    assert "宿主会自行处理" in html
-    assert "视为未决定" in html
-    assert "插件不代你判断" in html
-    assert "自动拒绝" not in html
+    # 4) 执行者 + 上游，压成一行小字
+    assert "执行：claude-code 会话 800257f3" in html
+    assert "上游：" in html
+    # 5) **不在主卡上的东西**（规格 Q2）
+    assert "@ D:\\workspace" not in html, "工作目录还压在卡片上"
+    assert "宿主会自行处理" not in html, "超时说明还压在卡片上"
+    assert "不掐掉整个回合" not in html, "免责说明还压在卡片上"
     # 6) 三个按钮
     for action in (ACTION_APPROVE, ACTION_DENY, ACTION_EXPLAIN):
         assert f'data-neko-action="{action}"' in html
@@ -1325,7 +1330,7 @@ def test_card_escapes_agent_supplied_text() -> None:
     """工具参数是 Agent 产的：拼进 HTML 前必须转义，否则是注入面。"""
     html = build_card_html(subject="claude-code",
                            tool_summary='</p><script>alert(1)</script>',
-                           session_id="s", working_directory=None, timeout_seconds=570)
+                           session_id="s", working_directory=None)
     assert "<script>" not in html
     assert "&lt;script&gt;" in html
 
@@ -1344,10 +1349,58 @@ def test_explain_delete_mentions_it_never_auto_decides() -> None:
     explanation = explain_request(tool_name="Bash", tool_summary="Bash: rm -rf x",
                                   working_directory=r"D:\workspace", rule="delete",
                                   severity="critical")
-    assert "删除类" in explanation["verdict"]
-    assert "永不进入 L2" in explanation["extra"]
+    assert "删除文件" in explanation["verdict"]
+    assert "高风险" in explanation["verdict"]
+    assert "永远不会自动放行" in explanation["extra"]
     assert "亲自点允许或拒绝" in explanation["extra"]
-    assert "只转发、不代判" in explanation["note"] or "规则层" in explanation["note"]
+    # 到期不等于拒绝（规格 §2 硬规则 1）：这句话必须在解释卡里说清楚
+    assert "未决定" in explanation["timeout"]
+    assert "不代你判断" in explanation["timeout"]
+
+
+def test_explain_does_not_repeat_the_tool_name() -> None:
+    """``tool_summary`` 已经带「Bash: 」前缀，再拼一遍就是复读。"""
+    explanation = explain_request(tool_name="Bash",
+                                  tool_summary="Bash: rm -rf build/",
+                                  working_directory=None, rule="delete",
+                                  severity="critical")
+    assert explanation["what"] == "Claude Code 请求执行 Bash: rm -rf build/"
+    assert "Bash：Bash" not in explanation["what"]
+
+
+def test_explain_falls_back_to_the_tool_name_alone() -> None:
+    """拿不到摘要时就写工具名，不写一个空的「：」。"""
+    explanation = explain_request(tool_name="Bash", tool_summary="",
+                                  working_directory=None, rule="",
+                                  severity="notice")
+    assert explanation["what"] == "Claude Code 请求执行 Bash"
+
+
+def test_explain_carries_no_internal_words() -> None:
+    """2026-11-22 真机反馈：解释卡上漏过 L0 / critical / L2 / onFailure。
+
+    这些是给我们排查用的，用户看到不知道那是什么（C5 同类缺陷）。
+    **正文、模型理由、依据全部扫**——任何一块泄了都算泄。
+    """
+    explanation = explain_request(tool_name="Bash", tool_summary="Bash: rm -rf x",
+                                  working_directory=r"D:\workspace", rule="delete",
+                                  severity="critical", session_id="800257f3",
+                                  model_reason="只读命令，无副作用",
+                                  basis="工具 Bash；工作目录 D:\\workspace")
+    text = " ".join(explanation.values())
+    for word in ("L0", "L1", "L2", "critical", "onFailure", "notice", "warn",
+                 "delete", "api_key", "ai_judgement", "auto_decide"):
+        assert word not in text, f"解释卡泄了内部词 {word!r}"
+
+
+def test_explain_carries_the_session_and_working_directory() -> None:
+    """规格 Q2：主卡不放了，但信息不丢——都在「这是什么」里。"""
+    explanation = explain_request(tool_name="Bash", tool_summary="Bash: ls",
+                                  working_directory=r"D:\workspace",
+                                  rule="", severity="notice",
+                                  session_id="800257f3-1234")
+    assert "800257f3" in explanation["location"]
+    assert "D:\\workspace" in explanation["location"]
 
 
 def test_explain_low_risk_still_does_not_decide() -> None:

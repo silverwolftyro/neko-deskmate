@@ -103,6 +103,18 @@ auto_decide_max_severity = "notice"
 # standard（加上范围与规则判据，默认）| detailed（再叠加模型给的理由与依据）。
 explain_verbosity = "standard"
 
+# 高风险警示的强调程度：first_n（默认）| always | never。
+# 高危卡片上原来每条都顶一整行红字。真机反馈：前几次有用，之后价值像反比
+# 函数一样暴跌——看多了就等于没有，真到该被叫住的那一刻也被一起跳过。
+#   first_n  同一类操作的前 warning_first_n 次显示整行红字，之后缩成徽标「⚠ 高风险」
+#   always   每次都显示整行红字
+#   never    永远只显示徽标
+# **这只改变警示长什么样，不改变行为**：高危操作照样永不自动放行、照样必须人点。
+warning_emphasis = "first_n"
+
+# first_n 档下，整行红字显示几次（同一类操作计）。
+warning_first_n = 3
+
 # 模型用的 key。只用来判断"有没有 key"，**不写日志、不进卡片、不给模型看**。
 # 5b 起真正被使用；见下面 [agent_deskmate.model]。
 api_key = ""

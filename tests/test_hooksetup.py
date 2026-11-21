@@ -18,10 +18,15 @@ import socket
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
 
+from plugin.plugins.agent_deskmate import (
+    AgentDeskmatePlugin,
+    hooksetup,
+)
 from plugin.plugins.agent_deskmate.hook_relay import HEALTH_PATH as RELAY_HEALTH_PATH
 from plugin.plugins.agent_deskmate.hooksetup import (
     EVENT_NAME,
@@ -35,6 +40,7 @@ from plugin.plugins.agent_deskmate.hooksetup import (
     parse_relay_command,
     read_settings,
     relay_command,
+    relay_matches,
     selfcheck,
     settings_path,
     source_relay_path,
@@ -683,6 +689,45 @@ def test_sync_relay_reports_a_missing_source(tmp_path: Path) -> None:
     assert "没有中继脚本" in why
 
 
+@pytest.mark.parametrize("target_content,expected", [
+    ("print('x')\n", False),          # 内容不同
+    ("", False),                      # 空文件
+])
+def test_relay_matches_compares_content(tmp_path: Path, target_content: str,
+                                        expected: bool) -> None:
+    """逐字节比对——旧副本照样能跑，只是不发新字段（静默失效）。"""
+    source = tmp_path / "src.py"
+    source.write_text("print('new')\n", encoding="utf-8")
+    target = tmp_path / "data" / "src.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(target_content, encoding="utf-8")
+    assert relay_matches(source, target) is expected
+
+
+def test_relay_matches_is_true_for_an_identical_copy(tmp_path: Path) -> None:
+    source = tmp_path / "src.py"
+    source.write_text("print('x')\n", encoding="utf-8")
+    target = tmp_path / "data" / "src.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(source.read_bytes())
+    assert relay_matches(source, target) is True
+
+
+@pytest.mark.parametrize("missing", ["source", "target", "both"])
+def test_relay_matches_is_false_when_a_file_is_missing(tmp_path: Path,
+                                                       missing: str) -> None:
+    """任何一边不在都算不一致——启动自检要能把它和"内容过期"区分开。"""
+    source = tmp_path / "src.py"
+    target = tmp_path / "data" / "src.py"
+    if missing == "target":
+        source.write_text("x\n", encoding="utf-8")
+    elif missing == "source":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x\n", encoding="utf-8")
+    # "both"：两边都不写
+    assert relay_matches(source, target) is False
+
+
 def test_installed_relay_lives_in_the_plugin_data_dir() -> None:
     """数据目录归插件自己管，宿主不碰——这是选它的全部理由。"""
     path = installed_relay_path("D:/some/data")
@@ -754,3 +799,137 @@ def test_marker_is_not_a_port() -> None:
     """标记里没有数字，不会被误当成端口。"""
     parsed = parse_relay_command(relay_command("D:/d/hook_relay.py", 48921))
     assert parsed["port"] == 48921
+
+
+# ── 启动自检：旧副本要重写（规格 P0 + 本轮改了中继协议）──────────────────
+#
+# 2026-11-22 第三轮：中继加了上游进程链，请求体多了一个字段。
+# 用户机器上还躺着一份旧副本——它照样能跑，只是**再也不发新字段**，
+# 症状是卡片上永远没有「上游」那一行，且没有任何一条报错。
+# 所以启动自检必须比内容，不一致就重写。
+
+class _StubLogger:
+    def __init__(self) -> None:
+        self.lines: list[tuple[str, tuple]] = []
+
+    def _log(self, level: str, args: tuple) -> None:
+        self.lines.append((level, args))
+
+    def info(self, *args: tuple) -> None:
+        self._log("info", args)
+
+    def warning(self, *args: tuple) -> None:
+        self._log("warning", args)
+
+    def error(self, *args: tuple) -> None:
+        self._log("error", args)
+
+    def messages(self, level: str) -> list[str]:
+        return [" ".join(str(a) for a in args) for lv, args in self.lines
+                if lv == level]
+
+
+class _PluginStub:
+    """只借 ``_check_installed_hook_port`` 这一个方法，不实例化真插件。
+
+    刻意不 ``object.__new__(AgentDeskmatePlugin)``：``plugin_dir`` /
+    ``data_path`` 在基类上是只读 property，实例上塞不进去，而这里要测的
+    只是启动自检那几行分支。
+    """
+
+    _check_installed_hook_port = AgentDeskmatePlugin._check_installed_hook_port
+
+    def __init__(self, data_dir: Path, plugin_dir: Path, port: int,
+                 logger: _StubLogger) -> None:
+        self.logger = logger
+        self.plugin_dir = plugin_dir
+        self.data_path = lambda name="": data_dir / name
+        self._approval = types.SimpleNamespace(port=port)
+
+
+def _plugin_stub(data_dir: Path, plugin_dir: Path, port: int,
+                 logger: _StubLogger) -> _PluginStub:
+    return _PluginStub(data_dir, plugin_dir, port, logger)
+
+
+def _patch_hooksetup(monkeypatch, **replacements) -> None:
+    """同一个函数名在两个模块里各有一份引用，两处都要打补丁。
+
+    ``__init__.py`` 是 ``from .hooksetup import settings_path``，所以
+    ``monkeypatch.setattr(hooksetup, "settings_path", ...)`` 改了定义处，
+    调用处那份还指着原来的函数——改了没反应的坑，踩过一次就别再踩。
+    """
+    import plugin.plugins.agent_deskmate as package
+
+    for name, value in replacements.items():
+        monkeypatch.setattr(hooksetup, name, value)
+        monkeypatch.setattr(package, name, value)
+
+
+def test_startup_rewrites_a_stale_relay_copy(settings: Path, backups: Path,
+                                             tmp_path: Path,
+                                             monkeypatch) -> None:
+    """启动时发现副本过期 → 自动重写 + 记一条 warning（不是错误）。"""
+    data_dir = tmp_path / "agent_deskmate-data"
+    install_hook(PLUGIN_DIR, 48921, settings=settings, backup_dir=backups,
+                 data_dir=data_dir)
+    copy = installed_relay_path(data_dir)
+    copy.write_text("# 上一版的旧副本\n", encoding="utf-8")
+
+    logger = _StubLogger()
+    _patch_hooksetup(monkeypatch, settings_path=lambda: settings)
+    _plugin_stub(data_dir, PLUGIN_DIR, 48921, logger
+                 )._check_installed_hook_port(48921)  # noqa: SLF001
+
+    assert copy.read_bytes() == source_relay_path(PLUGIN_DIR).read_bytes()
+    warnings = logger.messages("warning")
+    assert warnings, "重写了却没记账"
+    assert "不一致" in warnings[0]
+    assert not logger.messages("error")
+
+
+def test_startup_stays_quiet_when_the_copy_is_current(settings: Path,
+                                                      backups: Path,
+                                                      tmp_path: Path,
+                                                      monkeypatch) -> None:
+    """副本是最新的就别吭声——warning 会变成噪音，真告警就被淹了。"""
+    data_dir = tmp_path / "agent_deskmate-data"
+    install_hook(PLUGIN_DIR, 48921, settings=settings, backup_dir=backups,
+                 data_dir=data_dir)
+
+    logger = _StubLogger()
+    _patch_hooksetup(monkeypatch, settings_path=lambda: settings)
+    _plugin_stub(data_dir, PLUGIN_DIR, 48921, logger
+                 )._check_installed_hook_port(48921)  # noqa: SLF001
+
+    assert not logger.messages("warning")
+    assert not logger.messages("error")
+
+
+def test_startup_reports_a_copy_it_cannot_rewrite(settings: Path,
+                                                  backups: Path,
+                                                  tmp_path: Path,
+                                                  monkeypatch) -> None:
+    """重写失败（磁盘满 / 权限）要报错，并说清去调 hook_install。
+
+    这里直接把 sync_relay 换成必然失败的版本：真去造一个写不进去的
+    目录在 Windows 上要么做不到、要么留下副作用。
+    """
+    data_dir = tmp_path / "agent_deskmate-data"
+    install_hook(PLUGIN_DIR, 48921, settings=settings, backup_dir=backups,
+                 data_dir=data_dir)
+    installed_relay_path(data_dir).write_text("旧副本\n", encoding="utf-8")
+
+    logger = _StubLogger()
+    _patch_hooksetup(
+        monkeypatch,
+        settings_path=lambda: settings,
+        sync_relay=lambda _src, _dst: (False, "写不进中继副本（模拟）"),
+    )
+    _plugin_stub(data_dir, PLUGIN_DIR, 48921, logger
+                 )._check_installed_hook_port(48921)  # noqa: SLF001
+
+    errors = logger.messages("error")
+    assert errors, "重写失败却没报错"
+    assert "hook_install" in errors[0]
+    assert not logger.messages("warning")

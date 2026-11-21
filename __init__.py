@@ -63,19 +63,22 @@ from .approval import (
     CARD_CSS,
     DECIDED_BY_AI,
     DECIDED_BY_USER,
+    DEFAULT_WARNING_FIRST_N,
     VERBOSITIES,
     VERBOSITY_STANDARD,
     ApprovalGateway,
+    WarningPolicy,
     advice_text,
     build_authorize_actions,
     build_authorize_html,
     build_card_actions,
     build_card_html,
-    build_explain_actions,
     build_explain_html,
     build_result_html,
     explain_request,
     is_known_advice_state,
+    normalize_warning_mode,
+    warning_key,
 )
 from .broadcast import Broadcaster, describe_actor, render_text
 from .commands import (
@@ -86,7 +89,10 @@ from .events import UnifiedEvent, attribute, delegated_server
 from .hooksetup import (
     install_hook,
     installed_hook,
+    relay_matches,
     settings_path,
+    source_relay_path,
+    sync_relay,
     uninstall_hook,
 )
 from .model_advice import (
@@ -109,6 +115,7 @@ from .rules import (
     evaluate_failure,
     evaluate_transcript_error,
 )
+from .warncount import COUNTS_FILENAME
 
 # 聊天里显示的来源标签。红线 1：source 必须显式传，不能用默认空串。
 SOURCE = "agent_deskmate"
@@ -596,6 +603,11 @@ class AgentDeskmatePlugin(NekoPluginBase):
             has_api_key=bool(self._advisor.api_key),
             audit_path=self.data_path("audit.jsonl"),
             authorization_path=self.data_path("authorization.json"),
+            warning_counts_path=self.data_path(COUNTS_FILENAME),
+            # **建议层的可用性单独传**（规格 Q4）：它跟 L2 的判断后端是两件事。
+            # 曾经这里传的是"judge 在不在"，而 judge 恒为 None，于是模型建议
+            # 明明在工作，启动行一直显示「生效=建议否」。
+            advice_backend_ready=bool(self._advisor.enabled),
         )
         if not self._approval.start():
             self._approval = None
@@ -661,6 +673,24 @@ class AgentDeskmatePlugin(NekoPluginBase):
             )
             return
 
+        # 中继副本与插件里的版本逐字节比对，不一致就重写（规格 P0/Q1）。
+        # 只查"文件在不在"不够：旧副本照样能跑，只是**不再发新协议字段**，
+        # 症状是某个功能静默消失且没有任何报错——比坏掉更难查。
+        source = source_relay_path(self.plugin_dir)
+        if not relay_matches(source, script):
+            ok, why = sync_relay(source, script)
+            if not ok:
+                self.logger.error(
+                    "审批中继副本与插件里的版本不一致，且重写失败：{}。"
+                    "请调一次 hook_install 入口重写这条 hook", why,
+                )
+                return
+            self.logger.warning(
+                "审批中继副本（{}）与插件里的版本不一致，已自动重写。"
+                "这条 hook 指向的就是它，所以下一次权限请求起就用上新版；"
+                "若重写一直不成功，请调一次 hook_install 入口", script,
+            )
+
         hooked = installed.get("port")
         if hooked is None:
             self.logger.error(
@@ -683,14 +713,23 @@ class AgentDeskmatePlugin(NekoPluginBase):
         **只打日志，不播报**——这是配置建议，不是观测结果，按红线 1
         不能走 push_message 打扰用户。也不猜归因：提示只告诉用户
         "想显示『你自己开的』需要声明什么"，不替他声明。
+
+        顺带把审批语义写在这里（规格 Q2：那段话从主卡上搬走了，搬到
+        「这是什么」与首启提示两处）。**到期不等于拒绝**这句话必须有个
+        地方说清楚，否则用户会以为"不点就是不同意"。
         """
-        if _mine_roots(config):
-            return
+        if not _mine_roots(config):
+            self.logger.info(
+                "提示：未配置 [agent_deskmate.mine] roots，删除类播报的主语将显示为"
+                "「发起者未知」。想让它显示「你自己开的 claude-code」，在配置里声明"
+                "你常开会话的目录（例如 roots = [\"D:\\\\workspace\"]）。"
+                "这是你自己给的事实，插件不猜；详见 config.example.toml。"
+            )
         self.logger.info(
-            "提示：未配置 [agent_deskmate.mine] roots，删除类播报的主语将显示为"
-            "「发起者未知」。想让它显示「你自己开的 claude-code」，在配置里声明"
-            "你常开会话的目录（例如 roots = [\"D:\\\\workspace\"]）。"
-            "这是你自己给的事实，插件不猜；详见 config.example.toml。"
+            "审批语义：允许后 Claude Code 继续这次调用；拒绝则中止这次调用"
+            "（不会掐掉整个回合）。到期无人决定 = 视为未决定，由 Claude Code "
+            "自己接手，插件不代你判断，也不把「一直没点」记成拒绝。"
+            "卡片上点「这是什么」可以看到这段说明、会话与工作目录。"
         )
 
     @lifecycle(id="shutdown")
@@ -902,6 +941,22 @@ class AgentDeskmatePlugin(NekoPluginBase):
         except Exception as exc:  # noqa: BLE001  HUD 推不出去不影响审批
             self.logger.warning("HUD 推送失败（{}）：{}", type(exc).__name__, exc)
 
+    def _warning_policy(self, pending: Any) -> WarningPolicy:
+        """这一次的警示该长成什么样（规格 Q3）。
+
+        配置读不到就按出厂默认（前几次红字 / n=3）——**卡片是核心功能，
+        一个配置项读不出来不该让它消失**。``seen`` 由计数文件给，
+        同一类别第几次命中（含这次）。
+        """
+        section = _approval_section(getattr(self, "_last_config", None) or {})
+        return WarningPolicy(
+            mode=normalize_warning_mode(section.get("warning_emphasis")),
+            first_n=int(_to_number(section.get("warning_first_n"),
+                                   DEFAULT_WARNING_FIRST_N)),
+            seen=self._approval.note_warning(
+                warning_key(pending.action_class, pending.severity)),
+        )
+
     async def _create_approval_card(self, pending: Any) -> None:
         request = pending.request
         # 主语用归因语法生成，和播报说同一套话——不能卡片一套、播报一套。
@@ -910,16 +965,19 @@ class AgentDeskmatePlugin(NekoPluginBase):
             requester_evidence="", requester=None,
         )
         body = request.tool_summary or request.tool_name or "未知工具"
-        timeout = self._approval.timeout_seconds
         advice = await self._advice_for_card(pending)
         # 整份建议留在记录上：解释卡要显示模型的理由与依据（规格 P3）。
         pending.advice = advice
+        # 红字递减（规格 Q3）：先记一次命中，再按"第几次"决定警示长成
+        # 红字还是徽标。**只影响外观**——门控那边一个字节都没改。
+        warning = self._warning_policy(pending)
         html = build_card_html(
             subject=subject, tool_summary=body, session_id=request.session_id,
-            working_directory=request.working_directory, timeout_seconds=timeout,
+            working_directory=request.working_directory,
             advice_state=advice["state"],
             risk=pending.severity, action_class=pending.action_class,
             command=_command_of(request), conclusion=advice["conclusion"],
+            upstream=request.upstream, warning=warning,
             logger=self.logger,
         )
         try:
@@ -1072,15 +1130,26 @@ class AgentDeskmatePlugin(NekoPluginBase):
         name=tr("entry.approval_explain.name", default="这是什么"),
         description=tr(
             "entry.approval_explain.description",
-            default="解释这条审批请求是什么、L0 规则对它有什么判断。"
-                    "不接模型，只说规则层能讲准的事实。",
+            default="在审批卡旁边追加一张说明卡：讲清这次请求是什么、后果与影响"
+                    "范围、会话与工作目录、超时后会怎样。原审批卡不会被替换，"
+                    "三个按钮始终可点。不接模型时只讲规则层能讲准的事实。",
         ),
     )
     async def approval_explain(self, request_id: str, _ctx: dict):
-        """「这是什么」按钮的落点：解释，只说事实，不猜意图。
+        """「这是什么」按钮的落点：**追加**一条说明卡，原审批卡原地不动。
 
-        解释卡**自带允许 / 拒绝 / 返回审批三个按钮**（2026-11-22 真机反馈）：
-        原来它把审批卡的按钮整个替换掉，用户看完解释只能干等到期。
+        2026-11-22 真机反馈（两轮）：
+
+        * 第一轮：解释卡*替换*审批卡，按钮全被抢走，用户看完只能干等到期。
+          修法是给解释卡补上按钮 + 「返回审批」。
+        * 第二轮：补上去的「返回审批」在宿主侧直接报
+          ``UI action 'approval_show' is not exposed by surface 'chat_card:…'``，
+          用户卡在中间出不去；而且解释卡正文里还漏着 ``L0`` / ``critical`` /
+          ``L2`` / ``onFailure`` 这些内部词（C5 同类缺陷）。
+
+        所以这次不替换、不切换：**另发一条消息**。原审批卡的三个按钮
+        始终可点，也就不需要「返回审批」和 ``approval_show`` 入口了——
+        「切换」这个动作整个消失，比把它修靠谱。
         """
         if self._approval is None:
             return Err(SdkError("审批服务未运行"))
@@ -1097,70 +1166,75 @@ class AgentDeskmatePlugin(NekoPluginBase):
             command=_command_of(pending.request),
             model_reason=advice.get("reason", ""),
             basis=advice.get("basis", ""),
-            # 没接入模型/没签字时那句陈述。主卡不放它（正文固定四行），
+            # 没接入模型/没签字时那句陈述。主卡不放它（正文四行），
             # 但用户点「这是什么」时该看到。
             model_note=(advice_text(advice.get("state", ADVICE_STATE_FALLBACK))
                         if advice.get("state") != ADVICE_STATE_READY else ""),
+            session_id=pending.request.session_id,
+            timeout_seconds=self._approval.timeout_seconds,
             verbosity=_verbosity_of(getattr(self, "_last_config", {}) or {}),
         )
-        try:
-            card = self.ctx.get_card(_ctx["card_id"], target_lanlan=_ctx.get("lanlan_name"))
-            await card.update(html=build_explain_html(explanation, request_id),
-                              summary=explanation["title"],
-                              actions=build_explain_actions(request_id))
-        except (CardSubmissionError, KeyError) as exc:
-            self.logger.warning("解释卡片更新失败（{}）：请求 {}", exc, request_id)
+        await self._show_explain_card(pending, explanation)
         return Ok(explanation)
 
-    @plugin_entry(
-        id="approval_show",
-        name=tr("entry.approval_show.name", default="回到审批"),
-        description=tr(
-            "entry.approval_show.description",
-            default="解释卡上「返回审批」按钮的落点：把卡片还原成审批态。"
-                    "正常不会手动调用它。",
-        ),
-    )
-    async def approval_show(self, request_id: str, _ctx: dict):
-        """「返回审批」：把解释卡还原成审批态。
+    async def _show_explain_card(self, pending: Any,
+                                 explanation: dict[str, str]) -> None:
+        """把说明卡发出去。**发不出去只记日志，界面给人话，不给人啃的错误。**
 
-        没有这个入口，用户在解释态里没有任何路可以回到做决定——
-        只能干等到期，而那正是规格要避免的。
+        同一个请求重复点「这是什么」时更新同一张卡，而不是越点越多。
+        更新失败（卡被宿主收起了）就新开一张——用户点这个按钮必须看得到东西。
+
+        **刻意不传 ``target_lanlan``**：审批卡是网关线程建的，那边也没有
+        lanlan 可传，两边都用宿主的 current_lanlan 才不会指向不同的人。
         """
-        if self._approval is None:
-            return Err(SdkError("审批服务未运行"))
-        pending = self._approval.find(request_id)
-        if pending is None:
-            return Err(SdkError("找不到这个审批请求（可能已过期并被清理）"))
-        if pending.settled():
-            return Ok({"message": "这个请求已经决定过了"})
-        request = pending.request
-        advice = getattr(pending, "advice", None) or {}
-        subject = describe_actor(
-            executor=request.agent or "claude-code",
-            requester_evidence="", requester=None,
-        )
-        html = build_card_html(
-            subject=subject,
-            tool_summary=request.tool_summary or request.tool_name or "未知工具",
-            session_id=request.session_id,
-            working_directory=request.working_directory,
-            timeout_seconds=self._approval.timeout_seconds,
-            advice_state=advice.get("state", ADVICE_STATE_FALLBACK),
-            risk=pending.severity, action_class=pending.action_class,
-            command=_command_of(request),
-            conclusion=advice.get("conclusion", ""),
-            logger=self.logger,
-        )
+        html = build_explain_html(explanation)
+        card_id = getattr(pending, "explain_card_id", None)
         try:
-            card = self.ctx.get_card(_ctx["card_id"], target_lanlan=_ctx.get("lanlan_name"))
-            await card.update(html=html,
-                              summary=f"审批：{subject} 请求执行 "
-                                      f"{request.tool_summary}"[:80],
-                              actions=build_card_actions(request_id))
-        except (CardSubmissionError, KeyError) as exc:
-            self.logger.warning("审批卡片还原失败（{}）：请求 {}", exc, request_id)
-        return Ok({"message": "已回到审批态"})
+            if card_id:
+                card = self.ctx.get_card(card_id)
+                await card.update(html=html, summary=explanation["title"])
+            else:
+                card = await self.ctx.create_card(
+                    html=html, css=CARD_CSS, summary=explanation["title"],
+                )
+                pending.explain_card_id = card.id
+            return
+        except Exception as exc:  # noqa: BLE001  见 docstring：绝不外泄内部报错
+            # 日志里**连异常消息一起写**：``UI action ... is not exposed``
+            # 这类信息只写类型名（RuntimeError）等于没写，排查时还是要去猜。
+            self.logger.warning(
+                "说明卡片{}失败（{}）：{}，尝试新开一张",
+                "更新" if card_id else "创建", type(exc).__name__, exc,
+            )
+        if not card_id:
+            # 第一次就失败：没有旧卡可更新，只能告诉用户"这个按钮暂时不可用"。
+            await self._note_button_unavailable()
+            return
+        try:
+            card = await self.ctx.create_card(
+                html=html, css=CARD_CSS, summary=explanation["title"],
+            )
+            pending.explain_card_id = card.id
+        except Exception as exc:  # noqa: BLE001  宿主层面的事，我们只能记
+            self.logger.warning("说明卡片创建失败（{}）：{}",
+                                type(exc).__name__, exc)
+            await self._note_button_unavailable()
+
+    async def _note_button_unavailable(self) -> None:
+        """按钮点不动时，界面上只出现一句人话。
+
+        宿主/内部异常（``UI action ... is not exposed by surface ...`` 这类）
+        **不许直接显示给用户**：那是给我们排查用的，甩到界面上只会让人慌，
+        而且什么都做不了。所以这里另发一张只有一句话的卡，真实原因进日志。
+        """
+        try:
+            await self.ctx.create_card(
+                html=build_result_html("这个按钮暂时不可用，请稍后再试。"),
+                css=CARD_CSS, summary="同桌猫",
+            )
+        except Exception as exc:  # noqa: BLE001  连这句话都发不出去就只能记日志
+            self.logger.warning("连「按钮不可用」提示都发不出去（{}）：{}",
+                                type(exc).__name__, exc)
 
     # ── hook 装配（5a 实测：没人装 hook，卡片永远不来） ────────────────────
 

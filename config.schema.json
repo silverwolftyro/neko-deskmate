@@ -326,6 +326,41 @@
                 "standard",
                 "detailed"
               ]
+            },
+            "warning_emphasis": {
+              "type": "string",
+              "title": "High-risk warning emphasis",
+              "description": "How loudly the high-risk warning is shown. First few times: the full red line for the first few requests of each kind, then a small badge. Always: the red line every time. Never: only the badge. This only changes how the warning looks, never whether a request can be allowed automatically.",
+              "x-title-i18n": {
+                "en": "High-risk warning emphasis",
+                "zh-CN": "高风险警示的强调程度"
+              },
+              "x-description-i18n": {
+                "en": "How loudly the high-risk warning is shown. First few times: the full red line for the first few requests of each kind, then a small badge. Always: the red line every time. Never: only the badge. This only changes how the warning looks, never whether a request can be allowed automatically.",
+                "zh-CN": "高风险警示显示得多醒目。前几次：同一类操作的前几次显示整行红字，之后缩成一个徽标。每次：每次都显示整行红字。从不：只显示徽标。这只改变警示长什么样，不改变任何操作能不能被自动放行——高危操作始终必须你亲自点。"
+              },
+              "default": "first_n",
+              "enum": [
+                "first_n",
+                "always",
+                "never"
+              ]
+            },
+            "warning_first_n": {
+              "type": "integer",
+              "title": "How many times to show the full red line",
+              "description": "Only used when the emphasis above is set to the first few times. The full red line appears for the first N requests of each kind; after that it becomes a small badge.",
+              "x-title-i18n": {
+                "en": "How many times to show the full red line",
+                "zh-CN": "整行红字显示几次"
+              },
+              "x-description-i18n": {
+                "en": "Only used when the emphasis above is set to the first few times. The full red line appears for the first N requests of each kind; after that it becomes a small badge.",
+                "zh-CN": "只在上面的强调程度选「前几次」时有效。同一类操作的前 N 次显示整行红字，第 N+1 次起缩成一个徽标。"
+              },
+              "default": 3,
+              "minimum": 1,
+              "maximum": 20
             }
           }
         },

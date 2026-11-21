@@ -60,9 +60,11 @@ deny 可另带 ``message`` 与 ``interrupt``。``interrupt`` 默认 False——
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -74,6 +76,7 @@ from .commands import (
     CONCLUSIONS,
     card_lines,
 )
+from .warncount import WarningCounter
 
 # 决策取值。只有用户点按钮、或 L2 在用户显式授权下自动放行，才能产生这两个值。
 APPROVE_ALLOW = "allow"
@@ -317,6 +320,10 @@ class ApprovalRequest(BaseModel):
     tool_summary: str = Field(default="", description="工具调用的一行摘要（给人看）")
     working_directory: str | None = Field(default=None, description="会话 cwd")
     agent: str = Field(default="claude-code", description="来源 Agent")
+    # 上游进程链：谁拉起了这个 Agent。由中继在转发时爬进程树填
+    # （规格 §11：**只展示，不参与任何决策**）。空 = 没爬到 → 显示「上游未知」。
+    upstream: list[dict[str, str]] = Field(
+        default_factory=list, description="上游进程链 [{name, path}]，从近到远")
     received_at: float = Field(default_factory=time.time)
 
 
@@ -356,6 +363,10 @@ class PendingApproval:
         # 这一条拿到的模型建议。**只给「这是什么」卡用**——主卡只显示结论行，
         # 理由与依据按规格 P3 折叠进解释卡，不让它们干扰扫读。
         self.advice: dict[str, str] = {}
+        # 「这是什么」说明卡的 id。它是**追加**的一条新消息，不占审批卡
+        # （2026-11-22 真机反馈：原来解释卡替换审批卡，按钮全没了）。
+        # 记下 id 是为了重复点时更新同一张，而不是越点越多。
+        self.explain_card_id: str | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -419,6 +430,8 @@ def build_request(payload: Any) -> ApprovalRequest:
 
     容忍缺字段：``session_id`` 可能是空的（后台/无会话场景），
     那时键变成 ``("", request_id)``，照样能工作——只是定位信息少一截。
+    ``upstream`` 由中继爬进程树填，**不是 hook 原生字段**；直接打
+    ``/hook/permission`` 的请求没有它，那时显示「上游未知」而不是猜一个。
     """
     data = payload if isinstance(payload, dict) else {}
     tool_name = str(data.get("tool_name") or "")
@@ -428,7 +441,35 @@ def build_request(payload: Any) -> ApprovalRequest:
         tool_name=tool_name,
         tool_summary=_tool_summary(tool_name, data.get("tool_input")),
         working_directory=(str(data["cwd"]) if data.get("cwd") else None),
+        upstream=_clean_upstream(data.get(UPSTREAM_FIELD)),
     )
+
+
+def _clean_upstream(raw: Any) -> list[dict[str, str]]:
+    """把中继报上来的进程链洗干净：只留 ``{name, path}``，最多三条。
+
+    中继是独立脚本，它读到的进程名/路径不能当可信内容——拼进 HTML 前
+    必须过一遍类型与长度。形状不对就当没有（显示「上游未知」），
+    **不猜、不补**：猜错归因比没有归因更危险。
+    """
+    if not isinstance(raw, (list, tuple)):
+        return []
+    cleaned: list[dict[str, str]] = []
+    for entry in raw:
+        if len(cleaned) >= UPSTREAM_MAX:
+            break
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        # **只收字符串**：数字/None 说明中继那头出了问题，那种条目显示出来
+        # 也读不懂（"7"是谁？），不如当没有。宽容留给展示层，严格留给边界。
+        if not isinstance(name, str) or not name.strip():
+            continue
+        path = entry.get("path")
+        cleaned.append({"name": _clip(name, 64).strip(),
+                        "path": _clip(path, 260).strip()
+                        if isinstance(path, str) else ""})
+    return cleaned
 
 
 def _port_in_use(port: int) -> bool:
@@ -503,9 +544,6 @@ def no_decision_response(*, reason: str, timeout_seconds: float) -> dict:
 ACTION_APPROVE = "deskmate_approve"
 ACTION_DENY = "deskmate_deny"
 ACTION_EXPLAIN = "deskmate_explain"
-# 「这是什么」卡上的"返回审批"：看完解释能当场回到审批态，
-# 不然解释卡把按钮抢光了，用户只能干等到期（2026-11-22 真机反馈）。
-ACTION_BACK = "deskmate_back"
 # 「这是什么」讲多细（规格 P5.3）。三档，默认 standard。
 #   brief     只讲结论与最坏结果
 #   standard  加上范围与规则判据
@@ -517,11 +555,127 @@ VERBOSITIES = (VERBOSITY_BRIEF, VERBOSITY_STANDARD, VERBOSITY_DETAILED)
 DEFAULT_VERBOSITY = VERBOSITY_STANDARD
 ACTION_AUTH_CONFIRM = "deskmate_authorize_confirm"
 ACTION_AUTH_CANCEL = "deskmate_authorize_cancel"
-# 承载这四个按钮的入口 id。
+# 承载这些按钮的入口 id。
 ENTRY_DECIDE = "approval_decide"
 ENTRY_EXPLAIN = "approval_explain"
-ENTRY_SHOW = "approval_show"
 ENTRY_AUTHORIZE = "approval_authorize"
+
+# ── 高风险警示的强调档位（2026-11-22 真机反馈）────────────────────────────
+# 原实现每条请求都顶一整行红字。用户原话：前几次有用，之后价值像反比函数
+# 一样暴跌——**看多了就等于没有**，而真到该被叫住的那一刻也被一起跳过。
+#
+# 所以红字按命中次数递减：
+#   always    每条都整行红字
+#   first_n   前 n 次整行红字，第 n+1 次起缩成一个徽标（默认）
+#   never     永远只显示徽标
+#
+# **这只改长什么样，不改行为。** 极高危依然永不自动放行、依然必须人点，
+# 徽标态与红字态走的是同一条门控（有测试盯死这件事：视觉降级 ≠ 安全降级）。
+WARNING_ALWAYS = "always"
+WARNING_FIRST_N = "first_n"
+WARNING_NEVER = "never"
+WARNING_MODES = (WARNING_ALWAYS, WARNING_FIRST_N, WARNING_NEVER)
+DEFAULT_WARNING_MODE = WARNING_FIRST_N
+DEFAULT_WARNING_FIRST_N = 3
+WARNING_BANNER = ("高风险动作：任何配置都不会让它自动放行，"
+                  "必须由你亲自点允许或拒绝。")
+WARNING_BADGE = "⚠ 高风险"
+
+
+def normalize_warning_mode(value: object) -> str:
+    """配置里的档位名 → 合法取值。认不出按默认（first_n）处理，不抛。"""
+    mode = str(value or "").strip().lower()
+    return mode if mode in WARNING_MODES else DEFAULT_WARNING_MODE
+
+
+@dataclass(frozen=True)
+class WarningPolicy:
+    """这一次的警示该长什么样。**只决定外观，不决定放不放行。**"""
+
+    mode: str = DEFAULT_WARNING_MODE
+    first_n: int = DEFAULT_WARNING_FIRST_N
+    # 同一类别第几次命中（含这次）。计数落在数据目录，重启不丢。
+    seen: int = 1
+
+    def kind(self) -> str:
+        """``banner`` | ``badge``。
+
+        ``first_n`` 为 0 或负数时永远只给徽标——那是用户明写"一次红字都不要"，
+        偷偷给一次反而是没听懂配置。（徽标仍在，安全提示不会因为看腻了就消失。）
+        """
+        if self.mode == WARNING_ALWAYS:
+            return "banner"
+        if self.mode == WARNING_NEVER:
+            return "badge"
+        return "banner" if self.seen <= self.first_n else "badge"
+
+
+# ── 上游进程链（规格 §11：只展示，不参与任何决策）────────────────────────
+# 真实链路常常是：DSH 的 agent → 起 pwsh → 起 `claude -p` → 它调 Bash。
+# 卡片原来只写「claude-code 请求执行」，用户看不到"是谁拉起的 claude"。
+# 中继自己就在这条链上，所以由它往上爬进程树，把 [{name, path}] 随请求
+# 报给插件；插件只负责怎么说。
+#
+# **爬不到就说不知道**：空链一律「上游未知」，绝不拿当前进程名凑一个。
+UPSTREAM_UNKNOWN = "上游未知"
+UPSTREAM_MAX = 3
+# 中继写进请求体的键名。**必须与 hook_relay.py 的 UPSTREAM_FIELD 一致**，
+# 一致性由 tests/test_upstream.py 里的一条测试盯着。
+# 带前缀是因为请求体本身是 Claude Code 的：将来它加一个叫 ``upstream``
+# 的字段，不带前缀的我们就会把它的内容当成进程链显示给用户——错归因。
+UPSTREAM_FIELD = "deskmate_upstream"
+# 可执行路径里能认出来的发起者 → 友好名。按**完整词**匹配（``\b`` 边界）：
+# "desk" 不许命中 "Desktop"——那种误报比没有友好名更糟。
+# 认不出来的显示 exe 名本身：宁可少说，不错说。
+UPSTREAM_FRIENDLY = (
+    ("deepseek", "DeepSeek Harness"),
+    ("dsh", "DeepSeek Harness"),
+    ("mcode", "mcode"),
+    ("desk", "desk"),
+)
+
+
+def _friendly_exe(path: str, name: str) -> str:
+    lowered = str(path or "").lower().replace("\\", "/")
+    for needle, friendly in UPSTREAM_FRIENDLY:
+        if re.search(rf"\b{re.escape(needle)}\b", lowered):
+            return f"{name}（{friendly}）"
+    return name
+
+
+def describe_upstream(upstream: Any) -> str:
+    """进程链 → 一行人话：``pwsh.exe ← node.exe（DeepSeek Harness）``。
+
+    链按"谁拉起了谁"从近到远排，所以用 ``←`` 连接。
+    **这不是证据链，只是线索**：Windows 上父进程可能已退出、中间常隔一层
+    shell，所以它只用来回答"这是我自己开的吗"，不参与任何门控判断。
+    """
+    labels: list[str] = []
+    if isinstance(upstream, (list, tuple)):
+        for entry in upstream:
+            if len(labels) >= UPSTREAM_MAX:
+                break
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            labels.append(_friendly_exe(str(entry.get("path") or ""), name))
+    return " ← ".join(labels) if labels else UPSTREAM_UNKNOWN
+
+
+def warning_key(action_class: str, risk: str) -> str:
+    """警示计数的归类键：**同一类才算一次重复**。
+
+    规格说按 action_class 计。但红条的亮起条件是"不可恢复类别 **或** 极高危档"，
+    只按类别计会出一个坑：万一来一条"可恢复但极高危"的请求，它的键会和
+    所有低风险请求一模一样（都是 ``recoverable``），点几次低风险之后
+    这条极高危的红字就被递减掉了——用错阈值比没有阈值危险。
+    所以不可恢复的按类别计，其余按风险档计，两个命名空间不相撞。
+    """
+    if action_class in IRREVERSIBLE_CLASSES:
+        return action_class
+    return f"risk:{risk}"
 
 CARD_CSS = (
     "section { padding: 12px; font-size: 13px; }"
@@ -534,6 +688,11 @@ CARD_CSS = (
     ".verdict { font-size: 15px; margin: 8px 0 2px; }"
     ".verdict strong { display: inline; font-size: 15px; }"
     ".risk { color: #c0392b; font-size: 13px; margin: 6px 0; }"
+    # 徽标：红字递减之后的形态。单行、小号、不占正文——用户在第二次之后
+    # 就不再逐字读它，但它得一直在（安全提示不能因为看腻了就消失）。
+    ".badge { display: inline-block; color: #c0392b; font-size: 12px;"
+    " border: 1px solid #c0392b; border-radius: 3px; padding: 0 6px;"
+    " margin: 6px 0 0; }"
     ".src { color: #888; font-size: 12px; margin: 8px 0 2px; }"
     ".hint { color: #aaa; font-size: 12px; margin-top: 8px; }"
     "button { margin: 8px 8px 0 0; padding: 6px 18px; }"
@@ -554,30 +713,28 @@ def _minutes(seconds: float) -> str:
 
 
 def build_card_html(*, subject: str, tool_summary: str, session_id: str,
-                    working_directory: str | None, timeout_seconds: float,
+                    working_directory: str | None,
                     advice_state: str = ADVICE_STATE_FALLBACK,
                     risk: str = DEFAULT_RISK_SEVERITY,
                     action_class: str = DEFAULT_ACTION_CLASS,
                     command: str = "", conclusion: str = "",
+                    upstream: Any = (), warning: WarningPolicy | None = None,
                     logger: Any = None) -> str:
     """审批卡片的 HTML。纯函数——卡片文案是验收项，必须能单测。
 
-    六块内容：标题/来源/命令、**极高危红条**、会话与 cwd、
-    建议（陈述句）、超时说明、三个按钮。
-    ``subject`` 由调用方用归因语法生成（``describe_actor``），
-    这样播报和卡片说的是同一套话。
+    **只放决策需要的东西**（2026-11-22 真机反馈：原来半屏是免责声明与
+    术语解释，结论被埋在中间）：结论、动作、后果、范围、三个按钮，
+    外加一行小字的执行者与上游进程链。会话 id / 工作目录 / 超时说明 /
+    免责声明全部搬到「这是什么」与配置页。
 
-    建议块刻意排在按钮**上方**（规格 §16.1「覆盖 §12.1」）：用户点之前要看到。
+    ``subject`` 由调用方用归因语法生成（``describe_actor``），
+    这样播报和卡片说的是同一套话。``upstream`` 是中继爬进程树的结果。
 
     **任何 ``advice_state`` 都不能让这个函数抛异常。** 模型建议是锦上添花，
     卡片是核心功能——建议挂了也必须能正常审批。所以未知状态走
     ``advice_text`` 的兜底文案；传了 ``logger`` 就顺手记一条 warning，
     让"为什么这条没有结论"有据可查（不传也不影响渲染）。
     """
-    location = f"会话 {session_id or '未知'}"
-    if working_directory:
-        location += f" @ {working_directory}"
-
     if not is_known_advice_state(advice_state):
         # 未知状态：兜底 + 记账。绝不向上抛——那会让整张卡片消失。
         if logger is not None:
@@ -587,19 +744,22 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
             )
         advice_state = ADVICE_STATE_FALLBACK
 
-    # 极高危永远呈现（规格 §2 硬规则 3 + §17.2）：标红 + 明说任何配置都不会
-    # 让它自动放行。判据是**动作类别或极高危档**，不是规则名（C3）——
-    # 规则名会随规则库变，红条不能跟着漏。
+    # 高风险警示（规格 §2 硬规则 3 + §17.2）。判据是**动作类别或极高危档**，
+    # 不是规则名（C3）——规则名会随规则库变，警示不能跟着漏。
+    # ``WarningPolicy`` 只决定它长成红字还是徽标，**不决定放不放行**。
     high_risk = (action_class in IRREVERSIBLE_CLASSES
                  or SEVERITY_ORDER.get(risk, 0) >= SEVERITY_ORDER["critical"])
-    risk_html = (
-        '<p class="risk"><strong>高风险动作：任何配置都不会让它自动放行，'
-        "必须由你亲自点允许或拒绝。</strong></p>"
-        if high_risk else ""
-    )
+    warn_kind = (warning or WarningPolicy()).kind() if high_risk else "none"
+    if warn_kind == "banner":
+        warn_html = (f'<p class="risk"><strong>{_escape(WARNING_BANNER)}'
+                     "</strong></p>")
+    elif warn_kind == "badge":
+        warn_html = f'<p><span class="badge">{_escape(WARNING_BADGE)}</span></p>'
+    else:
+        warn_html = ""
 
-    # 主卡正文固定四行（规格 P3）：动作 / 后果 / 范围 / 结论。
-    # 前三行由命令翻译词典产出（本地、零 key），第四行结论由调用方填——
+    # 主卡正文固定四行（规格 P3）：结论 / 动作 / 后果 / 范围。
+    # 前三行由命令翻译词典产出（本地、零 key），结论行由调用方填——
     # 词典只描述事实，不给结论。
     lines = card_lines(command=command or tool_summary,
                        working_directory=working_directory)
@@ -613,28 +773,29 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
         conclusion_text = CONCLUSION_UNSURE
     body_lines = [
         # 结论行**置于最上**（规格 P2）：快速扫读时眼睛先落在哪里，
-        # 结论就该在哪里。P3 的四行样例把结论排在最后，与 P2 的"置于最上"
+        # 结论就该在那里。P3 的四行样例把结论排在最后，与 P2 的"置于最上"
         # 冲突；这里按 P2 排，因为 P2 给了理由（误读），P3 只给了内容清单。
         f'<p class="verdict"><strong>{_escape(conclusion_text)}</strong></p>',
         f'<p class="act">{_escape(lines["action"])}</p>',
         f"<p>{_escape(lines['consequence'])}</p>",
         f"<p>{_escape(lines['scope'])}</p>",
+        warn_html,
     ]
 
+    # 执行者与上游：压成两行小字放在最下面。它们回答"这是我自己开的吗"，
+    # 属于定位信息，不该挤占结论的位置（规格 Q2）。
+    short_session = (session_id or "")[:8]
+    who = f"执行：{subject}" + (f" 会话 {short_session}" if short_session else "")
     return (
         "<section>"
         "<strong>同桌猫 · 审批请求</strong>"
-        f"<p class=\"loc\">{_escape(location)}</p>"
         + "".join(body_lines)
-        + risk_html
-        + f"<p class=\"src\">{_escape(subject)} 请求执行</p>"
-        + f"<p class=\"hint\">允许后 Claude Code 继续执行；拒绝则中止这次调用"
-          f"（不掐掉整个回合）。{_minutes(timeout_seconds)}后无人决定，"
-          "宿主会自行处理，届时这条视为未决定——插件不代你判断。</p>"
-          f"<button data-neko-action=\"{ACTION_APPROVE}\">允许</button>"
-          f"<button data-neko-action=\"{ACTION_DENY}\">拒绝</button>"
-          f"<button data-neko-action=\"{ACTION_EXPLAIN}\">这是什么</button>"
-          "</section>"
+        + f"<p class=\"src\">{_escape(who)}</p>"
+        + f"<p class=\"src\">上游：{_escape(describe_upstream(upstream))}</p>"
+        + f"<button data-neko-action=\"{ACTION_APPROVE}\">允许</button>"
+        + f"<button data-neko-action=\"{ACTION_DENY}\">拒绝</button>"
+        + f"<button data-neko-action=\"{ACTION_EXPLAIN}\">这是什么</button>"
+        + "</section>"
     )
 
 
@@ -642,47 +803,69 @@ def explain_request(*, tool_name: str, tool_summary: str,
                     working_directory: str | None, rule: str,
                     severity: str, command: str = "",
                     model_reason: str = "", basis: str = "",
-                    model_note: str = "",
+                    model_note: str = "", session_id: str = "",
+                    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
                     verbosity: str = DEFAULT_VERBOSITY) -> dict[str, str]:
     """「这是什么」按钮的落点：解释，只说事实，不猜意图。
 
-    主卡的正文只有固定四行（规格 P3），所以模型的理由与依据放在这里——
-    「这是什么」就是看细节的地方，主卡不是。
+    主卡的正文只有四行（规格 P3），所以**会话 id、工作目录、超时说明、
+    模型的理由与依据全放这里**——「这是什么」就是看细节的地方。
 
     ``basis`` 那行按规格 P3 整行来自动生成（工具 / 目录 / 风险档 / 模型名），
     不许手写：手写的内容迟早和实际字段不一致。
+
+    **全文人话，不出现内部词**（2026-11-22 真机反馈：解释卡上出现过
+    ``L0`` / ``critical`` / ``L2`` / ``onFailure``——那是 C5 同类缺陷，
+    用户不知道那是什么）。风险档只用来分支措辞，**不把档位名印出来**。
     """
     if rule == "delete":
-        verdict = f"L0 规则判定为**删除类**（{severity}），属于高风险动作。"
-        extra = ("这类动作永不进入 L2 自动决定，必须由你亲自点允许或拒绝；"
-                 "宿主侧的 onFailure 策略只在你一直不决定时兜底。")
+        verdict = "这是一次删除文件的操作，属于高风险。"
+        extra = "这类操作永远不会自动放行，必须你亲自点允许或拒绝。"
     elif rule:
-        verdict = f"L0 规则命中 {rule}（{severity}）。"
+        verdict = "本地规则命中了这次操作，按高风险处理。"
         extra = "是否放行由你决定，插件只转发、不代判。"
     else:
-        verdict = "L0 规则未命中，按低风险（notice）处理。"
-        extra = ("即使风险低，只要没开 L2 自动决定，插件仍然只转发、不代判；"
-                 "你一直不决定的话，到期后由宿主按 onFailure 策略处理。")
+        verdict = "本地规则没有命中，按低风险处理。"
+        extra = ("即使风险低，只要没开自动决定，插件仍然只转发、不代判；"
+                 "你一直不决定的话，到期后由 Claude Code 自己接手。")
+
+    # 主卡上原来那段"允许后…/拒绝则…/约 N 分钟后…"整块搬到这里
+    # （规格 Q2：卡片上不重复免责说明）。**到期不等于拒绝**——
+    # 这句话必须说清楚，否则用户会以为不点就是不同意。
+    timeout_line = (
+        f"允许后 Claude Code 继续执行；拒绝则中止这次调用"
+        f"（不会掐掉整个回合）。{_minutes(timeout_seconds)}后无人决定，"
+        "这条视为未决定，由 Claude Code 自己接手——插件不代你判断，"
+        "也不把「一直没点」记成拒绝。")
+
+    short_session = (session_id or "")[:8]
+    where = working_directory or "工作目录未知"
+    location = (f"会话 {short_session} 的工作目录：{where}"
+                if short_session else f"工作目录：{where}")
 
     explanation = {
         "title": "这是什么",
-        "what": f"Claude Code 请求执行 {tool_name or '某个工具'}：{tool_summary}",
+        # ``tool_summary`` 本身已经是「Bash: rm -rf build/」这种形状，
+        # 再把 tool_name 拼一遍就是「请求执行 Bash：Bash: rm -rf build/」——
+        # 工具名出现两次，看着像插件复读。所以摘要已经有前缀就不重复。
+        "what": (f"Claude Code 请求执行 "
+                 f"{tool_summary or tool_name or '某个工具'}"),
         "verdict": verdict,
         "extra": extra,
-        "location": (f"会话工作目录 {working_directory}" if working_directory
-                     else "会话工作目录未知"),
-        "note": ("以上是规则层能讲准的事实。看不出来历的地方不会替你猜——"
+        "timeout": timeout_line,
+        "location": location,
+        "note": ("以上是插件能讲准的事实。看不出来的地方不会替你猜——"
                  "要不要放行由你定。"),
     }
     # 讲多细由配置决定（规格 P5.3）。brief 只留结论与后果；standard 加范围
     # 与规则判据；detailed 再叠加模型给的理由与依据。
     if verbosity == VERBOSITY_BRIEF:
-        explanation.pop("location", None)
-        explanation.pop("extra", None)
+        for key in ("location", "extra", "timeout"):
+            explanation.pop(key, None)
     elif verbosity != VERBOSITY_DETAILED:
         model_reason, basis = "", ""
     if model_note:
-        # 没接入模型时的那句陈述。放在解释卡而不是主卡：主卡正文是固定四行，
+        # 没接入模型时的那句陈述。放在解释卡而不是主卡：主卡正文是四行，
         # 而这句话属于"细节"，正是「这是什么」该放的地方。
         explanation["model_note"] = model_note
     if model_reason:
@@ -692,20 +875,15 @@ def explain_request(*, tool_name: str, tool_summary: str,
     return explanation
 
 
-def build_explain_html(explanation: dict[str, str],
-                       request_id: str = "") -> str:
+def build_explain_html(explanation: dict[str, str]) -> str:
     """把 explain_request 的结果渲染成卡片用的 HTML。
 
-    **自带三个按钮**（允许 / 拒绝 / 返回审批）。2026-11-22 真机反馈：
-    解释卡替换了审批卡之后按钮全没了，用户只能干等到期——看完解释
-    当然要能当场决定，所以按钮必须跟着解释一起出现。
+    **纯说明卡，一个按钮都没有**（2026-11-22 第二轮真机反馈）：原来它
+    *替换*审批卡，把按钮整个抢走，而卡上的「返回审批」在宿主侧报
+    ``UI action ... is not exposed by surface ...``，用户卡在中间出不去。
+    现在改成**追加一条新消息**，原审批卡原地不动、三个按钮始终可点，
+    所以这里既不需要按钮，也不需要"返回"。
     """
-    buttons = (
-        f"<button data-neko-action=\"{ACTION_APPROVE}\">允许</button>"
-        f"<button data-neko-action=\"{ACTION_DENY}\">拒绝</button>"
-        f"<button data-neko-action=\"{ACTION_BACK}\">返回审批</button>"
-        if request_id else ""
-    )
     return (
         "<section>"
         f"<strong>{_escape(explanation['title'])}</strong>"
@@ -717,24 +895,13 @@ def build_explain_html(explanation: dict[str, str],
            if explanation.get("model_note") else "")
         + (f"<p><strong>{_escape(explanation['model_reason'])}</strong></p>"
            if explanation.get("model_reason") else "")
+        + (f"<p>{_escape(explanation['timeout'])}</p>"
+           if explanation.get("timeout") else "")
         + (f"<p class=\"hint\">{_escape(explanation['basis'])}</p>"
            if explanation.get("basis") else "")
         + f"<p class=\"hint\">{_escape(explanation['note'])}</p>"
-        + buttons
         + "</section>"
     )
-
-
-def build_explain_actions(request_id: str) -> dict[str, dict[str, Any]]:
-    """解释卡的三个按钮 → 两个入口 + 一个返回。"""
-    return {
-        ACTION_APPROVE: {"entry": ENTRY_DECIDE,
-                         "args": {"request_id": request_id, "decision": APPROVE_ALLOW}},
-        ACTION_DENY: {"entry": ENTRY_DECIDE,
-                      "args": {"request_id": request_id, "decision": APPROVE_DENY}},
-        ACTION_BACK: {"entry": ENTRY_SHOW,
-                      "args": {"request_id": request_id}},
-    }
 
 
 def build_card_actions(request_id: str) -> dict[str, dict[str, Any]]:
@@ -889,6 +1056,8 @@ class ApprovalGateway:
                  has_api_key: bool = False,
                  audit_path: Any = None,
                  authorization_path: Any = None,
+                 warning_counts_path: Any = None,
+                 advice_backend_ready: bool = False,
                  judge: Any = None) -> None:
         self._logger = logger
         self._port = int(port)
@@ -906,6 +1075,14 @@ class ApprovalGateway:
         self._authorization_path = authorization_path
         # 用户的显式授权确认。默认 None = 没签字 → L1/L2 全不可用。
         self._authorization = load_authorization(authorization_path)
+        # 红字递减的命中计数。**刻意与门控分开存**：它只影响警示长什么样，
+        # 不影响任何放行判断（规格 Q3：视觉降级绝不改变行为）。
+        self._warnings = WarningCounter(warning_counts_path)
+        # **L1 建议后端真的能构造出来吗**。2026-11-22 口径 bug：原来这里
+        # 借的是 L2 的 judge（恒为 None），于是模型建议明明在工作，
+        # 启动行却显示「生效=建议否」。建议层和自动决定层是两件事，
+        # 判据必须分开（规格 Q4）。
+        self._advice_backend_ready = bool(advice_backend_ready)
         # 判断后端。5a 恒为 None——门控算得出来，但没有模型就不自动决定。
         self._judge = judge
         self._lock = threading.Lock()
@@ -972,19 +1149,23 @@ class ApprovalGateway:
             target=server.serve_forever, name="deskmate-approval", daemon=True,
         )
         self._thread.start()
-        # 状态行拆成「配置怎么写」与「实际生不生效」两列（规格 P5.1）：
-        # 原来只有一个"L1建议=开/关"，而它按 advice_state() 算——授权没确认时
-        # 显示"关"，用户明明把配置打开了，看着像插件没听懂。
+        # 状态行拆成「配置怎么写」与「实际生不生效」两列（规格 P5.1），
+        # 且**两层的判据分开**（规格 Q4）：
+        #   「生效=建议」看 L1 建议客户端（配置 + key + 授权 + 客户端可构造）
+        #   「生效=自动」看 L2 判断后端（配置 + 授权 + judge 在）
+        # 原来两列都借 judge 算，于是建议明明在工作也显示「否」。
+        # 最后一栏特意叫「自动判断后端」而不是「后端」——建议客户端也是后端，
+        # 两个词混在一起就是这次口径 bug 的由来。
         self._logger.info(
             "审批服务就绪 http://127.0.0.1:{}{} 到期={}s 保留={}s "
-            "配置=建议{}/自动{} 生效=建议{}/自动{} 授权={} 判断后端={}",
+            "配置=建议{}/自动{} 生效=建议{}/自动{} 授权={} 自动判断后端={}",
             self._port, HOOK_PATH, self._timeout_seconds, self._retention_seconds,
             "开" if self._ai_judgement else "关",
             self._auto_decide,
             "是" if self._l1_ready() else "否",
             "是" if self._auto_decide_live() else "否",
             "已确认" if self._authorization is not None else "未确认",
-            "已接入" if self._judge is not None else "未接入（5b）",
+            "已接入" if self._judge is not None else "未接入",
         )
         if self._authorization is None and (self._ai_judgement
                                             or self._auto_decide != AUTO_OFF):
@@ -1459,23 +1640,43 @@ class ApprovalGateway:
         return advice_state(
             ai_judgement=self._ai_judgement,
             has_key=self._has_api_key,
-            backend_ready=self._judge is not None,
+            backend_ready=self._advice_backend_ready,
             authorized=bool(self.authorized_scopes()),
         )
 
+    def note_warning(self, key: str) -> int:
+        """记一次该类别的命中，返回**含这次**的次数。
+
+        计数挂了就返回 1（当成第一次）——多显示一次红字远比
+        因为计数失败少显示一次安全。
+        """
+        try:
+            return self._warnings.bump(key)
+        except Exception as exc:  # noqa: BLE001  计数失败不影响审批
+            self._logger.warning("警示计数失败（{}）：{}", type(exc).__name__, exc)
+            return 1
+
     def _auto_decide_live(self) -> bool:
-        """L2 现在是否真的能自动放行（配置开 + 授权签了 + 有后端）。"""
+        """L2 现在是否真的能自动放行（配置开 + 授权签了 + 有判断后端）。
+
+        **刻意不看建议层**：L2 要的是判断后端，不是建议客户端。
+        这两层曾经共用一个 readiness，结果启动行把"建议在工作"显示成
+        "没生效"，也把"没有判断后端"显示成"建议没生效"（规格 Q4）。
+        """
         if self._auto_decide != AUTO_LOW_RISK_ONLY or self._judge is None:
             return False
         scopes = self._authorization.scopes if self._authorization else ()
         return AUTH_SCOPE_AUTO in scopes
 
     def _l1_ready(self) -> bool:
-        return advice_state(
-            ai_judgement=self._ai_judgement,
-            has_key=self._has_api_key,
-            backend_ready=self._judge is not None,
-        ) == ADVICE_STATE_READY
+        """L1 建议现在是否真的给得出建议。
+
+        判据与 ``advice_state()`` **完全同一处**：配置开 + 有 key + 签了字
+        + 建议客户端构造得出来。状态行只是它的展示，不另算一套——
+        再算一套就会出现"行上说没生效、卡片上却在给建议"的自相矛盾
+        （2026-11-22 真机反馈：卡片 3 秒建出且带理由，启动行却说 建议否）。
+        """
+        return self.advice_state() == ADVICE_STATE_READY
 
     def undecided_count(self) -> int:
         with self._lock:

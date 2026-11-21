@@ -326,42 +326,20 @@ def test_explain_unknown_verbosity_falls_back_to_standard() -> None:
     assert "basis" not in explanation
 
 
-# ── P1：解释卡必须自带按钮 ────────────────────────────────────────────────
+# ── P1/Q5：解释卡是追加的说明卡，不抢审批卡的按钮 ─────────────────────────
 
-def test_explain_card_carries_its_own_three_buttons() -> None:
-    """2026-11-22 真机反馈：解释卡替换审批卡后按钮全没了，用户只能干等到期。
+def test_explain_card_has_no_buttons_of_its_own() -> None:
+    """2026-11-22 第二轮真机反馈：解释卡*替换*审批卡之后按钮全没了，
+    补上去的「返回审批」又在宿主侧报 ``UI action ... is not exposed``。
 
-    所以解释卡必须自带 允许 / 拒绝 / 返回审批 三个按钮。
+    所以现在改成**追加一条新消息**：原审批卡原地不动、三个按钮始终可点，
+    解释卡也就不需要任何按钮——一个都没有，比"有一两个能用"可靠。
     """
-    from plugin.plugins.agent_deskmate.approval import (
-        ACTION_APPROVE,
-        ACTION_BACK,
-        ACTION_DENY,
-        build_explain_html,
-    )
+    from plugin.plugins.agent_deskmate.approval import build_explain_html
 
-    html = build_explain_html(_explanation(verbosity="detailed"), "req-1")
-    for action in (ACTION_APPROVE, ACTION_DENY, ACTION_BACK):
-        assert f'data-neko-action="{action}"' in html, f"解释卡缺按钮 {action}"
-
-
-def test_explain_buttons_reach_the_right_entries() -> None:
-    """允许/拒绝落到 approval_decide，返回落到 approval_show。"""
-    from plugin.plugins.agent_deskmate.approval import (
-        ENTRY_DECIDE,
-        ENTRY_SHOW,
-        build_explain_actions,
-    )
-
-    actions = build_explain_actions("req-1")
-    assert actions["deskmate_approve"]["entry"] == ENTRY_DECIDE
-    assert actions["deskmate_approve"]["args"] == {"request_id": "req-1",
-                                                  "decision": "allow"}
-    assert actions["deskmate_deny"]["entry"] == ENTRY_DECIDE
-    assert actions["deskmate_deny"]["args"] == {"request_id": "req-1",
-                                                "decision": "deny"}
-    assert actions["deskmate_back"]["entry"] == ENTRY_SHOW
-    assert actions["deskmate_back"]["args"] == {"request_id": "req-1"}
+    html = build_explain_html(_explanation(verbosity="detailed"))
+    assert "data-neko-action" not in html, "解释卡上有按钮"
+    assert "返回审批" not in html
 
 
 def test_explain_card_escapes_agent_supplied_text() -> None:
@@ -369,5 +347,5 @@ def test_explain_card_escapes_agent_supplied_text() -> None:
     from plugin.plugins.agent_deskmate.approval import build_explain_html
 
     explanation = _explanation(tool_summary="</p><script>alert(1)</script>")
-    html = build_explain_html(explanation, "req-1")
+    html = build_explain_html(explanation)
     assert "<script>" not in html
