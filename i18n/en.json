@@ -3,8 +3,11 @@
   "plugin.description": "Watches your local coding agents: broadcasts and explains when approval, completion, failure or a stall happens, and lets you approve or reject inside N.E.K.O.",
 
   "entry.status.name": "Plugin Status",
-  "entry.status.description": "Returns the plugin's own runtime state: whether it is running, for how long, which M0-lite stage it is at, and whether the observation adapters are ready. Used to confirm the plugin really loaded; observes no agent.",
+  "entry.status.description": "Returns the plugin's own state (uptime / stage / adapter readiness). Agent observation runs in a background poll every 3 seconds; use scan_now to trigger one immediately.",
 
   "entry.dump_events.name": "Dump Recent Events",
-  "entry.dump_events.description": "Reads the observation sources once and returns the most recent N unified events, to confirm the parsing is correct."
+  "entry.dump_events.description": "Reads the observation sources once and returns the most recent N unified events, to confirm the parsing is correct.",
+
+  "entry.scan_now.name": "Scan Now",
+  "entry.scan_now.description": "Reads the observation sources once and runs the rules, returning event count / hit count / expected broadcast count and the rule breakdown. Read-only diagnostics: it sends no broadcast."
 }

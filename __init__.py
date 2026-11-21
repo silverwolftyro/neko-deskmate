@@ -2,7 +2,7 @@
 
 基本版（M0-lite）路线：骨架能加载 → Claude Code 转录 tail + 网关元数据观测 →
 L0 规则层 → SDK 播报 → 审批中继 → 零 key 行为。
-当前进度：**M0-lite-2 观测 + 统一事件**（M0-lite-1 骨架已通过官方四条验收）。
+当前进度：**M0-lite-4 播报**（观测轮询跑在 3 秒 timer 上，scan_now 是只读诊断入口）。
 
 三条红线（详见 AGENTS.md）：
   1. 播报只能走 push_message(source=..., visibility=[...], ai_behavior=...)，
@@ -38,7 +38,12 @@ from plugin.sdk.plugin import (
 )
 
 from .adapters import ClaudeCodeAdapter, GatewayAdapter
-from .broadcast import Broadcaster
+from .adapters.claude_code import (
+    iter_transcript_files,
+    read_new_transcript_events,
+)
+from .adapters.gateway import current_watermark, read_new_gateway_events
+from .broadcast import Broadcaster, render_text
 from .events import UnifiedEvent
 from .rules import (
     Coalescer,
@@ -58,6 +63,12 @@ TRANSCRIPT_TAIL_BYTES = 65536
 
 # 单轮最多播几条，防止适配器积压后一次刷屏。
 MAX_BROADCAST_PER_TICK = 5
+
+# scan_now 每个数据源最多回看多少条事件。只读诊断，够看出规则对不对就行。
+SCAN_EVENT_COUNT = 50
+
+# scan_now 回显几条"将要播报"的原文，超过就截断。
+SCAN_SAMPLE_LIMIT = 3
 
 
 class StatusReply(BaseModel):
@@ -79,11 +90,28 @@ class DumpEventsReply(BaseModel):
     sources: dict[str, str] = Field(default_factory=dict, description="各数据源的读取情况")
 
 
-def _expand(path_value: object) -> Path:
-    """展开配置里的 ~ 和环境变量。配置给模板，代码不写死绝对路径。"""
+class ScanNowReply(BaseModel):
+    """scan_now 入口的输出契约。只读诊断：一次也不发送播报。"""
+
+    events_read: int = Field(description="本轮实际检查的统一事件条数")
+    hits: int = Field(description="规则命中条数（未去重）")
+    broadcasts: int = Field(description="去重后预计会播报的条数")
+    top_rules: list[dict] = Field(description="命中规则分布，按条数降序，如 [{'rule': 'delete', 'count': 3}]")
+    samples: list[str] = Field(description="最多 3 条将要播报的原文，用于肉眼确认")
+    sources: dict[str, str] = Field(default_factory=dict, description="各数据源的读取情况")
+
+
+def _expand(path_value: object) -> Path | None:
+    """展开配置里的 ~ 和环境变量；**没配置就返回 None**，不返回 Path()。
+
+    不能返回 ``Path()``：它等于 ``.``，而 ``Path(".").is_dir()`` 是真的。
+    于是缺配置会静默变成"观测当前工作目录"——插件进程的 cwd 是宿主的目录，
+    那会扫出一堆无关 jsonl，还会打出"适配器就绪"的假日志。
+    （这个坑是 test_scan 的缺配置用例当场抓到的。）
+    """
     text = str(path_value or "").strip()
     if not text:
-        return Path()
+        return None
     return Path(os.path.expanduser(os.path.expandvars(text)))
 
 
@@ -94,6 +122,129 @@ def _to_number(value: object, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return result if result == result else default
+
+
+# ── 只读诊断（scan_now） ────────────────────────────────────────────────────
+# 这一整块刻意与常驻轮询的状态隔离，理由见 diagnose() 的文档字符串。
+# 放在模块级而不是类方法里，是为了能在没有宿主 ctx 的情况下单测。
+
+def _scan_transcript_tail(projects_dir: Path, count: int) -> list[UnifiedEvent]:
+    """只读扫一遍**最新**转录文件的尾部。
+
+    只看最新一个文件：常驻轮询按 mtime 扫多个文件，但诊断要的是"刚才发生了什么"，
+    那永远在最新的文件里。全扫多个文件既慢又没必要。
+    """
+    files = iter_transcript_files(projects_dir)
+    if not files:
+        return []
+    newest = files[0]
+    size = newest.stat().st_size
+    offset = max(0, size - TRANSCRIPT_TAIL_BYTES)
+    events, _ = read_new_transcript_events(newest, offset)
+    return events[-count:]
+
+
+def _scan_gateway_tail(db_path: Path, count: int) -> list[UnifiedEvent]:
+    """按 rowid 回看最后 ``count`` 行（一次性，不动常驻水位）。"""
+    watermark = current_watermark(db_path)
+    events, _ = read_new_gateway_events(db_path, max(0, watermark - count), limit=count)
+    return events[-count:]
+
+
+def _hits_for_event(event: UnifiedEvent) -> list[RuleHit]:
+    """一个事件跑当前阶段所有规则。
+
+    删除类用完整命令判（summary 被截断，会漏掉长命令里的 rm）；
+    失败类按真实状态码定严重度，不从 summary 文本反解析。
+    """
+    hits: list[RuleHit] = []
+
+    if event.event == "tool_use" and event.command:
+        hit = evaluate_delete(
+            event.command,
+            agent=event.agent, session=event.session, ts=event.ts,
+        )
+        if hit is not None:
+            hits.append(hit)
+
+    elif event.event == "error":
+        if event.source_type == "proxy_request_logs":
+            hit = evaluate_failure(
+                status_code=event.status_code,
+                error_message=event.summary,
+                agent=event.agent, session=event.session, ts=event.ts,
+            )
+        else:
+            hit = evaluate_transcript_error(event)
+        if hit is not None:
+            hits.append(hit)
+
+    return hits
+
+
+def diagnose(section: dict[str, str], *, log=None,
+             per_source: int = SCAN_EVENT_COUNT) -> ScanNowReply:
+    """读一遍观测源并跑规则，返回统计；**一次播报都不发送**。
+
+    刻意不复用常驻轮询的三个状态（transcript offset、gateway rowid、合并器），
+    复用会同时造成两个 bug：
+      1) 把还没轮到的增量消费掉 → 3 秒后的 timer 看不到这些事件，**播报被吞**；
+      2) 推进合并器的记账 → 同一条真播报反而被这次诊断**抑制**。
+    所以这里自己读尾部，配一个一次性的合并器估算"会播几条"。
+
+    因此 ``broadcasts`` 的语义是"这批事件若是新鲜的，会播几条"——
+    它不知道常驻轮询已经播过什么，所以刚刚播过的同类事件这里可能仍计 1。
+    这是有意的取舍：诊断宁可多说一条，也不能让宿主少播一条。
+    """
+    events: list[UnifiedEvent] = []
+    sources: dict[str, str] = {}
+
+    projects_dir = _expand(section.get("claude_projects_dir"))
+    if projects_dir is not None and projects_dir.is_dir():
+        events.extend(_scan_transcript_tail(projects_dir, per_source))
+        sources["claude_code_transcript"] = str(projects_dir)
+    else:
+        sources["claude_code_transcript"] = "未配置或目录不存在"
+
+    db_path = _expand(section.get("cc_switch_db"))
+    if db_path is not None and db_path.is_file():
+        events.extend(_scan_gateway_tail(db_path, per_source))
+        sources["gateway_metadata"] = str(db_path)
+    else:
+        sources["gateway_metadata"] = "未配置或文件不存在"
+
+    coalescer = Coalescer(window_seconds=_to_number(section.get("coalesce_seconds"), 60.0))
+    hits: list[RuleHit] = []
+    broadcasts = 0
+    samples: list[str] = []
+    for event in events:
+        for hit in _hits_for_event(event):
+            hits.append(hit)
+            if coalescer.offer(hit) is None:
+                continue  # 一次性合并器：同键在窗口内只算一条
+            broadcasts += 1
+            if len(samples) < SCAN_SAMPLE_LIMIT:
+                samples.append(render_text(hit))
+
+    counts: dict[str, int] = {}
+    for hit in hits:
+        counts[hit.rule] = counts.get(hit.rule, 0) + 1
+    top_rules = [
+        {"rule": rule, "count": count}
+        for rule, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+    if log is not None:
+        log.info("scan_now：事件 {} 条，命中 {} 条，预计播报 {} 条，来源 {}",
+                 len(events), len(hits), broadcasts, sources)
+    return ScanNowReply(
+        events_read=len(events),
+        hits=len(hits),
+        broadcasts=broadcasts,
+        top_rules=top_rules,
+        samples=samples,
+        sources=sources,
+    )
 
 
 @neko_plugin
@@ -173,7 +324,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
         projects_dir = _expand(section.get("claude_projects_dir"))
         db_path = _expand(section.get("cc_switch_db"))
-        if not projects_dir.is_dir() and not db_path.is_file():
+        if not (projects_dir is not None and projects_dir.is_dir()) \
+                and not (db_path is not None and db_path.is_file()):
             self.logger.warning(
                 "两个观测源都不可用（transcript={} gateway={}），本轮跳过",
                 projects_dir or "未配置", db_path or "未配置",
@@ -181,8 +333,15 @@ class AgentDeskmatePlugin(NekoPluginBase):
             return None
 
         coalesce_seconds = _to_number(section.get("coalesce_seconds"), 60.0)
-        self._transcript_adapter = ClaudeCodeAdapter(projects_dir) if projects_dir.is_dir() else None
-        self._gateway_adapter = GatewayAdapter(db_path) if db_path.is_file() else None
+        # 路径配了但不存在时同样不建适配器——建了也只会 poll 出空，还误导日志。
+        self._transcript_adapter = (
+            ClaudeCodeAdapter(projects_dir)
+            if projects_dir is not None and projects_dir.is_dir() else None
+        )
+        self._gateway_adapter = (
+            GatewayAdapter(db_path)
+            if db_path is not None and db_path.is_file() else None
+        )
         self._broadcaster = Broadcaster(
             self.push_message, self.logger, source=SOURCE,
             coalescer=Coalescer(window_seconds=coalesce_seconds),
@@ -210,44 +369,13 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
         outcomes: list[str] = []
         for event in events:
-            for hit in self._hits_for(event):
+            for hit in _hits_for_event(event):
                 outcomes.append(broadcaster.broadcast(hit))
                 if len(outcomes) >= MAX_BROADCAST_PER_TICK:
                     self.logger.info("本轮播报已达上限 {} 条，余下留待下一轮",
                                      MAX_BROADCAST_PER_TICK)
                     return outcomes
         return outcomes
-
-    @staticmethod
-    def _hits_for(event: UnifiedEvent) -> list[RuleHit]:
-        """一个事件跑当前阶段所有规则。
-
-        删除类用完整命令判（summary 被截断，会漏掉长命令里的 rm）；
-        失败类按真实状态码定严重度，不从 summary 文本反解析。
-        """
-        hits: list[RuleHit] = []
-
-        if event.event == "tool_use" and event.command:
-            hit = evaluate_delete(
-                event.command,
-                agent=event.agent, session=event.session, ts=event.ts,
-            )
-            if hit is not None:
-                hits.append(hit)
-
-        elif event.event == "error":
-            if event.source_type == "proxy_request_logs":
-                hit = evaluate_failure(
-                    status_code=event.status_code,
-                    error_message=event.summary,
-                    agent=event.agent, session=event.session, ts=event.ts,
-                )
-            else:
-                hit = evaluate_transcript_error(event)
-            if hit is not None:
-                hits.append(hit)
-
-        return hits
 
     @timer_interval(id="watch", seconds=3)
     async def watch_tick(self, **_):
@@ -272,11 +400,19 @@ class AgentDeskmatePlugin(NekoPluginBase):
     @plugin_entry(
         id="status",
         name=tr("entry.status.name", default="插件状态"),
-        description=tr("entry.status.description", default="返回同桌猫自身的运行状态。"),
+        description=tr(
+            "entry.status.description",
+            default="返回同桌猫自身状态（运行时长 / 阶段 / 适配器就绪情况）。"
+                    "Agent 观测在后台每 3 秒轮询中进行，用 scan_now 可立即触发一次。",
+        ),
         llm_result_fields=["status", "stage"],
     )
     async def status(self, **_) -> StatusReply:
-        """返回插件自身状态；不观测任何 Agent。"""
+        """返回插件自身状态；不观测任何 Agent。
+
+        注意：这个入口本身不观测——观测在 ``watch_tick`` 的 3 秒 timer 里跑。
+        这句话容易读反，所以 i18n 文案里刻意写清了"观测在后台轮询中"。
+        """
         uptime = round(time.time() - self._started_at, 1) if self._started_at is not None else None
         return StatusReply(
             status="running" if self._started_at is not None else "stopped",
@@ -311,14 +447,14 @@ class AgentDeskmatePlugin(NekoPluginBase):
         events: list[UnifiedEvent] = []
 
         projects_dir = _expand(section.get("claude_projects_dir"))
-        if projects_dir.is_dir():
+        if projects_dir is not None and projects_dir.is_dir():
             events.extend(self._recent_transcript_events(projects_dir, count))
             sources["claude_code_transcript"] = str(projects_dir)
         else:
             sources["claude_code_transcript"] = "未配置或目录不存在"
 
         db_path = _expand(section.get("cc_switch_db"))
-        if db_path.is_file():
+        if db_path is not None and db_path.is_file():
             events.extend(self._recent_gateway_events(db_path, count))
             sources["gateway_metadata"] = str(db_path)
         else:
@@ -337,29 +473,45 @@ class AgentDeskmatePlugin(NekoPluginBase):
             sources=sources,
         )
 
+    @plugin_entry(
+        id="scan_now",
+        name=tr("entry.scan_now.name", default="立即扫描一次"),
+        description=tr(
+            "entry.scan_now.description",
+            default="同步读一次观测源并跑规则判定，返回事件数 / 命中数 / 预计播报数与规则分布。"
+                    "只读诊断，不发送任何播报。",
+        ),
+        llm_result_fields=["events_read", "hits", "broadcasts", "top_rules"],
+    )
+    async def scan_now(self, **_) -> ScanNowReply:
+        """立即跑一次「观测 + 规则判定」，但**不播报**。
+
+        常驻观测不在这里：它在 ``watch_tick`` 的 ``@timer_interval(3s)`` 里
+        （入口只在被调用时跑，靠入口做常驻观测等于没人调就完全不观测）。
+        这个入口是给真机调试用的——点一下就知道解析和规则对不对，
+        不用等 3 秒，也不用真往聊天窗里发消息。
+
+        读盘丢进线程：入口跑在 entry loop 里，阻塞它会拖慢同 loop 上的其它调用。
+        """
+        section = await self._watch_config()
+        return await asyncio.to_thread(diagnose, section, log=self.logger)
+
     # ── 一次性读取（不走增量水位） ──────────────────────────────────────────
 
     def _recent_transcript_events(self, projects_dir: Path, count: int) -> list[UnifiedEvent]:
         """往回扫最近一个转录文件的末尾，解析出事件。"""
-        from .adapters.claude_code import iter_transcript_files, read_new_transcript_events
-
         files = iter_transcript_files(projects_dir)
         if not files:
             self.logger.info("转录目录下没有 jsonl：{}", projects_dir)
             return []
         newest = files[0]
         size = newest.stat().st_size
-        offset = max(0, size - TRANSCRIPT_TAIL_BYTES)
-        events, _ = read_new_transcript_events(newest, offset)
-        self.logger.info("转录 tail：{} 末尾 {} 字节，解析出 {} 条",
-                         newest.name, size - offset, len(events))
-        return events[-count:]
+        self.logger.info("转录 tail：{} 末尾 {} 字节",
+                         newest.name, min(size, TRANSCRIPT_TAIL_BYTES))
+        return _scan_transcript_tail(projects_dir, count)
 
     def _recent_gateway_events(self, db_path: Path, count: int) -> list[UnifiedEvent]:
         """按 rowid 取最后 count 行（一次性，不动常驻水位）。"""
-        from .adapters.gateway import current_watermark, read_new_gateway_events
-
-        watermark = current_watermark(db_path)
-        events, _ = read_new_gateway_events(db_path, max(0, watermark - count))
-        self.logger.info("网关账本：当前水位 {}，取回 {} 条", watermark, len(events))
-        return events[-count:]
+        events = _scan_gateway_tail(db_path, count)
+        self.logger.info("网关账本：取回 {} 条", len(events))
+        return events

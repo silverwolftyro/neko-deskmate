@@ -65,15 +65,41 @@ def test_events_registered() -> None:
             registered[meta.id] = meta
 
     assert set(registered) == {
-        "startup", "shutdown", "config_change", "status", "dump_events", "watch",
+        "startup", "shutdown", "config_change", "status", "dump_events", "scan_now", "watch",
     }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"
     assert registered["shutdown"].event_type == "lifecycle"
     assert registered["config_change"].event_type == "lifecycle"
     assert registered["status"].event_type == "plugin_entry"
     assert registered["dump_events"].event_type == "plugin_entry"
+    assert registered["scan_now"].event_type == "plugin_entry"
     # 常驻观测轮询必须是 timer，不能是 entry——entry 只在被调用时跑
     assert registered["watch"].event_type == "timer"
+
+
+def test_observation_lives_in_the_timer_not_in_an_entry() -> None:
+    """观测必须在 timer 里，不能挪进 status / dump_events / scan_now。
+
+    entry 只在被调用时跑：把观测搬进入口，等于"没人点就完全不观测"。
+    scan_now 是刻意的例外——它是**只读诊断**，见它自己的文档字符串。
+    """
+    import inspect
+
+    module = __import__("plugin.plugins.agent_deskmate", fromlist=["*"])
+    cls = module.AgentDeskmatePlugin
+
+    timers = [
+        meta.id for meta in (
+            getattr(getattr(cls, name), "__neko_event_meta__", None)
+            for name in dir(cls)
+        )
+        if meta is not None and meta.event_type == "timer"
+    ]
+    assert timers == ["watch"]
+
+    for entry_name in ("status", "dump_events", "scan_now"):
+        source = inspect.getsource(getattr(cls, entry_name))
+        assert "_poll_once" not in source, f"{entry_name} 里出现了常驻轮询调用"
 
 
 def test_source_constant_is_plugin_id() -> None:
