@@ -15,6 +15,23 @@ auto_start = false
 # L0 规则层：同一事件在该秒数内合并成一条播报（防刷屏）。
 coalesce_seconds = 60
 
+# 播报正文是否原样写进插件日志。
+#   true  = 写，但写之前先脱敏（-p<密码>、--token/--api-key 的值、password=、
+#           api_key=、sk-…、Bearer … 一律打成 ***）
+#   false = 只写「命令长度 + 前 40 字」（照样先脱敏）
+# 聊天窗里给人看的永远是原文——打码只针对落盘日志。
+log_commands = true
+
+# 审批中继（M0-lite-5）：本地 HTTP 服务监听端口，只绑 127.0.0.1。
+# 改这个值必须同时改 hooks.json 里的 url，否则 Claude Code 的
+# PermissionRequest hook 打不到插件（启动时若发现两边不一致会打错误日志）。
+approval_port = 48921
+
+# 审批等待上限（秒）。超时按"拒绝"回填——审批类交互宁可慢一步，
+# 也不能无人点击就一直挂着。Claude Code 的 hook 默认超时是 600s，
+# 所以这个值要明显小于 600。
+approval_timeout_seconds = 60
+
 # 停滞判定：同一会话超过该分钟数没有新事件且未结束，报一次。
 stall_minutes = 10
 

@@ -44,6 +44,55 @@ SEVERITY_LABEL = {
 
 _PUSH_REJECTION_INFO = frozenset({"backpressure", "transport_error", "transport_unavailable"})
 
+# ── 日志脱敏 ────────────────────────────────────────────────────────────────
+# 播报正文要给人看，不能打码；但**日志会落盘**，命令里可能带密钥。
+# AGENTS.md 要求不得记录会话文本/密钥——这里用"写日志前打码"落地，
+# 而不是把日志删掉（排查时还要靠它确认到底播了什么）。
+#
+# 覆盖：-p<密码>、--token/--api-key/--password 后的值、password=…、
+# api_key=…、sk-…、Bearer …。宁可比必要多打一点——漏一个密钥比多几个
+# *** 严重得多。
+
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Bearer 令牌必须排在 KEY=value 之前：否则 `Authorization: Bearer eyJ…`
+    # 会先被后者匹配成 `Authorization=***`，把真正的令牌原样留下。
+    (re.compile(r"(?i)\bbearer\s+\S+"), "Bearer ***"),
+    # Authorization 头整体打码。带 Bearer 的交给上一条处理（它已经吃掉令牌），
+    # 这里用负向断言避开，否则会留下一个多余的 ***。
+    (re.compile(r"(?i)\bauthorization\s*[=:]\s*(?!bearer\b)\S+"), "Authorization=***"),
+    # -p<密码> / -p <密码>（curl、mysql 等的惯用写法）
+    (re.compile(r"(?i)((?:^|\s)-p\s*)(\S+)"), r"\1***"),
+    # --token=xxx / --api-key xxx / --password=xxx
+    (re.compile(r"(?i)(--(?:token|api-key|apikey|password|passwd|secret)[= ]+)(\S+)"), r"\1***"),
+    # KEY=value / KEY: value（.env、JSON、URL query 的惯用写法）
+    (re.compile(r"(?i)\b(password|passwd|api_key|apikey|secret|token)\s*[=:]\s*\S+"),
+     r"\1=***"),
+    # OpenAI/DeepSeek 风格的 key
+    (re.compile(r"sk-[A-Za-z0-9_\-]{6,}"), "sk-***"),
+)
+
+# log_commands=false 时保留的原文长度
+LOG_COMMAND_HEAD_CHARS = 40
+
+
+def redact(text: str) -> str:
+    """把文本里的密钥形状打成 `***`。纯函数，便于单测。"""
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def for_log(text: str, *, log_commands: bool = True) -> str:
+    """写进日志前的最后一道处理。
+
+    总是先脱敏（关掉 log_commands 也要脱敏——前 40 字照样可能含密钥）；
+    ``log_commands=false`` 时进一步只留「长度 + 前 40 字」。
+    """
+    safe = redact(text)
+    if log_commands:
+        return safe
+    return f"命令 {len(text)} 字：{safe[:LOG_COMMAND_HEAD_CHARS]}"
+
 # 会话短 id 的长度。全 UUID 有 36 字符，在一行播报里纯属噪音。
 SESSION_SHORT_LEN = 8
 
@@ -188,11 +237,13 @@ class Broadcaster:
         *,
         source: str,
         coalescer: Any = None,
+        log_commands: bool = True,
     ) -> None:
         self._push = push
         self._logger = logger
         self._source = source
         self._coalescer = coalescer
+        self._log_commands = log_commands
         self.sent = 0
         self.rejected = 0
         self.coalesced = 0
@@ -217,25 +268,28 @@ class Broadcaster:
             )
         except Exception as exc:  # noqa: BLE001  播报失败绝不能炸掉观测循环
             self.rejected += 1
-            self._logger.warning("播报抛出异常（{}）：{}", type(exc).__name__, text)
+            self._logger.warning("播报抛出异常（{}）：{}", type(exc).__name__,
+                                 for_log(text, log_commands=self._log_commands))
             return "exception"
 
         return self._handle_result(result, hit, text)
 
     def _handle_result(self, result: object, hit: RuleHit, text: str) -> str:
+        # 聊天窗里给人看的是原文；落盘的一律过 for_log（脱敏 + 可选截断）
+        logged = for_log(text, log_commands=self._log_commands)
         if not isinstance(result, dict):
             self.rejected += 1
-            self._logger.warning("播报返回了非预期类型 {}：{}", type(result).__name__, text)
+            self._logger.warning("播报返回了非预期类型 {}：{}", type(result).__name__, logged)
             return "unexpected"
 
         if result.get("submitted") is True:
             self.sent += 1
-            self._logger.info("已播报 [{}] {}（累计 {} 条）", hit.severity, text, self.sent)
+            self._logger.info("已播报 [{}] {}（累计 {} 条）", hit.severity, logged, self.sent)
             return "sent"
 
         reason = str(result.get("reason") or "unknown")
         self.rejected += 1
         # payload_too_large 是永久性问题，值得 warning；其余是瞬时拥塞，info 就够
         level = self._logger.warning if reason not in _PUSH_REJECTION_INFO else self._logger.info
-        level("播报未被接受（{}）：[{}] {}", reason, hit.severity, text)
+        level("播报未被接受（{}）：[{}] {}", reason, hit.severity, logged)
         return reason

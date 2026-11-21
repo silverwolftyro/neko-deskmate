@@ -35,16 +35,22 @@ class FakeLogger:
         self.lines: list[tuple[str, str]] = []
 
     def _log(self, level: str, message: str, *args: object) -> None:
-        self.lines.append((level, message))
+        # 必须真的做 {} 插值：只存模板的话，"日志里不准出现密钥"这类断言
+        # 验的其实是模板字符串，等于没验。
+        try:
+            rendered = str(message).format(*args) if args else str(message)
+        except (IndexError, KeyError, ValueError):
+            rendered = f"{message} | args={args!r}"
+        self.lines.append((level, rendered))
 
     def info(self, message: str, *args: object) -> None:
-        self._log("info", message)
+        self._log("info", message, *args)
 
     def warning(self, message: str, *args: object) -> None:
-        self._log("warning", message)
+        self._log("warning", message, *args)
 
     def error(self, message: str, *args: object) -> None:
-        self._log("error", message)
+        self._log("error", message, *args)
 
 
 class RecordingPush:
@@ -364,3 +370,79 @@ def test_severity_and_attribution_stay_orthogonal() -> None:
                             source=attribute(_source(session="s"), mine_roots=[CWD]))
     assert unknown.severity == known.severity == SEVERITY_CRITICAL
     assert priority_for(unknown.severity) == priority_for(known.severity)
+
+
+# ── 日志脱敏（A） ───────────────────────────────────────────────────────────
+# 聊天窗给人看原文，落盘日志必须先打码：AGENTS.md 要求不得记录会话文本/密钥。
+# 这里不删日志（排查要靠它确认播了什么），只脱敏。
+
+from plugin.plugins.agent_deskmate.broadcast import for_log, redact  # noqa: E402
+
+
+@pytest.mark.parametrize("command,secret", [
+    ("mysql -u root -pSuperSecret123", "SuperSecret123"),
+    ("curl -p hunter2 https://x", "hunter2"),
+    ("deploy --token=ghp_ABCDEFGHIJKLMNOP", "ghp_ABCDEFGHIJKLMNOP"),
+    ("deploy --api-key sk-live-999888777", "sk-live-999888777"),
+    ("export password=MyPassw0rd", "MyPassw0rd"),
+    ("export api_key: abc123def456", "abc123def456"),
+    ("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9", "eyJhbGciOiJIUzI1NiJ9"),
+    ("neko --secret topsecret", "topsecret"),
+])
+def test_redact_removes_secret_values(command: str, secret: str) -> None:
+    assert secret not in redact(command)
+
+
+def test_redact_keeps_the_rest_readable() -> None:
+    """脱敏不能把整条命令打成马赛克——否则日志对排查没用。"""
+    text = redact("rm -rf build/ && echo ok")
+    assert text == "rm -rf build/ && echo ok"
+
+
+def test_redact_is_idempotent() -> None:
+    once = redact("mysql -pSecret123 -u root")
+    assert redact(once) == once
+
+
+def test_for_log_default_keeps_redacted_full_text() -> None:
+    text = for_log("mysql -pSecret123 -u root --database app", log_commands=True)
+    assert "Secret123" not in text
+    assert "--database app" in text      # 脱敏后仍保留可排查信息
+
+
+def test_for_log_disabled_keeps_only_length_and_head() -> None:
+    long_command = "rm -rf " + "x" * 200 + " -pSecret123"
+    text = for_log(long_command, log_commands=False)
+    assert "Secret123" not in text
+    assert f"命令 {len(long_command)} 字" in text
+    assert "x" * 200 not in text          # 超过 40 字的原文不落盘
+
+
+def test_for_log_disabled_still_redacts_the_head() -> None:
+    """关掉 log_commands 也要脱敏——前 40 字照样可能含密钥。"""
+    text = for_log("curl -H 'Authorization: Bearer sk-supersecretvalue' https://x",
+                   log_commands=False)
+    assert "sk-supersecretvalue" not in text
+
+
+def test_broadcast_log_is_redacted() -> None:
+    """端到端：含 sk- 的命令，日志里不得出现原文。"""
+    logger = FakeLogger()
+    push = RecordingPush()
+    hit = _hit(summary="删除文件：curl -H 'Authorization: Bearer sk-live-999888777' https://x")
+    Broadcaster(push, logger, source=SOURCE, log_commands=True).broadcast(hit)
+
+    assert push.calls[0]["parts"][0]["text"].count("sk-live-999888777") == 1  # 聊天窗保留原文
+    joined = " ".join(message for _, message in logger.lines)
+    assert "sk-live-999888777" not in joined
+    assert "***" in joined
+
+
+def test_broadcast_log_honours_log_commands_false() -> None:
+    logger = FakeLogger()
+    hit = _hit(summary="删除文件：" + "rm -rf " + "y" * 200)
+    Broadcaster(RecordingPush(), logger, source=SOURCE,
+                log_commands=False).broadcast(hit)
+    joined = " ".join(message for _, message in logger.lines)
+    assert "y" * 200 not in joined
+    assert "命令 " in joined

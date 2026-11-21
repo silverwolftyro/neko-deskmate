@@ -125,6 +125,18 @@ def _to_number(value: object, default: float) -> float:
     return result if result == result else default
 
 
+def _to_bool(value: object, default: bool) -> bool:
+    """配置里的布尔容错转换。只认显式的 true/false，其余（含 None）退回默认。"""
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off"):
+        return False
+    return default
+
+
 def _watch_section(config: dict[str, Any]) -> dict[str, Any]:
     """从 ``[agent_deskmate]`` 整节里取 ``watch`` 子表；没有就是空 dict。"""
     section = config.get("watch")
@@ -378,6 +390,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._broadcaster = Broadcaster(
             self.push_message, self.logger, source=SOURCE,
             coalescer=Coalescer(window_seconds=coalesce_seconds),
+            log_commands=_to_bool(config.get("log_commands"), True),
         )
         self.logger.info(
             "观测适配器就绪 transcript={} gateway={} 合并窗口={}s",
