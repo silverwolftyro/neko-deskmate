@@ -78,8 +78,10 @@ from .commands import (
     CONCLUSION_ALLOW,
     CONCLUSION_UNSURE,
     CONCLUSIONS,
+    MAX_CARD_ACTIONS,
     TIER_EXTREME,
     TIER_UNKNOWN,
+    all_action_phrases,
     card_lines,
     command_body_unknown,
     command_display_note,
@@ -973,6 +975,12 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
     # 执行者信息之前：它是关于"你看全了吗"的警告，得在按钮之前。
     note = command_display_note(command or tool_summary)
     note_html = f'<p class="src">{_escape(note)}</p>' if note else ""
+    # B3：一条命令里有多个动作时（`rm a && git reset --hard`），**每一段都要
+    # 列出来**，最危险的在前。老实现只列第一个——没被描述的动作等于被默认
+    # 批准，用户点"允许"时根本不知道还有第二个。超出的进「这是什么」。
+    action_html = "".join(f'<p class="act">{_escape(text)}</p>'
+                          for text in lines["actions"]) or \
+        f'<p class="act">{_escape(lines["action"])}</p>'
     # 结论行的取值受 advice_state 约束：**只有真的拿到了模型建议，
     # 结论才可能是"建议允许/建议拒绝"**。建议层降级时（没 key、没签字、
     # 调用失败、状态未知）一律落最保守的第三态——哪怕调用方误传了一个结论，
@@ -986,7 +994,7 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
         # 结论就该在那里。P3 的四行样例把结论排在最后，与 P2 的"置于最上"
         # 冲突；这里按 P2 排，因为 P2 给了理由（误读），P3 只给了内容清单。
         f'<p class="verdict"><strong>{_escape(conclusion_text)}</strong></p>',
-        f'<p class="act">{_escape(lines["action"])}</p>',
+        action_html,
         f"<p>{_escape(lines['consequence'])}</p>",
         f"<p>{_escape(lines['scope'])}</p>",
         warn_html,
@@ -1073,6 +1081,14 @@ def explain_request(*, tool_name: str, tool_summary: str,
     # 等宽块 + 保留换行：多行脚本要照着原样读才判断得准。
     if full_command.strip():
         explanation["full_command"] = full_command
+    # B3：一条命令里有多个动作时，主卡只列最危险的 ``MAX_CARD_ACTIONS`` 条，
+    # **剩下的在这里一条不少地列全**。主卡装不下不等于可以不知道——
+    # 那是"没被描述的动作被默认批准"的另一种形式。
+    if command.strip():
+        everything = all_action_phrases(command, working_directory)
+        if len(everything) > MAX_CARD_ACTIONS:
+            explanation["all_actions"] = "；".join(
+                text.lstrip("⚠️ ") for text in everything)
     # 讲多细由配置决定（规格 P5.3）。brief 只留结论与后果；standard 加范围
     # 与规则判据；detailed 再叠加模型给的理由与依据。
     # **full_command 不在这三个档次里被裁掉**：它是主卡看不全的那部分，
@@ -1113,6 +1129,9 @@ def build_explain_html(explanation: dict[str, str]) -> str:
         # 先看清事实，再看别人的意见。
         + (f"<pre class=\"cmd\">{_escape(explanation['full_command'])}</pre>"
            if explanation.get("full_command") else "")
+        # B3：主卡列不下的其余动作，一条不少地列在这里。
+        + (f"<p>这条命令里还有这些动作：{_escape(explanation['all_actions'])}</p>"
+           if explanation.get("all_actions") else "")
         + (f"<p class=\"src\">{_escape(explanation['model_note'])}</p>"
            if explanation.get("model_note") else "")
         + (f"<p><strong>{_escape(explanation['model_reason'])}</strong></p>"

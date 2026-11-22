@@ -27,14 +27,14 @@ from typing import Any
 from pydantic import Field
 
 from .commands import (
+    DELETE_PAIRS,
+    DELETE_TOKENS,
     PRINT_ONLY_COMMANDS,
-    TIER_EXTREME,
     TIER_SCOPE_UNKNOWN,
-    TIER_UNKNOWN,
     basename,
+    delete_tier_for_command,
     severity_for_tier,
     simple_commands,
-    tier_for_command,
 )
 from .events import (
     AttributionFields,
@@ -55,9 +55,8 @@ RULE_FAILURE = "failure"
 RULE_DELEGATION = "delegation"
 
 # 任务书点名的六个模式。大小写不敏感（PowerShell 本身不敏感）。
-DELETE_TOKENS = frozenset({"rm", "rmdir", "del", "remove-item"})
-DELETE_PAIRS = (("git", "clean"), ("drop", "table"))
-# 看帮助不等于真删文件；只在危险 token 是命令本身第一个 token 时豁免。
+# **词表本身已搬到 commands.py**（B3：所有命令词表同一个家，
+# 否则 B3 的危险度排序要么抄一份、要么反向 import）。这里只转发。
 HELP_FLAGS = frozenset({"--help", "-h", "/?", "-?"})
 
 # ── L2 只读白名单（B2）───────────────────────────────────────────────────
@@ -235,17 +234,15 @@ def _working_dir_of(source: UnifiedEvent | None) -> str | None:
 def delete_tier(command: str, working_directory: str | None = None) -> str:
     """一条删除命令的目标档位。闸门与词典共用这一个函数（B2）。
 
-    **删除动作但一个目标都没解析出来时抬到极高危**：`git clean -fdx`、
-    `rm -rf a b`（`a`/`b` 不打斜杠就不是"像路径的"目标）、目标被变量藏起来……
+    **删除动作但一个目标都没解析出来时抬到极高危**：`git clean -fdx`
+    （`clean` 是子命令不是路径）、目标被变量藏起来的 `rm`……
     B2 表把"无法解析的目标"归进极高危——说不清要删什么的时候，按最坏的猜。
+    （`rm -rf a b` 不在此列：`_looks_like_path` 默认算路径，两个都解析得出来。）
 
-    这个抬档放在这里而不是调用方里：``evaluate_delete``（播报）和
-    ``approval._classify``（闸门）都要走同一条，放在任一侧都会让另一侧漂移。
+    抬档规则在 ``commands.delete_tier_for_command`` 里（B3 搬过去的），
+    播报、闸门、卡片排序共用同一处：放在任一侧都会让另一侧漂移。
     """
-    tier = tier_for_command(command, working_directory)
-    if tier == TIER_UNKNOWN:
-        return TIER_EXTREME
-    return tier
+    return delete_tier_for_command(command, working_directory)
 
 
 def evaluate_delete(command: str, *, agent: str = "", session: str = "",

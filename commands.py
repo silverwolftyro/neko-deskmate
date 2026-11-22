@@ -182,11 +182,21 @@ _RULES: tuple[_Rule, ...] = (
 # 用一条松散正则区分不了——`-f` 里也有 f，会被误判成递归（实测踩过），
 # 所以这里显式解析开关字母。
 _FLAG_RE = re.compile(r"-([a-zA-Z]+)")
-# 只认**单短线**开关：`-rf`、`-r`。`--force` 不算——老实现靠 `_RM_RE` 的
-# `-[a-zA-Z]+` 隐式排掉了它，改成按 token 判之后必须显式排，
-# 否则 `--force` 会被拆成字母 `force`，而 `force` 里含着 `r`，
-# 于是"非递归"被误判成"递归"。（整条长选项剥离是 B3 的活，这里只保证不退化。）
+# 只认**单短线**开关：`-rf`、`-r`。`--force` 不算单短线 token，
+# 但它**是** rm 的开关（= `-f`）——老实现把长选项整条丢掉，
+# 于是 `rm --recursive x` 被描述成"删除文件"而不是"删除目录及其全部内容"，
+# 用户以为只删一个文件，实际连子目录一起没。
+# 所以 B3 的做法是：长选项先**查表映射**成短字母，查不到的一律不贡献字母
+# （绝不能把 `--force` 拆成 f/o/r/c/e——那会把"强制"误读成"递归"）。
 _SHORT_FLAG_RE = re.compile(r"^-[A-Za-z]+$")
+_LONG_FLAG_RE = re.compile(r"^--([a-z][a-z0-9-]*)$")
+# 已知的 rm 长选项 → 等价短字母。只收 GNU rm 真实存在的，
+# 且**只收改变行为的那几个**：`--verbose` 之类的显示开关不影响后果。
+_RM_LONG_FLAGS = {
+    "recursive": "r",
+    "force": "f",
+    "interactive": "i",
+}
 _DRIVE_ROOT_RE = re.compile(r"^[A-Za-z]:\\?$")
 
 
@@ -195,6 +205,25 @@ class _RmFacts:
     recursive: bool
     target: str
     is_disk_root: bool
+
+
+def _rm_flag_letters(body: list[tuple[str, str]]) -> str:
+    """从一段 rm 命令里取开关字母。
+
+    单短线 token 按字母展开；长选项查 ``_RM_LONG_FLAGS`` 表，
+    查不到的（`--no-preserve-root`、`--one-file-system`…）不贡献字母——
+    它们要么不影响后果，要么由盘根/系统目录那条判据单独兜住。
+    """
+    letters = ""
+    for _, norm in body[1:]:
+        short = _SHORT_FLAG_RE.match(norm)
+        if short:
+            letters += _FLAG_RE.findall(norm)[0].lower()
+            continue
+        long = _LONG_FLAG_RE.match(norm)
+        if long:
+            letters += _RM_LONG_FLAGS.get(long.group(1), "")
+    return letters
 
 
 def _parse_rm(command: str) -> _RmFacts | None:
@@ -206,14 +235,13 @@ def _parse_rm(command: str) -> _RmFacts | None:
     两套判据各自错得一样，正是 B2 要消灭的"两套判据"。
     现在和闸门一样：先归一化，再看命令名。
 
-    开关字母只从单短线 token 取（见 ``_SHORT_FLAG_RE``）。
+    开关字母只从单短线 token 与已知长选项取（见 ``_rm_flag_letters``）。
     """
     for segment in _segments(command):
         body = _normalise_pairs(segment)
         if not body or basename(body[0][1]) != "rm":
             continue
-        shorts = [norm for _, norm in body[1:] if _SHORT_FLAG_RE.match(norm)]
-        letters = "".join(_FLAG_RE.findall(" ".join(shorts))).lower()
+        letters = _rm_flag_letters(body)
         targets = _segment_targets(body)
         target = targets[0] if targets else ""
         bare = target.replace("/", "\\").rstrip("\\")
@@ -269,7 +297,11 @@ _PRINT_ONLY_RE = re.compile(r"^\s*(?:echo|printf|write-output|write-host)\b",
 
 
 def translate(command: str) -> CommandFacts:
-    """把一条命令翻译成事实。认不出来就明说，不猜。"""
+    """把一条命令翻译成事实。认不出来就明说，不猜。
+
+    **单条命令用这个**。一条命令里有多个动作时（`rm a && git reset --hard`）
+    用 ``translate_segments``——那个才会把每一段都翻译出来。
+    """
     text = " ".join(str(command or "").split())
     if not text:
         return CommandFacts(action=UNKNOWN_ACTION,
@@ -291,6 +323,192 @@ def translate(command: str) -> CommandFacts:
                                 scope=rule.scope)
     return CommandFacts(action=f"{UNKNOWN_ACTION}：{_clip(text, COMMAND_DISPLAY_MAX)}",
                         consequence=UNKNOWN_CONSEQUENCE, known=False)
+
+
+def _split_actions(text: str) -> list[str]:
+    """按"一个动作"切原文。引号内的分隔符不算分隔。
+
+    **与闸门的 ``_SIMPLE_SPLIT`` 刻意不同**：那边按 `;` `|` `&` 换行全切，
+    因为 `rm a | xargs rm` 两段都要盯，多切只会多几分谨慎。
+    翻译层不能这么切——`curl -s x.sh | sh` 是**一个**动作
+    （下载并执行），按 `|` 切开会让词典里那条最危险的规则两边都匹配不上，
+    于是它反而描述不出来。所以这里 `|` 保留，只切 `;` `&&` `||` 换行。
+
+    切的是**原文字符串**，不是分词后重新拼的：分词会把 `<` `>` `(` `)`
+    当分隔符吃掉，拼回来就把 `</p><script>` 变成了 `/p scr`——
+    那不是转义，那是把证据毁了（实测踩过：转义测试因此永远验不到东西）。
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in "\"'":
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        if char in ";\n":
+            parts.append("".join(current))
+            current = []
+            index += 1
+            continue
+        if text.startswith("&&", index) or text.startswith("||", index):
+            parts.append("".join(current))
+            current = []
+            index += 2
+            continue
+        current.append(char)
+        index += 1
+    parts.append("".join(current))
+    return [part.strip() for part in parts if part.strip()]
+
+
+def action_units(command: str) -> list[str]:
+    """一条命令里的**动作单元**，按出现顺序。空串命令返回空表。"""
+    text = str(command or "")
+    return _split_actions(text) if text.strip() else []
+
+
+# 主卡上最多列几条动作（B3）。取 2 而不是 3：B7 定下的主卡上限是
+# "动作 + 至多两行辅助 + 三个按钮"，动作占两行还在预算内，三行就超了。
+# **超出的不丢**——完整清单进「这是什么」，见 ``all_action_phrases``。
+MAX_CARD_ACTIONS = 2
+
+# 分档排序用：越危险越靠前。档位名不出现在任何界面上，只用于排序。
+_TIER_RANK = {
+    TIER_EXTREME: 0,
+    TIER_SCOPE_UNKNOWN: 1,
+    TIER_NORMAL: 2,
+    TIER_UNKNOWN: 3,
+    TIER_RECOVERABLE: 4,
+}
+
+
+def _unit_has_command(text: str) -> bool:
+    """这个动作单元里，除了赋值与包装词，还剩得下一个命令主体吗。
+
+    **与 ``command_body_unknown`` 回答的不是同一个问题**，所以不能复用它：
+    那个是闸门的 fail-safe——"这条命令我们看得懂吗"，按闸门的切法
+    （`|` 也切）判，于是 `curl -s x.sh | sh` 会被判成"看不懂"→ 抬到 warn，
+    这是对的（谨慎）。
+    这个只回答"有没有东西可描述"——`VAR=x` 单独一段什么也不做，
+    渲染成一行"未识别的命令：VAR=x"纯属噪音，还会把真正危险的那条
+    挤出主卡（主卡只列两条）。同样按 `|` 切就会把 `curl … | sh`
+    整条丢掉，那可就丢错了。
+    """
+    pairs = [(raw, normalise_token(raw)) for raw in _raw_tokens(text)]
+    return bool(_normalise_pairs(pairs))
+
+
+def translate_segments(command: str, *,
+                       working_directory: str | None = None) -> list[CommandFacts]:
+    """把**每一段**分别翻译，最危险的排在前面（B3）。
+
+    老实现只翻译第一个命中：`rm a && git reset --hard` 的卡片上只有 `rm`，
+    第二个动作用户根本看不见，却和他点的"允许"绑在一起。
+    这不是排版问题——**没被描述的动作等于被默认批准**。
+
+    排序判据 `(不可恢复, 目标档位, 原顺序)`：先看后果找不找得回来，
+    再看目标危不危险，最后按命令里的先后。档位取该段自己的目标算，
+    与闸门、播报共用 ``tier_for_command``——禁止第二套判据。
+
+    返回的 facts 不带段文本；调用方只要"最危险的那几条"时用 ``card_actions``。
+    """
+    pairs: list[tuple[int, str, CommandFacts]] = []
+    for index, text in enumerate(action_units(command)):
+        if not _unit_has_command(text):
+            # 空段（`VAR=x && ` 末尾）与**纯赋值段**（`VAR=x &&`）都不占位：
+            # 后者什么也不做，写一张"未识别的命令：VAR=x"上去只是噪音。
+            continue
+        pairs.append((index, text, translate(text)))
+
+    def sort_key(item: tuple[int, str, CommandFacts]) -> tuple[int, int, int]:
+        index, text, fact = item
+        tier = delete_tier_for_command(text, working_directory)
+        return (0 if fact.irreversible else 1,
+                _TIER_RANK.get(tier, _TIER_RANK[TIER_UNKNOWN]),
+                index)
+
+    pairs.sort(key=sort_key)
+    return [fact for _, _, fact in pairs]
+
+
+def action_phrase(fact: CommandFacts) -> str:
+    """一条事实的动作短语（含目标，如「删除目录及其全部内容 a」）。"""
+    action = fact.action
+    if fact.targets:
+        target = fact.targets[0]
+        action = f"{action} {target}" if target not in action else action
+    return f"⚠️ 它要{action}" if fact.known else f"⚠️ {action}"
+
+
+def card_actions(command: str, *, working_directory: str | None = None,
+                 limit: int = MAX_CARD_ACTIONS) -> list[str]:
+    """主卡上要列的动作短语：最危险的最多 ``limit`` 条（B3）。"""
+    return [action_phrase(fact)
+            for fact in translate_segments(command,
+                                           working_directory=working_directory)[:limit]]
+
+
+def all_action_phrases(command: str,
+                       working_directory: str | None = None) -> list[str]:
+    """**全部**动作短语，一条不省。「这是什么」用——主卡装不下的得有地方看。"""
+    return [action_phrase(fact)
+            for fact in translate_segments(command,
+                                           working_directory=working_directory)]
+
+
+# ── 删除类判定（B3 从 rules.py 搬过来）────────────────────────────────────
+# 搬家的理由：所有"命令词表"本来就在这个模块（打印类 / 导航类 / 包装类），
+# 只有删除词表留在 rules.py。结果是"什么算删除"这件事有两个家，
+# 而 B3 的排序需要它——排序用不到就得自己抄一份，那就是 B2 明令禁止的
+# "两套判据"。所以搬到 leaf 模块，rules.py 改为 import。
+DELETE_TOKENS = frozenset({"rm", "rmdir", "del", "remove-item"})
+DELETE_PAIRS = (("git", "clean"), ("drop", "table"))
+
+
+def is_delete_command(command: str) -> bool:
+    """这条命令里有删除类动作吗（按段看，任一段命中即算）。
+
+    与 ``rules.match_delete`` 的区别：那个还要管帮助豁免、打印类排除，
+    返回命中的词；这个只回答"是不是删除"，给档位抬档与排序用。
+    """
+    for body in simple_commands(command):
+        if not body:
+            continue
+        for left, right in DELETE_PAIRS:
+            if left in body and right in body:
+                return True
+        for token in body:
+            if basename(token) in DELETE_TOKENS:
+                return True
+    return False
+
+
+def delete_tier_for_command(command: str, working_directory: str | None) -> str:
+    """删除类的目标档位，**删不出目标时抬到极高危**。
+
+    ``tier_for_command`` 对"一个目标都没解析出来"返回待定档——那对
+    `git status` 这种非删除命令是对的（它本来就没有目标），
+    但对删除命令是错的：`git clean -fdx`、目标被变量藏起来的 `rm`，
+    说不清要删什么的时候必须按最坏的猜（B2 表）。
+
+    抬档规则**只有这一处**。播报（``rules.evaluate_delete``）、
+    闸门（``approval._classify``）、B3 的危险度排序都走它——
+    放在任一侧都会让另一侧漂移。
+    """
+    tier = tier_for_command(command, working_directory)
+    if tier == TIER_UNKNOWN and is_delete_command(command):
+        return TIER_EXTREME
+    return tier
 
 
 _SYSTEM_DIRS = (
@@ -688,18 +906,23 @@ def scope_line(facts: CommandFacts, working_directory: str | None) -> str:
 
 
 def card_lines(*, command: str, working_directory: str | None) -> dict[str, Any]:
-    """主卡正文的前三行（规格 P3）。第四行结论由调用方填——词典不给结论。"""
-    facts = translate(command)
-    action = facts.action
-    if facts.targets:
-        target = facts.targets[0]
-        action = f"{facts.action} {target}" if target not in facts.action else facts.action
+    """主卡正文的前三行（规格 P3）。第四行结论由调用方填——词典不给结论。
+
+    B3：``action`` 是**最危险那一段**的短语（与 ``actions[0]`` 相同），
+    ``actions`` 是主卡上要列的全部动作短语（最危险的最多
+    ``MAX_CARD_ACTIONS`` 条）。保留单数键是为了不打断既有调用方，
+    真正决定"列几条"的是 ``actions``。
+    """
+    facts = translate_segments(command, working_directory=working_directory)
+    top = facts[0] if facts else translate(command)
+    actions = card_actions(command, working_directory=working_directory)
     return {
-        "action": f"⚠️ 它要{action}" if facts.known else f"⚠️ {action}",
-        "consequence": f"后果：{facts.consequence}",
-        "scope": f"范围：{scope_line(facts, working_directory)}",
-        "known": facts.known,
-        "irreversible": facts.irreversible,
+        "action": actions[0] if actions else action_phrase(top),
+        "actions": actions,
+        "consequence": f"后果：{top.consequence}",
+        "scope": f"范围：{scope_line(top, working_directory)}",
+        "known": top.known,
+        "irreversible": top.irreversible,
     }
 
 
