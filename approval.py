@@ -16,8 +16,15 @@
 到期（``timeout_mark_expired``，默认 570s = hook 600s 前 30s）时：
 用户没点 → **只把 pending 标成 ``expired``**——不拒绝、不回填、不记成"已拒绝"，
 响应体里不得出现任何 decision。用 503 + 无 decision 的响应体告诉宿主"插件没有
-决定"；真正拦住这次调用的是宿主自己的策略（``hooks.json`` 里的
-``onFailure:"block"``）。文案只写「宿主已自行处理，本插件未做判断」。
+决定"；中继把 503 翻成空对象 ``{}`` 打出来，Claude Code 回退到它自己的原生权限
+流程。文案只写「宿主已自行处理，本插件未做判断」。
+
+**``onFailure`` 刻意不配**（2026-11-22 更正，此前这里写反了）：
+早年的设想是让 ``hooks.json`` 带上 ``onFailure:"block"``，插件没启动时靠它拦住。
+真机实测否定了它：command hook 配上 block 之后，插件没启动 = 连接失败 =
+宿主按 block 处理 = **用户每一个权限请求全部卡死**。
+而 command hook 的默认失败语义本来就是非阻断——正好是我们要的。
+所以我们这边只保证"插件没决定时不假装有决定"，不靠宿主的 block 兜底。
 
 **L2 自动放行的时机是事件发生的那一刻，不是等到期。** 四条全中才自动 allow：
 用户已在 ``approval_authorize`` 确认授权文案、配置里 L1/L2 全开、风险 ≤ 阈值、
@@ -40,9 +47,12 @@
    拿它区分不了父子；但回填不需要区分，所以不影响正确性。
 4. **pending 到期不删**，标 ``expired`` 后按 ``retention_seconds`` 保留，
    以便事后查"当时到底问过什么"。
-5. **hooks.json 必须带 ``onFailure:"block"``。** 否则插件没起来、返回非 2xx
-   或超时，Claude Code 按"非阻断错误"处理 → **直接放行**。这是 fail-open，
-   对审批是灾难。我们到期时正是靠它把"没有决定"变成"拦住"。
+5. **hooks.json 刻意不带 ``onFailure:"block"``**（2026-11-22 更正，此前写反了）。
+   command hook 的默认失败语义是**非阻断**：插件没起来、返回非 2xx、超时，
+   Claude Code 都回退到它自己的原生权限弹窗。配上 ``onFailure:"block"`` 的话，
+   插件没启动就等于用户每一个权限请求全部卡死——真机实测确认过这个代价。
+   我们这边只保证"插件没有决定时不假装有决定"（503 + 空 decision），
+   不靠宿主的 block 兜底。
 
 官方回填格式（03-调研证据/06 §3.3）：::
 
@@ -303,9 +313,6 @@ def effective_max_severity(configured: str) -> str:
     if SEVERITY_ORDER[wanted] > SEVERITY_ORDER[AUTO_DECIDE_MAX_SEVERITY_CEILING]:
         return AUTO_DECIDE_MAX_SEVERITY_CEILING
     return wanted
-
-
-DEFAULT_MAX_SEVERITY = "notice"
 
 
 def auto_decide_gate(*, severity: str, ai_judgement: bool,
@@ -702,8 +709,9 @@ def hook_response(behavior: str, *, message: str = "") -> dict:
 def no_decision_response(*, reason: str, timeout_seconds: float) -> dict:
     """到期时的响应体：**不含任何 decision**。
 
-    配 503 一起用。宿主看到非 2xx 且 ``onFailure:"block"`` 已配置，
-    就会按它自己的失败策略处理（拦住这次调用）——那是宿主的决定，不是我们的。
+    配 503 一起用。宿主看到"插件没给决定"就按它自己的流程办
+    （command hook 的默认失败语义是非阻断，所以它回去弹原生权限框）。
+    那是宿主的决定，不是我们的——我们只说"我没有决定"。
     文案只写「宿主已自行处理，本插件未做判断」，不许出现"拒绝"字样。
 
     **F4（2026-11-21 真机实测）**：只写上面两句时，Claude Code 把到期理解成
@@ -1572,8 +1580,8 @@ class ApprovalGateway:
         with self._lock:
             for record in self._records.values():
                 if record.decided_by is None:
-                    # 关服务时还挂着的请求：我们不代用户决定，只标记，
-                    # 让宿主的 onFailure 策略去处理。
+                    # 关服务时还挂着的请求：我们不代用户决定，只标记。
+                    # 回给宿主的是"没有决定"，它自己会弹原生权限框。
                     record.decided_by = DECIDED_BY_EXPIRED
                     entry = self._write_audit_locked(record)
                     self._count_locked(record)
@@ -1624,7 +1632,10 @@ class ApprovalGateway:
         with self._lock:
             if record.decided_by is None:
                 # 到期：**只标记，不发任何决定、不记成拒绝**（规格 §2 硬规则 1）。
-                # 拦住这次调用的是宿主自己的 onFailure:"block"，不是我们的判断。
+                # 我们不假装有决定：回 503 + 空 decision，中继翻成空对象，
+                # Claude Code 回退到它自己的原生权限流程（2026-11-22：
+                # 这里原来写"拦住它的是宿主 onFailure:block"，写反了——
+                # 我们刻意不配 onFailure，靠的是"不假装决定"）。
                 self._mark_expired_locked(record)
 
         # 审计行与计数都必须在**投递之前**进内存：客户端一收到回填就可能来查，

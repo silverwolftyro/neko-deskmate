@@ -28,7 +28,11 @@ PLUGIN_DIR = Path(__file__).resolve().parents[1]
 _EXCLUDED_DIRS = {"__pycache__", ".github", ".vscode", ".idea", ".pytest_cache",
                   ".mypy_cache", ".ruff_cache", ".venv", ".git", ".agents",
                   ".claude", "dist", "build"}
-_EXCLUDED_FILES = {".DS_Store", "AGENTS.md", "CLAUDE.md", ".agents", ".claude"}
+# packager 自己排除的文件，加上**本机工具产物**：``uv run`` 会在插件目录留一个
+# ``uv.lock``，而它不在 include 白名单里 → "没有文件会被静默丢掉"这条不变式
+# 当场假失败（B6 实测踩过两次）。这些文件不是源码，该发布的判据不该管它们。
+_EXCLUDED_FILES = {".DS_Store", "AGENTS.md", "CLAUDE.md", ".agents", ".claude",
+                   "uv.lock"}
 _EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 
 
@@ -95,3 +99,16 @@ def test_include_patterns_are_not_too_broad(include: list[str]) -> None:
     """别图省事写个 "*"——那等于没写白名单。"""
     assert "*" not in include
     assert "**" not in include
+
+
+def test_tool_artifacts_are_not_treated_as_source(include: list[str]) -> None:
+    """B6：``uv run`` 留在插件目录的 ``uv.lock`` 不许让不变式假失败。
+
+    原来它会：``uv.lock`` 不在 include 白名单里，而 ``_shippable`` 把它
+    当成"该发布的源码" → ``test_every_shippable_file_is_covered`` 红，
+    红的原因跟"漏登记源码"毫无关系。那种假失败训练人忽略这条测试。
+    """
+    assert "uv.lock" in _EXCLUDED_FILES
+    # 反面证明它确实不在白名单里——否则这条测试什么都没有守住
+    assert not _matches("uv.lock", include)
+    assert "uv.lock" not in _shippable()

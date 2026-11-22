@@ -123,7 +123,11 @@ from .warncount import COUNTS_FILENAME
 # 聊天里显示的来源标签。红线 1：source 必须显式传，不能用默认空串。
 SOURCE = "agent_deskmate"
 
-STAGE = "M0-lite-4"
+# 当前阶段标记，原样出现在 status 入口的 ``stage`` 字段里。
+# **阶梯是规划期的产物，别把它当成"功能清单"读**——阶梯之外还做了
+# A 批（审批可信度）与 B 批（闸门与观测），见 README 的状态表。
+# 改这个值之前先看 README：两边对不上，用户会以为插件降级了。
+STAGE = "M0-lite-6"
 
 # dump_events 读转录时往回扫的字节数。转录单文件可到数 MB，全量倒进来没意义。
 TRANSCRIPT_TAIL_BYTES = 65536
@@ -781,6 +785,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._broadcaster = None
         # B4：各观测源上一次报错的时间，用于限频（见 ``_poll_source``）。
         self._source_error_at: dict[str, float] = {}
+        # B6：各观测源的真实就绪状态（见 ``_adapter_status``）。
+        self._source_state: dict[str, str] = {}
         self.logger.info("配置已变更，观测适配器将在下一轮重建（审批授权不受影响）")
         return Ok({"status": "reloaded"})
 
@@ -812,29 +818,43 @@ class AgentDeskmatePlugin(NekoPluginBase):
         section = _watch_section(config)
         projects_dir = _expand(section.get("claude_projects_dir"))
         db_path = _expand(section.get("cc_switch_db"))
-        if not (projects_dir is not None and projects_dir.is_dir()) \
-                and not (db_path is not None and db_path.is_file()):
+        transcript_ok = projects_dir is not None and projects_dir.is_dir()
+        gateway_ok = db_path is not None and db_path.is_file()
+        if not transcript_ok and not gateway_ok:
             self.logger.warning(
                 "两个观测源都不可用（transcript={} gateway={}），本轮跳过",
                 projects_dir or "未配置", db_path or "未配置",
             )
+            # 一个都配不了也要记状态：否则 status 永远显示"未启动"，
+            # 而真实原因是没配路径（B6）。
+            self._source_state["claude_code_transcript"] = (
+                "path_missing" if projects_dir is not None else "unconfigured")
+            self._source_state["gateway_metadata"] = (
+                "path_missing" if db_path is not None else "unconfigured")
             return None
 
         coalesce_seconds = _to_number(config.get("coalesce_seconds"), 60.0)
         # 路径配了但不存在时同样不建适配器——建了也只会 poll 出空，还误导日志。
-        self._transcript_adapter = (
-            ClaudeCodeAdapter(projects_dir)
-            if projects_dir is not None and projects_dir.is_dir() else None
-        )
+        # **每一源各自记一份真实状态**（B6）：老实现 status 里写死 "ready"，
+        # 用户看到 ready 就以为删除播报一定在，而适配器可能从没建起来。
+        # 假状态比没有状态更糟——它让排查从正确的方向开始错起。
+        self._transcript_adapter = ClaudeCodeAdapter(projects_dir) if transcript_ok else None
+        self._source_state["claude_code_transcript"] = (
+            "ready" if transcript_ok else
+            ("path_missing" if projects_dir is not None else "unconfigured"))
         # B4：网关适配器**单独兜**。它的构造就要读库（取当前 rowid 水位），
         # 库被锁 / 表被改名 / WAL 缺 -shm 都会在这里抛。
         # 老实现没有这一层：GatewayAdapter 一抛，_ensure_watchers 整轮失败，
         # 转录适配器永远建不起来——**网关坏了，删了什么都不播**。
         self._gateway_adapter = None
-        if db_path is not None and db_path.is_file():
+        self._source_state["gateway_metadata"] = (
+            "ready" if gateway_ok else
+            ("path_missing" if db_path is not None else "unconfigured"))
+        if gateway_ok:
             try:
                 self._gateway_adapter = GatewayAdapter(db_path)
             except GatewayReadError as exc:
+                self._source_state["gateway_metadata"] = "init_failed"
                 self.logger.warning(
                     "网关观测源建不起来（{}），本轮起只有转录生效：{}",
                     type(exc).__name__, exc)
@@ -1550,10 +1570,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
             source=SOURCE,
             stage=STAGE,
             uptime_sec=uptime,
-            adapters={
-                "claude_code_transcript": "ready",
-                "gateway_metadata": "ready",
-            },
+            adapters=self._adapter_status(),
             approval=self._approval.stats() if self._approval is not None else {"running": 0},
             authorization=(self._approval.authorization_snapshot()
                            if self._approval is not None else None),
@@ -1561,6 +1578,18 @@ class AgentDeskmatePlugin(NekoPluginBase):
             hook=self._hook_status(),
             model=self._model_status(),
         )
+
+    # 观测源的真实状态（B6）。老实现 status 里写死 "ready"，
+    # 那是**假状态**：用户看到 ready 就以为删除播报一定在，
+    # 而适配器可能压根没建起来（没配路径 / 路径不存在 / 库读不了）。
+    # 排查时假状态比没有状态更糟——它让人从错的方向开始查。
+    # 取值：not_started / unconfigured / path_missing / init_failed / ready。
+    _ADAPTER_SOURCES = ("claude_code_transcript", "gateway_metadata")
+
+    def _adapter_status(self) -> dict[str, str]:
+        """各观测源的当前状态。``_ensure_watchers`` 每次重建时刷新。"""
+        return {name: self._source_state.get(name, "not_started")
+                for name in self._ADAPTER_SOURCES}
 
     def _hook_status(self) -> dict[str, Any]:
         """审批 hook 装没装、装的是哪个端口。只读，不发起任何请求。"""

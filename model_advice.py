@@ -53,23 +53,15 @@ SUGGEST_DENY = "deny"
 SUGGEST_UNSURE = "unsure"
 SUGGESTIONS = (SUGGEST_ALLOW, SUGGEST_DENY, SUGGEST_UNSURE)
 
-# 取值 → 给人看的那几个字。**必须在卡片侧用这张表翻译，不能直接显示 token**：
-# 直接显示的话卡片上会出现"建议：allow"这种机器词（2026-11-22 真机事故的
-# 同族第二例，被链路测试当场抓住）。表跟着取值定义在同一个模块里，
-# 所以加一种建议时很难只加一半。
-SUGGESTION_TEXT = {
-    SUGGEST_ALLOW: "倾向放行",
-    SUGGEST_DENY: "倾向别放行",
-    SUGGEST_UNSURE: "不确定",
-}
 # 认不出的取值显示成什么。取最保守的那个——宁可说"不确定"，
 # 也不把一个来路不明的 token 印在卡片上。
 SUGGESTION_FALLBACK = SUGGEST_UNSURE
 
-
-def suggestion_text(suggestion: str) -> str:
-    """建议取值 → 人话。认不出的按"不确定"显示，绝不外溢原始 token。"""
-    return SUGGESTION_TEXT.get(suggestion, SUGGESTION_TEXT[SUGGESTION_FALLBACK])
+# 这里原来还有一张取值 → 中文建议词的对照表和一个查表函数。
+# **B6 删掉了：全项目零调用点**——结论行的三态文案在 commands.CONCLUSIONS 里，
+# 卡片渲染走 approval.safe_conclusion，从来不走那张表。
+# 留着它的害处是双份真相：哪天改了那张表，卡片上一个字都不会变，
+# 而改的人以为改过了。取值常量本身（SUGGEST_ALLOW …）仍在用，不删。
 
 # 模型输出的三个固定 token。**单独一行，整行精确匹配**（见 _parse）。
 # 第一版用的是中文词表包含判断（"不放行"里含"放行" → 判成 allow），

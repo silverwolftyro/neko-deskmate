@@ -93,12 +93,15 @@ class WatcherHost:
     _ensure_watchers = AgentDeskmatePlugin._ensure_watchers
     _poll_source = AgentDeskmatePlugin._poll_source
     _poll_once = AgentDeskmatePlugin._poll_once
+    _adapter_status = AgentDeskmatePlugin._adapter_status
+    _ADAPTER_SOURCES = AgentDeskmatePlugin._ADAPTER_SOURCES
 
     def __init__(self) -> None:
         self._broadcaster = None
         self._transcript_adapter = None
         self._gateway_adapter = None
         self._source_error_at: dict[str, float] = {}
+        self._source_state: dict[str, str] = {}
         self.logger = ListLogger()
         self.push_message = RecordingPush()
 

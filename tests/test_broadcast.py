@@ -441,9 +441,30 @@ def test_redact_masks_a_pem_private_key_block_whole() -> None:
 
 
 def test_redact_masks_a_long_undelimited_token() -> None:
-    """40 字以上、没有分隔的一整块，按"形状像令牌"打掉。"""
-    token = "a" * 48
+    """40 字以上、无分隔、**形状像令牌**（同时含字母与数字）的一整块打掉。
+
+    B6 收窄了判据。老规则只要"40 字以上的 [A-Za-z0-9_-]"，于是纯字母的长串
+    （不带引号的 ``git commit -m``、长标识符）也被打成马赛克——
+    日志反而看不出当时跑了什么。所以现在要求同时含字母和数字。
+    """
+    token = "a1b2c3d4e5" * 5                      # base64 形状：字母 + 数字
+    assert len(token) >= 40
     assert token not in redact(f"curl -H 'X-Api: {token}' https://x")
+    # 纯十六进制长串（git sha / md5）也打
+    sha = "d41d8cd98f00b204e9800998ecf8427e" * 2
+    assert sha not in redact(f"git checkout {sha}")
+
+
+def test_redact_leaves_pure_letter_runs_alone() -> None:
+    """B6 收窄的另一面：纯字母长串不是密钥形状，不打。
+
+    那条最常见的真实场景是 `git commit -m` 里一句不带引号的长说明——
+    把它打成 *** 之后，日志里"当时提交了什么"就再也看不出来了。
+    """
+    words = "a" * 48
+    assert redact(f"git commit -m {words}") == f"git commit -m {words}"
+    slug = "someverylongidentifierwithoutanydigitsinit"
+    assert slug in redact(f"npm run {slug}")
 
 
 def test_redact_leaves_long_urls_and_paths_alone() -> None:
