@@ -71,12 +71,19 @@ class RecordingPush:
 def _delete_hit(command: str = "rm -rf D:/other/x.txt"):
     """删除类命中的样本。
 
-    **刻意用工作区外的路径**：B2 之后删除按目标分档，`rm -rf build/`
-    落在"可恢复"档、播报前缀是【提示】。下面这些用例测的是严重度渲染本身，
-    用一个极高危目标才能继续验【严重】那条路。可恢复档另见
+    **刻意用工作区外的路径 + 显式给一个工作目录**：B2 之后删除按目标分档，
+    `rm -rf build/` 落在"可恢复"档、播报前缀是【提示】；而 B8 之后
+    "没有工作目录"落「范围未知」档、前缀是【警告】。
+    下面这些用例测的是【严重】那条路本身，所以两头都得钉住：
+    目标在工作区外、且我们确实知道工作目录。可恢复档另见
     ``test_recoverable_target_downgrades_the_broadcast``。
     """
-    return evaluate_delete(command, agent="claude-code", session="s1", ts="t")
+    source = UnifiedEvent(agent="claude-code", session="s1", event="tool_use",
+                          tool="Bash", command=command, ts="t",
+                          executor="claude-code",
+                          working_directory=r"D:\workspace\proj")
+    return evaluate_delete(command, agent="claude-code", session="s1", ts="t",
+                           source=source)
 
 
 # ── 严重度 → priority ─────────────────────────────────────────────────────

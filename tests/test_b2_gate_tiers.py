@@ -33,6 +33,7 @@ from plugin.plugins.agent_deskmate.commands import (
     TIER_EXTREME,
     TIER_NORMAL,
     TIER_RECOVERABLE,
+    TIER_SCOPE_UNKNOWN,
     TIER_UNKNOWN,
     TIERS,
     delete_targets,
@@ -117,10 +118,22 @@ def test_unparseable_targets_are_never_below_warn() -> None:
         assert _risk(command)[0] in ("warn", "critical")
 
 
-def test_missing_working_directory_means_worst_case() -> None:
-    """不知道工作目录 → 说不清在不在范围内 → 按最坏的猜。"""
-    assert _risk("rm -rf x", None)[0] == "critical"
-    assert assess_tier("Bash", {"command": "rm -rf x"}, None) == TIER_EXTREME
+def test_missing_working_directory_is_scope_unknown_not_extreme() -> None:
+    """B8：拿不到工作目录 → 「范围未知」档，**不再按最坏的猜**。
+
+    老实现这里返回极高危，实测后果是同一条命令两个结论：
+    审批卡片（hook 带 cwd）说 notice，播报（转录缺 cwd）说 critical。
+    用户见到红条就点确认，红条就是这么贬值的。
+
+    范围未知的 severity 仍是 warn（不低于 notice、仍要人点），
+    但不再冒充"它在工作区外"这个我们并不掌握的事实。
+    """
+    assert assess_tier("Bash", {"command": "rm -rf x"}, None) == TIER_SCOPE_UNKNOWN
+    assert _risk("rm -rf x", None)[0] == "warn"
+    # 家目录/系统目录与工作目录无关，照样极高危
+    assert assess_tier("Bash", {"command": "rm -rf ~"}, None) == TIER_EXTREME
+    # 目标解析失败是**另一回事**，仍按最坏的猜
+    assert assess_tier("Bash", {"command": "rm -rf $(cat p)"}, None) == TIER_EXTREME
 
 
 # ── 词典与闸门共用一套判据 ────────────────────────────────────────────────

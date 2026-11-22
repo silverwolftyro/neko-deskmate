@@ -48,6 +48,7 @@ from plugin.sdk.plugin import (
 
 from .adapters import ClaudeCodeAdapter, GatewayAdapter
 from .adapters.claude_code import (
+    CwdCache,
     iter_transcript_files,
     read_new_transcript_events,
 )
@@ -410,7 +411,10 @@ def _scan_transcript_tail(projects_dir: Path, count: int) -> list[UnifiedEvent]:
     size = newest.stat().st_size
     offset = max(0, size - TRANSCRIPT_TAIL_BYTES)
     events, _ = read_new_transcript_events(newest, offset)
-    return events[-count:]
+    # B8：诊断也要走同一条 cwd 线索，否则"预计播 N 条【严重】"
+    # 与常驻轮询实际播的【警告】对不上——诊断自己就成了第二套判据。
+    # 用一次性缓存（这一批内部沿用即可，跨批次不借）。
+    return CwdCache().fill(events)[-count:]
 
 
 def _scan_gateway_tail(db_path: Path, count: int) -> list[UnifiedEvent]:

@@ -126,8 +126,10 @@ def test_evaluate_delete_severity_follows_the_target_tier() -> None:
     assert severity_of("rm -rf D:/workspace/proj/src") == SEVERITY_WARN  # 工作区内
     assert severity_of("rm -rf node_modules") == SEVERITY_NOTICE        # 可重建
     assert severity_of("rm -rf build") == SEVERITY_NOTICE
-    # 拿不到工作目录 → 说不清在不在范围内 → 按最坏的猜
-    assert severity_of("rm -rf x", None) == SEVERITY_CRITICAL
+    # 拿不到工作目录 → **范围未知**档（B8），不是按最坏的猜。
+    # 老实现这里返回 critical，实测后果是同一条命令两个结论：
+    # 审批卡片（hook 带 cwd）说 notice，播报说 critical。
+    assert severity_of("rm -rf x", None) == SEVERITY_WARN
 
 
 def test_evaluate_delete_none_on_safe() -> None:

@@ -29,6 +29,7 @@ from pydantic import Field
 from .commands import (
     PRINT_ONLY_COMMANDS,
     TIER_EXTREME,
+    TIER_SCOPE_UNKNOWN,
     TIER_UNKNOWN,
     basename,
     severity_for_tier,
@@ -261,12 +262,19 @@ def evaluate_delete(command: str, *, agent: str = "", session: str = "",
     matched = match_delete(command)
     if matched is None:
         return None
+    tier = delete_tier(command, _working_dir_of(source))
+    summary = f"删除文件：{_clip(command)}"
+    if tier == TIER_SCOPE_UNKNOWN:
+        # B8：范围未知时必须**明说**，不许拿【严重】冒充一个我们并不掌握的
+        # 事实（"它在工作区外"）。用户看到的是【警告】+ 这句解释，
+        # 而不是一条每次都对的红字——对得多了，红字就不值钱了。
+        summary += "；这条记录没带工作目录，说不清在不在工作区外"
     return RuleHit(
         rule=RULE_DELETE,
-        severity=severity_for_tier(delete_tier(command, _working_dir_of(source))),
+        severity=severity_for_tier(tier),
         # 文案模版用「删除文件」而不是「删除类操作」——后者是内部术语，
         # 用户在 3 秒内要读懂的是"发生了什么"，不是我们的规则分类。
-        summary=f"删除文件：{_clip(command)}",
+        summary=summary,
         matched=matched,
         agent=agent,
         session=session,

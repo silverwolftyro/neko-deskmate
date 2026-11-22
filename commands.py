@@ -75,12 +75,21 @@ UNKNOWN_CONSEQUENCE = "看不出这一步最坏会怎样"
 # 后果是删 `node_modules` 和删 `~` 顶同一根红条——用户见到红条就点确认，
 # 闸门就是这么贬值的。改成**先解析目标路径集合，再按目标所在位置分档**。
 #
-# 四档（B2 表 + 「没见过的默认待定」）：
+# 目标档位（B2 表 + B8 的「范围未知」档）：
 TIER_RECOVERABLE = "recoverable"   # 删了重建得回来：依赖 / 构建产物 / 缓存
 TIER_NORMAL = "normal"             # 工作区内的其他路径
 TIER_EXTREME = "extreme"           # 工作区外 / 家目录 / 盘根 / 系统目录 / 目标不可解析
-TIER_UNKNOWN = "unknown"           # 解析不出目标、效果说不清 → 至少告警档
-TIERS = (TIER_RECOVERABLE, TIER_NORMAL, TIER_EXTREME, TIER_UNKNOWN)
+TIER_UNKNOWN = "unknown"           # 解析不出目标、效果说不清（删除类会再抬到极高危）
+# B8 新增：**目标解析得出来，但拿不到工作目录**——知道要删什么，
+# 不知道它在不在工作区外。这与"解析不出目标"是两件事，不能混成一档：
+# 后者是真不知道要删什么（按最坏的猜 → 极高危），前者是知道删什么、
+# 只是说不清位置（→ warn，文案明说）。老实现把两者都按最坏的猜，
+# 于是转录里每条缺 cwd 的删除都顶【严重】。
+TIER_SCOPE_UNKNOWN = "scope_unknown"
+TIERS = (TIER_RECOVERABLE, TIER_NORMAL, TIER_EXTREME, TIER_UNKNOWN,
+         TIER_SCOPE_UNKNOWN)
+# 从坏到好：多目标取最坏的一档时按这个顺序找。
+_WORST_FIRST = (TIER_EXTREME, TIER_SCOPE_UNKNOWN, TIER_NORMAL, TIER_RECOVERABLE)
 
 
 
@@ -597,8 +606,11 @@ def _tier_of_one(target: str, working_directory: str | None) -> str:
     if _is_home_or_root(target) or _is_system_path(target):
         return TIER_EXTREME
     if not working_directory:
-        # 不知道工作目录 → 说不清在不在范围内 → 按最坏的猜
-        return TIER_EXTREME
+        # B8：**拿不到工作目录 ≠ 最坏**。老实现这里返回极高危，于是转录里
+        # 每条缺 cwd 的删除都顶【严重】，而审批卡片（hook payload 带 cwd）
+        # 对同一条命令说 notice——两边说的不是一件事，用户只能不信其中一边。
+        # 改成「范围未知」档：知道要删什么，不知道它在不在工作区外。
+        return TIER_SCOPE_UNKNOWN
     if not _is_absolute(target):
         return TIER_NORMAL      # 相对路径：相对于会话工作目录，算在内
     return TIER_NORMAL if _under(target, working_directory) else TIER_EXTREME
@@ -616,7 +628,7 @@ def target_tier(targets: Any, *, working_directory: str | None,
         # 所以落待定档；删除类调用方会再把它抬到极高危（见 ``_classify``）。
         return TIER_UNKNOWN
     tiers = [_tier_of_one(t, working_directory) for t in usable]
-    for tier in (TIER_EXTREME, TIER_NORMAL, TIER_RECOVERABLE):
+    for tier in _WORST_FIRST:
         if tier in tiers:
             return tier
     return TIER_UNKNOWN
@@ -633,6 +645,9 @@ def severity_for_tier(tier: str) -> str:
     """目标档位 → 严重度（B2）。
 
     unknown 落 warn 而不是 notice：看不懂的命令按最坏的猜。
+    ``scope_unknown`` 同样落 warn：拿不到工作目录时我们**知道**要删什么，
+    只是说不清位置—— warn 表示"要留意、要人点"，又不用【严重】冒充一个
+    我们并不掌握的事实（B8）。
     这是 B1「归一化失败不得低于 notice」与 B2「没见过的默认待定」的交汇点。
     """
     return {
@@ -640,6 +655,7 @@ def severity_for_tier(tier: str) -> str:
         TIER_NORMAL: "warn",
         TIER_RECOVERABLE: "notice",
         TIER_UNKNOWN: "warn",
+        TIER_SCOPE_UNKNOWN: "warn",
     }.get(tier, "warn")
 
 

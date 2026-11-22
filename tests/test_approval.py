@@ -286,11 +286,28 @@ def test_tool_summary_never_dumps_the_whole_input() -> None:
 # ── 风险判定（L0，不接模型） ────────────────────────────────────────────────
 
 def test_assess_risk_marks_delete_as_critical() -> None:
-    severity, rule, action_class = assess_risk("Bash", {"command": "rm -rf /tmp/x"})
+    # 显式给工作目录：目标 `/tmp/x` 在它外面 → 极高危。
+    # （不给工作目录时落「范围未知」档 = warn，见下面那条——
+    #  B8 把"没有线索"和"确实在工作区外"分开了。）
+    severity, rule, action_class = assess_risk(
+        "Bash", {"command": "rm -rf /tmp/x"}, r"D:\workspace\proj")
     assert severity == "critical"
     assert rule == "delete"
     # 类别才是门控认的那一维；规则名会随规则库变，类别不会（规格 §16.3 C3）
     assert action_class == ACTION_CLASS_IRREVERSIBLE
+
+
+def test_assess_risk_without_cwd_is_scope_unknown_not_critical() -> None:
+    """B8：拿不到工作目录 → 范围未知（warn），不再冒充 critical。
+
+    这不是把安全放松了：warn 仍高于默认阈值 notice，仍然要人点；
+    而且删除命令永远进不了 L2 只读白名单，所以照样不会被自动放行。
+    换来的是播报不再对每条缺 cwd 的删除都喊狼来了。
+    """
+    severity, rule, action_class = assess_risk("Bash", {"command": "rm -rf x"})
+    assert severity == "warn"
+    assert rule == "delete"
+    assert action_class == ACTION_CLASS_RECOVERABLE
 
 
 @pytest.mark.parametrize("command", ["ls -la", "git status", "npm run build"])
@@ -308,8 +325,9 @@ def test_assess_risk_ignores_non_bash_tools() -> None:
         "notice", "", ACTION_CLASS_RECOVERABLE)
     assert assess_risk("Bash", None) == (
         "notice", "", ACTION_CLASS_RECOVERABLE)
+    # 相对路径 + 没有工作目录 → 范围未知（B8），不是 critical
     assert assess_risk("Bash", {"command": "rm -rf x"}) == (
-        "critical", "delete", ACTION_CLASS_IRREVERSIBLE)
+        "warn", "delete", ACTION_CLASS_RECOVERABLE)
 
 
 # ── 三层门控（规格 §1） ─────────────────────────────────────────────────────

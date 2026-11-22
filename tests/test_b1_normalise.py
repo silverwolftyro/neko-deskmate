@@ -20,6 +20,7 @@ import pytest
 
 from plugin.plugins.agent_deskmate.approval import assess_risk, assess_tier
 from plugin.plugins.agent_deskmate.commands import (
+    TIER_SCOPE_UNKNOWN,
     command_body_unknown,
     delete_targets,
     simple_commands,
@@ -163,11 +164,23 @@ def test_unreadable_commands_never_fall_below_warn() -> None:
     assert action_class == "recoverable"
 
 
-def test_no_working_directory_means_worst_case() -> None:
-    """拿不到 cwd → 说不清在不在工作区内 → 按最坏的猜。"""
-    assert assess_risk("Bash", {"command": "rm -rf x"}, None)[0] == "critical"
-    # 但认得出的只读命令不受影响
+def test_no_working_directory_is_not_the_same_as_worst_case() -> None:
+    """B8 改了这里的老口径。
+
+    老实现：拿不到 cwd → 按最坏的猜 → critical。
+    实测后果：转录里每条缺 cwd 的删除都顶【严重】，而审批卡片
+    （hook payload 带 cwd）对同一条命令说 notice——**同一动作两个结论**。
+    现在落「范围未知」档：severity 仍是 warn（不低于 notice、仍要人点），
+    但不再冒充一个我们并不掌握的事实（"它在工作区外"）。
+    """
+    assert assess_risk("Bash", {"command": "rm -rf x"}, None)[0] == "warn"
+    assert assess_tier("Bash", {"command": "rm -rf x"}, None) == TIER_SCOPE_UNKNOWN
+    # 与工作目录无关的判据不受影响：家目录/系统目录照样极高危
+    assert assess_risk("Bash", {"command": "rm -rf ~"}, None)[0] == "critical"
+    # 认得出的只读命令也不受影响
     assert assess_risk("Bash", {"command": "ls -la"}, None)[0] == "notice"
+    # 目标解析失败（另一回事）仍然极高危
+    assert assess_risk("Bash", {"command": "rm -rf $(cat p)"}, None)[0] == "critical"
 
 
 def test_non_bash_tools_are_untouched() -> None:

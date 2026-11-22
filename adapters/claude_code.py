@@ -58,12 +58,71 @@ def read_new_transcript_events(path: Any, offset: int = 0) -> tuple[list[Unified
     return events, consumed
 
 
+class CwdCache:
+    """会话级 cwd 缓存（B8）。
+
+    **先说实测**：当前版本 Claude Code 的 ``assistant`` 记录**100% 带 cwd**
+    （本机 28 个转录文件、5053 条 assistant 记录，0 条缺失）。
+    任务书 B8 记的"该行 has_cwd = False"在现版本上复现不出来——
+    那个 4612/9008 是**所有记录类型**的比例（``attachment``/``user``/
+    ``ai-title`` 也占一半），而产生事件的只有 ``assistant`` 与 ``system``。
+
+    所以这道缓存**不是当前的主路径，是兜底**：它保证"真出现缺 cwd 的记录时"
+    有一个说得过去的答案，而不是每次都对的红字。留着它的理由很便宜——
+    三十行纯内存状态，换掉的是"缺一条线索就升级成【严重】"这个行为。
+
+    规则：同一会话里**首个带 cwd 的记录**记下来，后续缺 cwd 的记录沿用。
+    跨会话不借（会话之间没有理由共享目录）；只在内存里，不落盘。
+
+    这是**推断**，不是事实：会话中途 ``cd`` 过，沿用的就是旧目录。
+    所以它只用来把"完全没线索"提升到"有一条线索"，
+    真沿不到（整条会话都没出现过 cwd）时档位落 ``scope_unknown``
+    并由播报文案明说，而不是继续冒充【严重】。
+
+    已知边界：适配器首次见到文件时只记水位、不解析历史（否则会把几个月的
+    转录全量倒进来播一遍），所以缓存从**第一次读到的记录**开始热。
+    """
+
+    def __init__(self) -> None:
+        self._by_session: dict[str, str] = {}
+
+    def remember(self, session: str, cwd: str | None) -> None:
+        """记下一条记录给出的 cwd。空值不记账（不许用 None 覆盖已知值）。"""
+        text = str(cwd or "").strip()
+        if session and text:
+            self._by_session[session] = text
+
+    def fill(self, events: list[UnifiedEvent]) -> list[UnifiedEvent]:
+        """按顺序给这批事件补 cwd，返回新列表（不改原对象）。
+
+        顺序很重要：必须先见到带 cwd 的那条，后面的才有的沿用。
+        调用方按文件顺序喂进来即可（适配器本来就是顺序读的）。
+        """
+        filled: list[UnifiedEvent] = []
+        for event in events:
+            self.remember(event.session, event.working_directory)
+            if event.working_directory or not event.session:
+                filled.append(event)
+                continue
+            inherited = self._by_session.get(event.session)
+            if not inherited:
+                filled.append(event)
+                continue
+            filled.append(event.model_copy(update={
+                "working_directory": inherited,
+            }))
+        return filled
+
+
 class ClaudeCodeAdapter:
     """一次会话一个 offset 的 tail 器。offset 存在内存里，重启后从末尾开始。"""
 
     def __init__(self, projects_dir: Any) -> None:
         self.projects_dir = Path(projects_dir)
         self._offsets: dict[str, int] = {}
+        # B8：跨轮次记住每个会话的 cwd。放在适配器里而不是全局——
+        # 它是"这一批观测源"的状态，跟 offset 一样重启即失效。
+        self._cwd = CwdCache()
 
     def available(self) -> bool:
         return self.projects_dir.is_dir()
@@ -82,4 +141,6 @@ class ClaudeCodeAdapter:
             new_events, new_offset = read_new_transcript_events(path, offset)
             self._offsets[key] = new_offset
             events.extend(new_events)
-        return events
+        # 补 cwd 放在**返回之前**：调用方（规则层、播报层）拿到的事件
+        # 必须已经带上这条线索，否则每个调用方都要自己记得补一遍。
+        return self._cwd.fill(events)
