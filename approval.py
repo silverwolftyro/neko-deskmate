@@ -78,10 +78,17 @@ from .commands import (
     CONCLUSION_ALLOW,
     CONCLUSION_UNSURE,
     CONCLUSIONS,
+    TIER_EXTREME,
+    TIER_UNKNOWN,
     card_lines,
+    command_body_unknown,
     command_display_note,
     conclusion_for,
+    severity_for_tier,
+    tier_for_command,
+    translate,
 )
+from .rules import delete_tier, l2_readonly_allowed, match_delete
 from .warncount import WarningCounter
 
 # 决策取值。只有用户点按钮、或 L2 在用户显式授权下自动放行，才能产生这两个值。
@@ -170,6 +177,9 @@ DEFAULT_ACTION_CLASS = ACTION_CLASS_RECOVERABLE
 
 # 严重度阶梯。与 rules.py 的取值一致，这里只用来比大小。
 SEVERITY_ORDER = {"info": 0, "notice": 1, "warn": 2, "critical": 3}
+# B1/B2 的兜底档：归一化之后仍看不懂的命令、以及解析不出目标的删除，
+# 一律落到 warn——"没见过的默认待定"，绝不进低风险。
+SEVERITY_WARN = "warn"
 
 # **极高危档本身不可被自动放行**（规格 §3 表：极高危"任何配置不得自动放行"）。
 # 这是独立于动作类别的第二道墙：万一将来某条规则忘了声明类别，
@@ -182,29 +192,100 @@ DEFAULT_MAX_SEVERITY = "notice"
 DEFAULT_RISK_SEVERITY = "notice"
 
 
-def assess_risk(tool_name: str, tool_input: Any) -> tuple[str, str, str]:
-    """评估一次工具调用。纯函数，不接模型。
+# 风险判定用的默认档：L0 规则没命中就当低风险。
+DEFAULT_RISK_SEVERITY = "notice"
 
-    返回 ``(severity, rule, action_class)``。5a 阶段只跑 L0 规则（删除类）——
-    没命中就按 ``notice``（低风险）算，**不猜**。模型判定是 5b 的事。
+# 审计里的规则名。**都是 Plain words，不许出现内部术语**——审计行会经
+# audit_list 显示给用户看，`irreversible` / `action_class` 这种词上过
+# A 批的禁用词清单，不能从后门绕回来。
+RULE_DELETE = "delete"        # 删除类（rm / del / rmdir / git clean …）
+RULE_DISCARD = "discard"      # 词典认得的不可恢复动作（git reset --hard …）
+RULE_UNCLEAR = "unclear"      # 归一化之后仍看不懂这条命令
 
-    ``action_class`` 是**独立于规则名**的一维：规则名会随规则库变，类别不会。
-    C1 把闸门规则重写成精度优先之后，这里会多返回几条规则，但门控只认类别，
-    不需要跟着改（规格 §16.3 C3）。
 
-    刻意不看 ``tool_input`` 里除命令以外的字段：猜动作是归因错的高发区。
-    """
-    command = ""
+def _command_of(tool_input: Any) -> str:
+    """从 tool_input 里取命令原文。只认 ``command`` 一个键——不猜。"""
     if isinstance(tool_input, dict):
         raw = tool_input.get("command")
         if isinstance(raw, str):
-            command = raw
-    if tool_name == "Bash" and command:
-        from .rules import match_delete
+            return raw
+    return ""
 
-        if match_delete(command):
-            return "critical", "delete", ACTION_CLASS_IRREVERSIBLE
+
+def _class_for_tier(tier: str) -> str:
+    """目标档位 → 动作类别。只有极高危显式声明"不可恢复"，
+    其余按可恢复算（与"未判定时按可恢复"同一理由：宁可漏，不可错杀）。"""
+    return (ACTION_CLASS_IRREVERSIBLE if tier == TIER_EXTREME
+            else DEFAULT_ACTION_CLASS)
+
+
+def _classify(command: str, working_directory: str | None
+              ) -> tuple[str, str, str, str]:
+    """一条 Bash 命令的完整判定。返回 ``(severity, rule, action_class, tier)``。
+
+    B2 之后按**目标档位**分，不再"命令里出现删除 token 就一律 critical"：
+    先解析要删哪些路径，再按路径所在位置定档。删 `node_modules` 与删 `~`
+    顶同一根红条，结果是用户见到红条就点确认，闸门就是这么贬值的。
+
+    闸门与词典现在共用同一套目标解析（``commands.tier_for_command``）——
+    老结构是两套判据，同一条 `git reset --hard` 词典认、闸门不认。
+    """
+    if match_delete(command):
+        # 删除类：目标解析不出来就抬到极高危，那条规则在 ``rules.delete_tier``
+        # 里——播报与闸门共用，避免两侧漂移。
+        tier = delete_tier(command, working_directory)
+        return severity_for_tier(tier), RULE_DELETE, _class_for_tier(tier), tier
+
+    # 词典认得的不可恢复动作：`git reset --hard` / `drop table` / `curl | sh`。
+    # 闸门原来完全不认它们——用户看到的是"低风险"，词典说的是"找不回来"。
+    facts = translate(command)
+    if facts.known and facts.irreversible:
+        tier = tier_for_command(command, working_directory)
+        return severity_for_tier(tier), RULE_DISCARD, _class_for_tier(tier), tier
+
+    # B1 兜底：归一化之后仍看不懂这条命令 → 至少 warn，绝不进低风险。
+    if command_body_unknown(command):
+        return SEVERITY_WARN, RULE_UNCLEAR, DEFAULT_ACTION_CLASS, TIER_UNKNOWN
+    return DEFAULT_RISK_SEVERITY, "", DEFAULT_ACTION_CLASS, TIER_UNKNOWN
+
+
+def assess_risk(tool_name: str, tool_input: Any,
+                working_directory: str | None = None) -> tuple[str, str, str]:
+    """评估一次工具调用。纯函数，不接模型。
+
+    返回 ``(severity, rule, action_class)``。档位另由 ``assess_tier`` 取——
+    两者同一份判定，只是视图不同，不会打架。
+
+    ``action_class`` 是**独立于规则名**的一维：规则名会随规则库变，类别不会。
+    门控只认类别与极高危档，所以新规则只要声明自己不可恢复就自动继承排除，
+    不需要有人记得改门控（规格 §16.3 C3）。
+
+    刻意不看 ``tool_input`` 里除命令以外的字段：猜动作是归因错的高发区。
+    """
+    command = _command_of(tool_input)
+    if tool_name == "Bash" and command:
+        severity, rule, action_class, _ = _classify(command, working_directory)
+        return severity, rule, action_class
     return DEFAULT_RISK_SEVERITY, "", DEFAULT_ACTION_CLASS
+
+
+def assess_tier(tool_name: str, tool_input: Any,
+                working_directory: str | None = None) -> str:
+    """这次请求的**目标档位**。闸门与警示计数共用它（B2）。
+
+    不是删除、也不是词典认得的不可恢复动作时返回 ``TIER_UNKNOWN``——
+    那种请求根本不亮红条，给它一个具体档位只会让计数键无意义地散开。
+    """
+    command = _command_of(tool_input)
+    if tool_name == "Bash" and command:
+        return _classify(command, working_directory)[3]
+    return TIER_UNKNOWN
+
+
+def _command_of_record(record: Any) -> str:
+    """从挂起的审批记录里取命令原文。取不到就空串（→ 不进白名单）。"""
+    request = getattr(record, "request", None)
+    return str(getattr(request, "full_command", "") or "")
 
 
 def effective_max_severity(configured: str) -> str:
@@ -229,7 +310,8 @@ def auto_decide_gate(*, severity: str, ai_judgement: bool,
                      has_key: bool, auto_decide: str,
                      max_severity: str,
                      authorized_scopes: tuple[str, ...] = (),
-                     action_class: str = DEFAULT_ACTION_CLASS) -> tuple[bool, str]:
+                     action_class: str = DEFAULT_ACTION_CLASS,
+                     readonly: bool = False) -> tuple[bool, str]:
     """L2 门控。返回 ``(是否放行, 原因)``。纯函数，便于单测。
 
     六条全中才放行，缺任何一条都给出**具体原因**——原因要能写进审计，
@@ -239,6 +321,13 @@ def auto_decide_gate(*, severity: str, ai_judgement: bool,
     排除判据按**动作类别**与**极高危档**，不按规则名（规格 §16.3 C3）：
     规则名会随规则库增删而变，靠它排除就意味着每加一条规则都得回来改门控。
     所以这个函数**刻意不收 ``rule`` 参数**——收了就会有人顺着它写规则名判断。
+    ``readonly`` 收的是一个**已算好的事实**（``rules.l2_readonly_allowed``
+    的结果），不是命令字符串：解析留在 rules 里单测，门控只消费结论。
+
+    ``readonly`` 默认 False（**不批**）：B2 之后删除类会按目标分档，
+    `rm -rf build/` 落在可恢复档、阈值之内，没有这道白名单它就会被自动放行。
+    默认不批意味着将来哪个调用点忘了算这个事实，L2 静默不生效——
+    那是安全的失败方向。
     """
     if auto_decide != AUTO_LOW_RISK_ONLY:
         return False, f"auto_decide={auto_decide!r} 未开启"
@@ -259,6 +348,10 @@ def auto_decide_gate(*, severity: str, ai_judgement: bool,
         return False, f"风险 {severity} 属极高危档，任何配置不得自动放行"
     if SEVERITY_ORDER.get(severity, 99) > SEVERITY_ORDER.get(max_severity, 0):
         return False, f"风险 {severity} 超过阈值 {max_severity}，回落为 L1"
+    # 第三道墙：只读白名单（B2）。可恢复 + 阈值之内也未必能自动放行——
+    # 代办范围必须收敛到"看了不会出事"的命令。
+    if not readonly:
+        return False, "不在 L2 只读白名单内，回落为 L1"
     return True, "L2 门控通过"
 
 
@@ -401,6 +494,10 @@ class PendingApproval:
         self.severity: str = DEFAULT_RISK_SEVERITY
         self.rule: str = ""
         self.action_class: str = DEFAULT_ACTION_CLASS
+        # **目标档位**（B2）：recoverable / normal / extreme / unknown。
+        # severity 与 action_class 都由它推出来，但推不回去——normal 与 unknown
+        # 都落 warn/recoverable，红字计数却要分开算，所以单独存一份。
+        self.risk_tier: str = TIER_UNKNOWN
         # L2 决定时填。
         self.judge_model: str = ""
         self.judge_reason: str = ""
@@ -750,18 +847,35 @@ def describe_upstream(upstream: Any) -> str:
     return " ← ".join(labels) if labels else UPSTREAM_UNKNOWN
 
 
-def warning_key(action_class: str, risk: str) -> str:
-    """警示计数的归类键：**同一类才算一次重复**。
+def warning_mode_for_tier(tier: str, configured: str) -> str:
+    """极高危档的警示模式：**强制常亮，永不递减**（B2）。
 
-    规格说按 action_class 计。但红条的亮起条件是"不可恢复类别 **或** 极高危档"，
-    只按类别计会出一个坑：万一来一条"可恢复但极高危"的请求，它的键会和
-    所有低风险请求一模一样（都是 ``recoverable``），点几次低风险之后
-    这条极高危的红字就被递减掉了——用错阈值比没有阈值危险。
-    所以不可恢复的按类别计，其余按风险档计，两个命名空间不相撞。
+    连点 3 次删 `node_modules` 之后，第 4 次的 `rm -rf ~` 仍要整行红字。
+    这里覆盖用户的递减配置——和 ``auto_decide_gate`` 的封顶阈值同一个理由：
+    安全件的下限不该被体验旋钮调没（用户配的 "never" 只对非极高危生效）。
+
+    抽成纯函数是为了能单测：原来这段逻辑塞在插件的 ``_warning_policy`` 里，
+    "极高危永不递减"这条就没法在不起宿主的条件下验证。
     """
-    if action_class in IRREVERSIBLE_CLASSES:
-        return action_class
-    return f"risk:{risk}"
+    if str(tier or "") == TIER_EXTREME:
+        return WARNING_ALWAYS
+    return normalize_warning_mode(configured)
+
+
+def warning_key(risk_tier: str) -> str:
+    """警示计数的归类键：**同一档才算一次重复**（B2 改为按目标档位计）。
+
+    老口径按 action_class 计，坑在：可恢复但极高危的请求会和所有低风险请求
+    共用 ``recoverable`` 这个键，点几次低风险之后，那条极高危的红字就被
+    递减掉了——用错阈值比没有阈值危险。改成按目标档位计，四档各一个键。
+
+    **极高危档永不进入递减**：那件事不在这个函数里做，而在
+    ``_warning_policy``——档位是 extreme 时强制常亮红字。
+    放在那里是因为"要不要递减"是外观决策，``WarningPolicy`` 才是外观的唯一入口；
+    计数这边只负责回答"同一档第几次见了"。
+    """
+    tier = str(risk_tier or "").strip() or TIER_UNKNOWN
+    return f"tier:{tier}"
 
 CARD_CSS = (
     "section { padding: 12px; font-size: 13px; }"
@@ -1422,10 +1536,14 @@ class ApprovalGateway:
         """
         request = build_request(payload)
         record = PendingApproval(request)
+        tool_input = (payload or {}).get("tool_input") if isinstance(payload, dict) else None
+        # 判定跑一遍、取两个视图：severity/rule/action_class 进门控与审计，
+        # risk_tier 进警示计数（B2：红字按目标档位计，极高危永不递减）。
+        # 两份视图出自同一个 ``_classify``，不会打架。
         record.severity, record.rule, record.action_class = assess_risk(
-            request.tool_name, (payload or {}).get("tool_input")
-            if isinstance(payload, dict) else None,
-        )
+            request.tool_name, tool_input, request.working_directory)
+        record.risk_tier = assess_tier(
+            request.tool_name, tool_input, request.working_directory)
         with self._lock:
             self._records[record.key] = record
             self._prune_locked()
@@ -1495,6 +1613,8 @@ class ApprovalGateway:
             auto_decide=self._auto_decide,
             max_severity=self._auto_decide_max_severity,
             authorized_scopes=scopes,
+            # 只读白名单（B2）在 rules 里算，这里只消费结论。
+            readonly=l2_readonly_allowed(_command_of_record(record)),
         )
         if not eligible:
             # 绝大多数请求走这条（默认全关）。不打日志：每次都打就是噪音，

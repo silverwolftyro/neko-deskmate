@@ -77,9 +77,9 @@ from .approval import (
     build_result_html,
     explain_request,
     is_known_advice_state,
-    normalize_warning_mode,
     safe_conclusion,
     warning_key,
+    warning_mode_for_tier,
 )
 from .broadcast import Broadcaster, describe_actor, render_text
 from .commands import (
@@ -956,15 +956,21 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
         配置读不到就按出厂默认（前几次红字 / n=3）——**卡片是核心功能，
         一个配置项读不出来不该让它消失**。``seen`` 由计数文件给，
-        同一类别第几次命中（含这次）。
+        同一目标档位第几次命中（含这次）。
+
+        **极高危档永不递减**（B2）：连点 3 次删 `node_modules` 之后，
+        第 4 次的 `rm -rf ~` 仍要整行红字。这里强制常亮，覆盖用户的递减配置——
+        和 ``auto_decide_gate`` 的封顶阈值同一个理由：安全件的下限
+        不该被体验旋钮调没。
         """
         section = _approval_section(getattr(self, "_last_config", None) or {})
+        tier = str(getattr(pending, "risk_tier", "") or "")
         return WarningPolicy(
-            mode=normalize_warning_mode(section.get("warning_emphasis")),
+            mode=warning_mode_for_tier(
+                tier, section.get("warning_emphasis")),
             first_n=int(_to_number(section.get("warning_first_n"),
                                    DEFAULT_WARNING_FIRST_N)),
-            seen=self._approval.note_warning(
-                warning_key(pending.action_class, pending.severity)),
+            seen=self._approval.note_warning(warning_key(tier)),
         )
 
     async def _create_approval_card(self, pending: Any) -> None:

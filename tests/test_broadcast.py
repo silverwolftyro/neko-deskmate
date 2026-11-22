@@ -68,7 +68,14 @@ class RecordingPush:
         return self.result
 
 
-def _delete_hit(command: str = "rm -rf build/"):
+def _delete_hit(command: str = "rm -rf D:/other/x.txt"):
+    """删除类命中的样本。
+
+    **刻意用工作区外的路径**：B2 之后删除按目标分档，`rm -rf build/`
+    落在"可恢复"档、播报前缀是【提示】。下面这些用例测的是严重度渲染本身，
+    用一个极高危目标才能继续验【严重】那条路。可恢复档另见
+    ``test_recoverable_target_downgrades_the_broadcast``。
+    """
     return evaluate_delete(command, agent="claude-code", session="s1", ts="t")
 
 
@@ -86,7 +93,7 @@ def test_render_text_has_severity_and_agent() -> None:
     text = render_text(_delete_hit())
     assert text.startswith("【严重】")
     assert "claude-code" in text
-    assert "rm -rf build/" in text
+    assert "rm -rf D:/other/x.txt" in text
     # 不用 emoji：这是状态播报不是装饰
     assert not any(ord(ch) > 0x1F000 for ch in text)
 
@@ -103,7 +110,7 @@ def test_push_carries_explicit_source_and_blind() -> None:
     assert call["visibility"] == ["chat"]
     assert call["priority"] == 9             # critical
     assert call["parts"][0]["type"] == "text"
-    assert "rm -rf build/" in call["parts"][0]["text"]
+    assert "rm -rf D:/other/x.txt" in call["parts"][0]["text"]
 
 
 def test_broadcaster_is_synchronous() -> None:
@@ -229,7 +236,7 @@ def _hit(**overrides):
 
 def _source(**overrides) -> UnifiedEvent:
     base = dict(agent="claude-code", session="800257f3-aaaa-bbbb", event="tool_use",
-                tool="Bash", command="rm -f x", ts="t", executor="claude-code",
+                tool="Bash", command="rm -rf ~", ts="t", executor="claude-code",
                 working_directory=CWD)
     base.update(overrides)
     return UnifiedEvent(**base)
@@ -239,11 +246,11 @@ def _source(**overrides) -> UnifiedEvent:
 
 def test_template_single_agent_user_declared() -> None:
     source = attribute(_source(), mine_roots=[CWD])
-    hit = evaluate_delete("rm -f deskmate-probe.docx", agent=source.agent,
+    hit = evaluate_delete("rm -rf ~/deskmate-probe.docx", agent=source.agent,
                           session=source.session, ts=source.ts, source=source)
     text = render_text(hit)
     assert text.startswith("【严重】你自己开的 claude-code 删除文件：")
-    assert "rm -f deskmate-probe.docx" in text
+    assert "rm -rf ~/deskmate-probe.docx" in text
     # 定位三件套：会话短 id + cwd，让用户 3 秒内判断"这是我开的吗"
     assert "会话 800257f3" in text
     assert CWD in text
@@ -253,7 +260,7 @@ def test_template_single_agent_user_declared() -> None:
 
 def test_template_subagent() -> None:
     source = attribute(_source(sidechain=True))
-    hit = evaluate_delete("rm -f deskmate-probe.docx", source=source)
+    hit = evaluate_delete("rm -rf ~/deskmate-probe.docx", source=source)
     text = render_text(hit)
     assert "（经子代理）" in text
     assert text.startswith("【严重】claude-code（经子代理）删除文件：")
@@ -331,7 +338,7 @@ def test_critical_never_guesses_even_for_failures() -> None:
 def test_known_attribution_escapes_the_hedge_at_any_severity() -> None:
     """有证据就不加"未知"——分级只管"没证据时要不要坦白"，不管有证据的。"""
     source = attribute(_source(), mine_roots=[CWD])
-    hit = evaluate_delete("rm -f x", source=source)
+    hit = evaluate_delete("rm -rf ~", source=source)
     assert hit.severity == SEVERITY_CRITICAL
     assert "发起者未知" not in render_text(hit)
 
@@ -369,7 +376,7 @@ def test_severity_and_attribution_stay_orthogonal() -> None:
     把"未知"降成 notice 会让用户忽略真正危险的删除；升成 critical 会让 429 也变严重。
     """
     unknown = _hit()
-    known = evaluate_delete("rm -f x", session="s",
+    known = evaluate_delete("rm -rf ~", session="s",
                             source=attribute(_source(session="s"), mine_roots=[CWD]))
     assert unknown.severity == known.severity == SEVERITY_CRITICAL
     assert priority_for(unknown.severity) == priority_for(known.severity)

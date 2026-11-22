@@ -428,9 +428,24 @@ def test_gate_respects_the_severity_threshold() -> None:
 def test_gate_opens_when_all_six_hold() -> None:
     eligible, why = auto_decide_gate(severity="notice", ai_judgement=True,
                                      has_key=True, auto_decide=AUTO_LOW_RISK_ONLY,
-                                     max_severity="notice", authorized_scopes=SIGNED)
+                                     max_severity="notice", authorized_scopes=SIGNED,
+                                     readonly=True)
     assert eligible is True
     assert why == "L2 门控通过"
+
+
+def test_gate_refuses_when_not_readonly_even_if_everything_else_holds() -> None:
+    """B2 第三道墙：可恢复 + 阈值之内，也不自动放行。
+
+    `rm -rf build/` 按目标分档落在"可恢复"、severity=notice、阈值之内——
+    没有只读白名单这道墙，它就会被 L2 自动放行。白名单外一律回落 L1。
+    """
+    eligible, why = auto_decide_gate(severity="notice", ai_judgement=True,
+                                     has_key=True, auto_decide=AUTO_LOW_RISK_ONLY,
+                                     max_severity="notice", authorized_scopes=SIGNED,
+                                     readonly=False)
+    assert eligible is False
+    assert "只读白名单" in why
 
 
 def test_advice_state_degrades_without_silently_succeeding() -> None:
@@ -728,7 +743,8 @@ def test_expired_entry_is_kept_not_deleted(port: int) -> None:
         assert row["session_id"] == "sess-1"
         assert "rm -rf build/" in row["tool_summary"]
         assert row["created_time"]                  # ISO 时间，人能读
-        assert row["risk"] == "critical"            # 删除类的风险判定
+        # B2 之后按目标分档：`build/` 是可重建目录 → notice，不再是 critical
+        assert row["risk"] == "notice"
         assert row["rule"] == "delete"
     finally:
         gateway.stop()
@@ -1836,9 +1852,22 @@ def test_audit_records_the_action_class(port: int) -> None:
     try:
         _post_status(port, PAYLOAD)          # rm -rf build/ → 删除类
         row = gateway.audit_rows()[0]
-        assert row["action_class"] == ACTION_CLASS_IRREVERSIBLE
-        assert row["severity"] == "critical"
-        assert "class=irreversible" in gateway.audit_text()
+        # B2 之后按目标分档：`build/` 是可重建的构建产物目录 → 可恢复档。
+        # 原来"出现删除 token 就一律 irreversible + critical"。
+        assert row["action_class"] == ACTION_CLASS_RECOVERABLE
+        assert row["severity"] == "notice"
+
+        # 工作区外的目标仍然不可恢复（`cwd` 是 D:\workspace\N.E.K.O）
+        gateway3 = _gateway(_free_port(), timeout=0.3)
+        try:
+            _post_status(gateway3.port, dict(PAYLOAD,
+                                             tool_input={"command": "rm -rf D:/other/x.txt"}))
+            row = gateway3.audit_rows()[0]
+            assert row["action_class"] == ACTION_CLASS_IRREVERSIBLE
+            assert row["severity"] == "critical"
+            assert "class=irreversible" in gateway3.audit_text()
+        finally:
+            gateway3.stop()
 
         gateway2 = _gateway(_free_port(), timeout=0.3)
         try:

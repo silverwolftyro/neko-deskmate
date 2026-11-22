@@ -21,12 +21,20 @@
 
 from __future__ import annotations
 
-import re
 import time
 from typing import Any
 
 from pydantic import Field
 
+from .commands import (
+    PRINT_ONLY_COMMANDS,
+    TIER_EXTREME,
+    TIER_UNKNOWN,
+    basename,
+    severity_for_tier,
+    simple_commands,
+    tier_for_command,
+)
 from .events import (
     AttributionFields,
     UnifiedEvent,
@@ -51,10 +59,48 @@ DELETE_PAIRS = (("git", "clean"), ("drop", "table"))
 # 看帮助不等于真删文件；只在危险 token 是命令本身第一个 token 时豁免。
 HELP_FLAGS = frozenset({"--help", "-h", "/?", "-?"})
 
+# ── L2 只读白名单（B2）───────────────────────────────────────────────────
+# L2 是"用户签了字之后的代办"。代办的范围必须收敛到**看了不会出事**的命令，
+# 而不是"大概不会出事"的命令：B2 把删除按目标分档之后，`rm -rf build/`
+# 落在可恢复档、阈值之内——没有这道白名单，它就会被自动放行。
+# 所以白名单外一律不进自动，哪怕它可恢复、哪怕阈值开到顶。
+#
+# 收录标准：**不写、不删、不改**任何文件，也不发起网络请求。
+# `find` 刻意不收（`find -delete` 能删），`git` 只收明确的只读子命令。
+L2_READONLY_COMMANDS = frozenset({
+    "ls", "dir", "pwd", "cd", "echo", "printf", "cat", "type", "more",
+    "less", "head", "tail", "which", "where", "whoami", "hostname",
+    "date", "printenv", "env", "grep", "egrep", "fgrep", "findstr",
+    "rg", "select-string", "get-content", "get-location", "get-childitem",
+    "jq", "git status", "git log", "git diff", "git show", "git branch",
+    "git remote", "git config --list", "npm ls", "pip list", "pip show",
+    "uv pip list", "uv pip show",
+})
+
+
+def l2_readonly_allowed(command: str) -> bool:
+    """这条命令整个都在 L2 只读白名单里吗。纯函数。
+
+    **每一段都必须在**：`ls && rm -rf x` 里有一段不在，整条就不批。
+    有一段看不懂（归一化之后没有命令主体）同样不批——白名单是"认得且安全"，
+    不是"没认出所以放过"。
+    """
+    segments = simple_commands(command)
+    if not segments:
+        return False
+    for body in segments:
+        if not body:
+            return False
+        head = body[0]
+        pair = f"{body[0]} {body[1]}" if len(body) > 1 else head
+        if pair in L2_READONLY_COMMANDS or head in L2_READONLY_COMMANDS:
+            continue
+        return False
+    return True
+
 # 分词：先按 shell 命令分隔符切成「简单命令」，再按空白与括号等切 token。
 # 必须分段：否则 `rm -rf x && del --help` 里后面那个 --help 会把前面的真删除一起赦免了。
-_SIMPLE_SPLIT = re.compile(r"[;|&\n]+")
-_SEPARATORS = re.compile(r"[\s;|&()<>]+")
+# **分词与归一化实现在 commands.py**（B1/B2：闸门与词典共用一套，禁止两套判据）。
 
 
 class RuleHit(AttributionFields):
@@ -102,56 +148,103 @@ def _attribution_of(event: UnifiedEvent | None) -> dict:
 # ── 分词 ──────────────────────────────────────────────────────────────────
 
 def _tokens(command: str) -> list[str]:
-    return [t for t in _SEPARATORS.split(command or "") if t]
+    """整条命令切 token。分词实现在 ``commands``，这里只做转发。"""
+    from .commands import tokens
+
+    return tokens(command)
 
 
 def _simple_commands(command: str) -> list[list[str]]:
     """按 `;` `|` `&` 换行切段，每段再切 token。段内判定互不影响。"""
-    commands = []
-    for part in _SIMPLE_SPLIT.split(command or ""):
-        tokens = [_normalise(t) for t in _tokens(part)]
-        if tokens:
-            commands.append(tokens)
-    return commands
-
-
-def _normalise(token: str) -> str:
-    """去引号、转小写。引号留着会让 `"rm` 匹配不上。"""
-    return token.strip("\"'`").lower()
+    return simple_commands(command)
 
 
 def _basename(token: str) -> str:
-    """`/bin/rm` → `rm`，`C:\\Windows\\System32\\del` → `del`。"""
-    for sep in ("/", "\\"):
-        if sep in token:
-            token = token.rsplit(sep, 1)[-1]
-    return token
+    return basename(token)
 
 
 # ── 删除类 ────────────────────────────────────────────────────────────────
 
+def _is_flag(token: str) -> bool:
+    return token.startswith("-") or token in ("--", "/?", "-?")
+
+
+def _is_help_only(rest: list[str]) -> bool:
+    """这一段是不是**纯粹**在问帮助。
+
+    老实现只看"命令名是删除命令 + 后面任意位置有 --help"，于是
+    `rm -rf ~ --help`（真删除）被赦免，而 `sudo rm -rf ~ --help` 因为
+    `sudo` 占了段首反而不赦免——**同一个动作两种 verdict**。
+    2026-11-22 真机记录到的正是这一类：判定对命令写法敏感，
+    不是某个前缀能绕过，verdict 随前缀与尾巴一起变。
+
+    改成：命令名之后**每一个** token 都必须是开关，且其中至少一个是帮助开关。
+    `rm --help` 赦免，`rm -rf ~ --help` 不赦免。
+    """
+    if not rest or not any(t in HELP_FLAGS for t in rest):
+        return False
+    return all(_is_flag(t) for t in rest)
+
+
 def match_delete(command: str) -> str | None:
     """返回命中的危险 token 名，未命中返回 None。纯函数。
 
-    按简单命令逐段判：段内第一个 token 是危险命令且带帮助 flag → 这段只是看帮助，跳过；
-    其余任何位置出现危险 token（sudo/xargs 前缀、引号内、路径形式）都算命中。
+    B1 之后每段先**归一化**（剥掉前导赋值与包装词）再判，所以
+    `sudo rm`、`VAR=x rm`、`env VAR=x rm`、`(rm …)`、`! rm …`、`xargs rm`
+    与裸 `rm` 是同一个 verdict——不再随写法变。
+
+    帮助豁免改为整段判定（见 ``_is_help_only``），并且**在归一化之后**执行，
+    所以加不加 `sudo` 前缀不再影响它。
+
+    兜底匹配仍然保留，但**命令主体明确"不执行参数"的除外**（echo / git /
+    curl …）：`echo "rm -rf 是危险操作"` 每张卡都顶红字，用户会被训练成
+    无脑点确认，最后闸门真的失效。命令主体不认识时照旧兜——
+    漏判是隐形的，误报至少能在 summary 里看见。
     """
-    for tokens in _simple_commands(command):
+    for body in simple_commands(command):
+        if not body or _is_help_only(body[1:]):
+            continue
+
         for left, right in DELETE_PAIRS:
-            for i in range(len(tokens) - 1):
-                if tokens[i] == left and tokens[i + 1] == right:
+            for i in range(len(body) - 1):
+                if body[i] == left and body[i + 1] == right:
                     return f"{left} {right}"
 
-        if _basename(tokens[0]) in DELETE_TOKENS:
-            if any(t in HELP_FLAGS for t in tokens[1:]):
-                continue  # 这一段只是 `del --help` 这类看帮助
-            return _basename(tokens[0])
+        head = basename(body[0])
+        if head in DELETE_TOKENS:
+            return head
 
-        for token in tokens:
-            name = _basename(token)
-            if name in DELETE_TOKENS:
-                return name
+        if head not in PRINT_ONLY_COMMANDS:
+            for token in body:
+                name = basename(token)
+                if name in DELETE_TOKENS:
+                    return name
     return None
+
+
+def _working_dir_of(source: UnifiedEvent | None) -> str | None:
+    """从源事件取工作目录；取不到就 None（= 说不清在不在范围内）。"""
+    if source is None:
+        return None
+    value = getattr(source, "working_directory", None)
+    text = str(value or "").strip()
+    return text or None
+
+
+def delete_tier(command: str, working_directory: str | None = None) -> str:
+    """一条删除命令的目标档位。闸门与词典共用这一个函数（B2）。
+
+    **删除动作但一个目标都没解析出来时抬到极高危**：`git clean -fdx`、
+    `rm -rf a b`（`a`/`b` 不打斜杠就不是"像路径的"目标）、目标被变量藏起来……
+    B2 表把"无法解析的目标"归进极高危——说不清要删什么的时候，按最坏的猜。
+
+    这个抬档放在这里而不是调用方里：``evaluate_delete``（播报）和
+    ``approval._classify``（闸门）都要走同一条，放在任一侧都会让另一侧漂移。
+    """
+    tier = tier_for_command(command, working_directory)
+    if tier == TIER_UNKNOWN:
+        return TIER_EXTREME
+    return tier
 
 
 def evaluate_delete(command: str, *, agent: str = "", session: str = "",
@@ -159,13 +252,18 @@ def evaluate_delete(command: str, *, agent: str = "", session: str = "",
     """对一个 Bash 命令判删除类。纯函数，不碰 I/O。
 
     ``source`` 是产生这个命令的统一事件，只用来带归因字段；不传就是「未知」。
+
+    严重度按**目标档位**定（B2），不再一律 critical：删 `node_modules` 与删 `~`
+    不是一回事，老口径把两者都顶成【严重】，结果是用户见到红字就点确认。
+    播报层跟着同一个档位走——播报说【严重】而卡片不红，那正是 A 批要消灭的
+    "看到的与实际做的不一致"。
     """
     matched = match_delete(command)
     if matched is None:
         return None
     return RuleHit(
         rule=RULE_DELETE,
-        severity=SEVERITY_CRITICAL,
+        severity=severity_for_tier(delete_tier(command, _working_dir_of(source))),
         # 文案模版用「删除文件」而不是「删除类操作」——后者是内部术语，
         # 用户在 3 秒内要读懂的是"发生了什么"，不是我们的规则分类。
         summary=f"删除文件：{_clip(command)}",

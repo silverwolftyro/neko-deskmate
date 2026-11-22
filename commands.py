@@ -70,6 +70,19 @@ COMMAND_DISPLAY_MAX = 80
 UNKNOWN_ACTION = "未识别的命令"
 UNKNOWN_CONSEQUENCE = "看不出这一步最坏会怎样"
 
+# ── 目标档位（B2：按删除目标分档）───────────────────────────────────────
+# 老口径只有一条："命令里出现删除 token"就判 critical，其余一律 notice。
+# 后果是删 `node_modules` 和删 `~` 顶同一根红条——用户见到红条就点确认，
+# 闸门就是这么贬值的。改成**先解析目标路径集合，再按目标所在位置分档**。
+#
+# 四档（B2 表 + 「没见过的默认待定」）：
+TIER_RECOVERABLE = "recoverable"   # 删了重建得回来：依赖 / 构建产物 / 缓存
+TIER_NORMAL = "normal"             # 工作区内的其他路径
+TIER_EXTREME = "extreme"           # 工作区外 / 家目录 / 盘根 / 系统目录 / 目标不可解析
+TIER_UNKNOWN = "unknown"           # 解析不出目标、效果说不清 → 至少告警档
+TIERS = (TIER_RECOVERABLE, TIER_NORMAL, TIER_EXTREME, TIER_UNKNOWN)
+
+
 
 @dataclass(frozen=True)
 class CommandFacts:
@@ -159,8 +172,12 @@ _RULES: tuple[_Rule, ...] = (
 # rm 单独处理：它的三个变体（删文件 / 删目录递归 / 清空磁盘）后果差别极大，
 # 用一条松散正则区分不了——`-f` 里也有 f，会被误判成递归（实测踩过），
 # 所以这里显式解析开关字母。
-_RM_RE = re.compile(r"\brm\s+(?P<flags>(?:-[a-zA-Z]+\s+)*)(?P<rest>.+)$")
 _FLAG_RE = re.compile(r"-([a-zA-Z]+)")
+# 只认**单短线**开关：`-rf`、`-r`。`--force` 不算——老实现靠 `_RM_RE` 的
+# `-[a-zA-Z]+` 隐式排掉了它，改成按 token 判之后必须显式排，
+# 否则 `--force` 会被拆成字母 `force`，而 `force` 里含着 `r`，
+# 于是"非递归"被误判成"递归"。（整条长选项剥离是 B3 的活，这里只保证不退化。）
+_SHORT_FLAG_RE = re.compile(r"^-[A-Za-z]+$")
 _DRIVE_ROOT_RE = re.compile(r"^[A-Za-z]:\\?$")
 
 
@@ -172,16 +189,29 @@ class _RmFacts:
 
 
 def _parse_rm(command: str) -> _RmFacts | None:
-    match = _RM_RE.search(command)
-    if match is None:
-        return None
-    letters = "".join(_FLAG_RE.findall(match.group("flags") or "")).lower()
-    words = (match.group("rest") or "").split()
-    target = words[0].strip("'\"") if words else ""
-    bare = target.replace("/", "\\").rstrip("\\")
-    is_disk_root = bool(_DRIVE_ROOT_RE.match(bare)) or bare in ("", "\\")
-    return _RmFacts(recursive="r" in letters, target=target,
-                    is_disk_root=is_disk_root)
+    """找 `rm` **作为命令**的那一段。
+
+    必须在命令位置上：`git commit -m "rm -rf x"` 里的 rm 是字符串，
+    不是要执行的东西。老实现用 `\\brm\\s+` 全文搜，于是那句话被判成
+    "删除目录及其全部内容"——闸门犯过同一类错（帮助豁免只看段首），
+    两套判据各自错得一样，正是 B2 要消灭的"两套判据"。
+    现在和闸门一样：先归一化，再看命令名。
+
+    开关字母只从单短线 token 取（见 ``_SHORT_FLAG_RE``）。
+    """
+    for segment in _segments(command):
+        body = _normalise_pairs(segment)
+        if not body or basename(body[0][1]) != "rm":
+            continue
+        shorts = [norm for _, norm in body[1:] if _SHORT_FLAG_RE.match(norm)]
+        letters = "".join(_FLAG_RE.findall(" ".join(shorts))).lower()
+        targets = _segment_targets(body)
+        target = targets[0] if targets else ""
+        bare = target.replace("/", "\\").rstrip("\\")
+        is_disk_root = bool(_DRIVE_ROOT_RE.match(bare)) or bare in ("", "\\")
+        return _RmFacts(recursive="r" in letters, target=target,
+                        is_disk_root=is_disk_root)
+    return None
 
 
 def _rm_facts(command: str) -> CommandFacts | None:
@@ -276,6 +306,342 @@ def _under(path: str, root: str) -> bool:
 
 def _is_absolute(target: str) -> bool:
     return bool(re.match(r"^[A-Za-z]:[\\/]", target)) or target.startswith(("/", "\\"))
+
+
+# ── 命令解析原语（B1/B2 共用；**禁止两套判据**）─────────────────────────
+# 这些是纯字符串函数：不碰 I/O、不碰配置、不 import 本包任何模块。
+# 放在这个叶子模块里，是为了让 ``rules.py``（闸门）与 ``approval.py``（审批）
+# 和本文件（词典）三方共用同一套分词 / 归一化 / 目标解析。
+# B2 的硬要求是"闸门与词典共用同一套目标解析结果"——两套判据等于没有判据，
+# 而同一条 ``git reset --hard`` 词典认、闸门不认，就是这么来的。
+
+# 前导赋值：`VAR=x rm …`、`VAR="a b" rm …`（分词后引号已经去了）
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# 段首装饰：剥掉之后剩下的才是命令主体
+_GROUP_OPENERS = frozenset({"(", "{", "!", "[["})
+# 前导包装词：后面跟的才是真正要跑的东西
+_LEADING_WRAPPERS = frozenset({
+    "env", "sudo", "command", "nohup", "time", "exec", "builtin",
+    "nice", "stdbuf", "setsid", "timeout", "watch", "xargs", "eval",
+    "runuser", "su", "doas",
+})
+# 这些词**执行**参数字符串：`bash -c "rm -rf x"` 里的 rm 是真删除
+_EXEC_WRAPPERS = frozenset({
+    "bash", "sh", "dash", "zsh", "fish", "ksh", "csh", "tcsh",
+    "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
+    "python", "python3", "py", "node", "deno", "perl", "ruby", "php",
+    "busybox", "at", "parallel",
+})
+# 这些词**不执行**参数：参数是给人看的字符串。
+# 列出来是为了让兜底匹配不误伤——`echo "rm -rf 是危险操作"` 每张卡都顶红字，
+# 用户会被训练成无脑点确认，最后闸门真的失效。
+#
+# **刻意不收 `git`**：`git rm --cached x` 是真删除，收了就会漏判它；
+# 而 `git commit -m "rm -rf x"` 那种误报在 summary 里一眼可辨（用户看得到那是
+# commit）。这个交换和 2026-11-21 定下的"宁可误报、不可漏判"是同一条。
+PRINT_ONLY_COMMANDS = frozenset({
+    "echo", "printf", "write-output", "write-host", "write-error",
+    "cat", "type", "more", "less", "man", "help", "head", "tail",
+    "grep", "egrep", "fgrep", "findstr", "rg", "ag", "select-string",
+    "get-content", "curl", "wget", "iwr", "invoke-webrequest",
+    "sqlcmd", "psql", "mysql", "sqlite3", "jq", "yq",
+})
+
+_SIMPLE_SPLIT = re.compile(r"[;|&\n]+")
+_SEPARATORS = re.compile(r"[\s;|&()<>]+")
+# 这些命令的参数**肯定不是删除目标**：它们只改 shell 自己的状态。
+# 不列进来的话，`cd D:/w && rm -rf x` 会把 `D:/w` 也当成要删的路径，
+# 于是整条命令被判"删了工作区外的目录"——比真实情况危言耸听得多。
+_NAVIGATION_COMMANDS = frozenset({
+    "cd", "chdir", "pushd", "popd", "export", "set", "setlocal", "source",
+    ".", "alias", "unalias", "unset", "let", "read", "declare", "typeset",
+    "local", "exit", "return", "break", "continue", "shift", "trap", "umask",
+})
+# 这些命令的第一个参数是**子命令**，不是路径：`git clean` 的 `clean`、
+# `git reset --hard` 的 `reset`。不跳掉它，它会被当成一个相对路径目标，
+# 于是"整个仓库的未追踪文件"被误判成"工作区内的一个目录"——降档。
+_SUBCOMMAND_OWNERS = frozenset({
+    "git", "npm", "pnpm", "yarn", "pip", "uv", "docker", "kubectl", "helm",
+    "cargo", "go", "dotnet", "mvn", "gradle", "make", "cmake", "terraform",
+    "aws", "gcloud", "az", "poetry", "conda", "brew", "apt", "apt-get",
+})
+# 纯粹的语言词，不可能同时是路径。
+_SHELL_KEYWORDS = frozenset({
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do",
+    "done", "case", "esac", "in", "function", "select", "time",
+})
+
+# 删了重建得回来的目录：装出来的依赖 / 构建产物 / 字节码缓存。
+# 判据是"路径里出现这些名字"，不是"等于"——`D:\pkg\node_modules\a` 也算。
+# 名字取得**保守**：写宽了会把真实路径误判成可恢复，那是降档，最危险的方向。
+_RECOVERABLE_MARKERS = (
+    "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".tox", ".cache", ".npm", ".nuget",
+    ".gradle", ".m2", ".parcel-cache", ".next", ".nuxt", "dist", "build",
+    "target",
+)
+# 目标集合算不出来的形态：命令替换、环境变量、通配符。
+# `rm -rf $(cat list)` / `rm -rf *` / `rm -rf $HOME` 的破坏面都大于
+# 任何单一路径，所以一律按最坏的档处理（B2 表：含通配符或无法解析的目标）。
+_UNPARSEABLE_RE = re.compile(r"[$`*?\[\]%]")
+
+
+def is_assignment(token: str) -> bool:
+    """`VAR=…` 形态的前导赋值。"""
+    return bool(_ASSIGNMENT_RE.match(str(token or "")))
+
+
+def normalise_token(token: str) -> str:
+    """去引号、转小写。引号留着会让 `"rm` 匹配不上。"""
+    return str(token or "").strip("\"'`").lower()
+
+
+def _raw_tokens(text: str) -> list[str]:
+    """按与归一化**同一套规则**切 token，但保留原文（大小写、引号）。
+
+    为什么需要原文：目标路径要显示给用户看。``D:/other/x.txt`` 被转成
+    ``d:/other/x.txt`` 之后，用户在卡片上认不出自己刚敲的那个路径——
+    而"让他确认一个他不认识的路径"等于没让他确认。
+    """
+    return [t for t in _SEPARATORS.split(str(text or "")) if t]
+
+
+def _segments(command: str) -> list[list[tuple[str, str]]]:
+    """每段是 ``[(原文, 归一化), …]``。原文给展示层，归一化给判定层。"""
+    out: list[list[tuple[str, str]]] = []
+    for part in _SIMPLE_SPLIT.split(str(command or "")):
+        pairs = [(raw, normalise_token(raw)) for raw in _raw_tokens(part)]
+        if pairs:
+            out.append(pairs)
+    return out
+
+
+def simple_commands(command: str) -> list[list[str]]:
+    """按 `;` `|` `&` 换行切段，每段再切 token **并剥掉段首噪音**。
+
+    段内判定互不影响。返回的就是"命令主体"token 列表——
+    ``VAR="a b" sudo rm -rf x`` 出来是 ``['rm', '-rf', 'x']``。
+
+    **判定一律走这个入口，不要自己 ``normalise_tokens(simple_commands(…))``**：
+    那样拿到的是已经丢过引号的 token，引号配对就断了，
+    ``VAR="a b" rm -rf x`` 会被吃成空段（实测踩过）。
+    """
+    return [[norm for _, norm in _normalise_pairs(segment)]
+            for segment in _segments(command)]
+
+
+def _normalise_pairs(segment: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """``simple_commands`` 的带原文版本：剥段首噪音，原文跟着一起留。"""
+    out = list(segment or [])
+    while out:
+        head = out[0][1]
+        if is_assignment(head):
+            # 带引号的值会被切成多个 token：`VAR="a b"` → `VAR="a` + `b"`。
+            # 只丢第一个的话，`b` 会变成"命令主体"——于是 `VAR="a b" rm -rf x`
+            # 判不出删除。一路吃到引号闭合为止。
+            # **引号状态必须按原文算**：归一化会 strip 掉收尾引号，
+            # 按归一化后的文本永远等不到闭合，会把整条命令吃光。
+            consumed, out = out[0][0], out[1:]
+            while out and _quote_state(consumed):
+                consumed += " " + out[0][0]
+                out = out[1:]
+            continue
+        if head in _LEADING_WRAPPERS or head in _EXEC_WRAPPERS:
+            out = out[1:]
+            # 包装词自己的开关：`sudo -u root`、`env -i`、`bash --norc`。
+            # 引号同理：`sudo -u "a b" rm` 不能把 `b` 留成命令主体。
+            while out and (out[0][1].startswith("-") or is_assignment(out[0][1])):
+                consumed, out = out[0][0], out[1:]
+                while out and _quote_state(consumed):
+                    consumed += " " + out[0][0]
+                    out = out[1:]
+            continue
+        if head in _GROUP_OPENERS:
+            out = out[1:]
+            continue
+        break
+    return out
+
+
+def basename(token: str) -> str:
+    """`/bin/rm` → `rm`，`C:\\Windows\\System32\\del` → `del`。
+
+    Windows 上要额外剥掉可执行后缀：`C:\\Windows\\System32\\rm.exe`
+     basename 之后是 `rm.exe`，而危险词表里是 `rm`——不剥就漏判。
+    """
+    text = str(token or "")
+    for sep in ("/", "\\"):
+        if sep in text:
+            text = text.rsplit(sep, 1)[-1]
+    lowered = text.lower()
+    for suffix in (".exe", ".cmd", ".bat", ".com", ".ps1"):
+        if lowered.endswith(suffix) and len(text) > len(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def _quote_state(text: str) -> str:
+    """扫一遍，返回**还没闭合**的引号字符；全部闭合则返回空串。"""
+    quote = ""
+    for char in str(text or ""):
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'`":
+            quote = char
+    return quote
+
+
+def tokens(command: str) -> list[str]:
+    """整条命令切 token。"""
+    return [t for t in _SEPARATORS.split(str(command or "")) if t]
+
+
+def command_body_unknown(command: str) -> bool:
+    """归一化之后仍拿不到命令主体 → True。
+
+    这不是"没命中规则"，是"我们看不懂这条命令"。B1 要求这种情况
+    **不得低于 notice**，B2 进一步要求至少 warn：看不懂的命令按最坏的猜，
+    比按最好的猜安全。
+    """
+    segments = simple_commands(command)
+    if not segments:
+        return bool(str(command or "").strip())
+    return any(not segment for segment in segments)
+
+
+def _segment_targets(segment: list[tuple[str, str]]) -> tuple[str, ...]:
+    """一段（**已配对**）里的路径目标，保留原文大小写。
+
+    `git` / `npm` 这类命令的第一个参数是子命令，跳过（见
+    ``_SUBCOMMAND_OWNERS``）；开关与赋值也跳过。
+    """
+    body = _normalise_pairs(segment)
+    if not body or body[0][1] in _NAVIGATION_COMMANDS:
+        return ()
+    rest = body[1:]
+    if body[0][1] in _SUBCOMMAND_OWNERS:
+        # 先吃掉子命令本身，再往下找路径
+        index = 0
+        while index < len(rest) and rest[index][1].startswith("-"):
+            index += 1
+        rest = rest[index + 1:] if index < len(rest) else []
+    return tuple(raw.strip("'\"") for raw, norm in rest
+                 if not norm.startswith("-") and not is_assignment(norm))
+
+
+def delete_targets(command: str) -> tuple[str, ...]:
+    """这条命令**要动哪些路径**。抽不出返回空元组。
+
+    只取命令主体之后、非开关、非赋值的 token；``cd`` / ``export`` 这类
+    只改 shell 自身状态的段整段跳过（见 ``_NAVIGATION_COMMANDS``）——
+    `rm -rf a b` 要能取到 `a` 和 `b` 两个，漏一个就可能把档位判低。
+
+    **刻意不用"停用词"过滤**：曾经用 `a` / `the` / `in` 之类筛掉"不像路径的
+    token"，结果 `rm -rf a b` 只取到 `b`——单字母目录名被当成英文冠词丢掉了。
+    丢目标只会让档位变低，那是最危险的方向；多取一个再按 ``_looks_like_path``
+    筛，方向才对。
+
+    返回的是**原文**（不是归一化后的）：路径要显示给用户看，
+    ``D:/other/x.txt`` 不能变成 ``d:/other/x.txt``。
+    """
+    found: list[str] = []
+    for segment in _segments(command):
+        found.extend(_segment_targets(segment))
+    return tuple(found)
+
+
+def _looks_like_path(token: str) -> bool:
+    """这个 token 可能是路径吗。
+
+    **默认是**，只有纯语言词才判否。曾经反过来写（要求"看起来像路径"：
+    有分隔符 / 有扩展名 / 是已知目录名），结果 `rm -rf src` 因为 `src`
+    两个字不像路径而被当成"没有目标"——而"没有目标"在删除类里会被抬到
+    极高危，于是删自己源码目录比删 `src/`（带斜杠）判得还重，全看有没有
+    打那个斜杠。默认是、只排除语言词，方向才不会随写法抖。
+    """
+    text = str(token or "").strip()
+    if not text:
+        return False
+    return text.lower() not in _SHELL_KEYWORDS
+
+
+def target_unparseable(command: str) -> bool:
+    """目标集合算不算得出来。算不出来 → 调用方必须按最坏的档处理。"""
+    return bool(_UNPARSEABLE_RE.search(str(command or "")))
+
+
+def is_recoverable_target(target: str) -> bool:
+    """删了重建得回来的目录（依赖 / 构建产物 / 缓存）。"""
+    lowered = str(target or "").lower().replace("/", "\\")
+    return any(marker in lowered for marker in _RECOVERABLE_MARKERS)
+
+
+def _is_home_or_root(target: str) -> bool:
+    """家目录 / 盘根。这些地方的破坏面没有边界。"""
+    text = str(target or "").strip().replace("/", "\\").rstrip("\\")
+    if not text:
+        return True
+    lowered = text.lower()
+    if lowered in ("~", "%userprofile%", "%home%", "%homepath%", "$home"):
+        return True
+    if lowered.startswith(("~\\", "%userprofile%\\", "%home%\\", "$home\\")):
+        return True
+    return bool(_DRIVE_ROOT_RE.match(text)) or text in ("\\", "/")
+
+
+def _tier_of_one(target: str, working_directory: str | None) -> str:
+    """单个目标的档位。"""
+    if is_recoverable_target(target):
+        return TIER_RECOVERABLE
+    if _is_home_or_root(target) or _is_system_path(target):
+        return TIER_EXTREME
+    if not working_directory:
+        # 不知道工作目录 → 说不清在不在范围内 → 按最坏的猜
+        return TIER_EXTREME
+    if not _is_absolute(target):
+        return TIER_NORMAL      # 相对路径：相对于会话工作目录，算在内
+    return TIER_NORMAL if _under(target, working_directory) else TIER_EXTREME
+
+
+def target_tier(targets: Any, *, working_directory: str | None,
+                unparseable: bool = False) -> str:
+    """按目标分档（B2 表）。多个目标时**取最坏的一档**——
+    一条命令删两个路径，危险的那个说了算。"""
+    if unparseable:
+        return TIER_EXTREME
+    usable = [str(t) for t in (targets or ()) if _looks_like_path(t)]
+    if not usable:
+        # 一个像路径的目标都没取到。这不是"没有目标"，是"说不清要删什么"，
+        # 所以落待定档；删除类调用方会再把它抬到极高危（见 ``_classify``）。
+        return TIER_UNKNOWN
+    tiers = [_tier_of_one(t, working_directory) for t in usable]
+    for tier in (TIER_EXTREME, TIER_NORMAL, TIER_RECOVERABLE):
+        if tier in tiers:
+            return tier
+    return TIER_UNKNOWN
+
+
+def tier_for_command(command: str, working_directory: str | None) -> str:
+    """一条命令的目标档位。闸门与词典共用这一个函数。"""
+    return target_tier(delete_targets(command),
+                       working_directory=working_directory,
+                       unparseable=target_unparseable(command))
+
+
+def severity_for_tier(tier: str) -> str:
+    """目标档位 → 严重度（B2）。
+
+    unknown 落 warn 而不是 notice：看不懂的命令按最坏的猜。
+    这是 B1「归一化失败不得低于 notice」与 B2「没见过的默认待定」的交汇点。
+    """
+    return {
+        TIER_EXTREME: "critical",
+        TIER_NORMAL: "warn",
+        TIER_RECOVERABLE: "notice",
+        TIER_UNKNOWN: "warn",
+    }.get(tier, "warn")
+
 
 
 def scope_line(facts: CommandFacts, working_directory: str | None) -> str:

@@ -36,6 +36,13 @@ from plugin.plugins.agent_deskmate.approval import (
     normalize_warning_mode,
     warning_key,
 )
+from plugin.plugins.agent_deskmate.commands import (
+    TIER_EXTREME,
+    TIER_NORMAL,
+    TIER_RECOVERABLE,
+    TIER_UNKNOWN,
+    TIERS,
+)
 from plugin.plugins.agent_deskmate.warncount import WarningCounter, counts_path
 
 
@@ -177,23 +184,24 @@ def test_gate_still_refuses_a_badged_high_risk_action() -> None:
 
 # ── 归类键 ───────────────────────────────────────────────────────────────
 
-def test_irreversible_actions_count_by_class() -> None:
-    assert warning_key(ACTION_CLASS_IRREVERSIBLE, "critical") == (
-        ACTION_CLASS_IRREVERSIBLE)
+def test_keys_are_per_target_tier() -> None:
+    """B2 之后按**目标档位**计，不按 action_class 计。
 
-
-def test_other_actions_count_by_risk_band() -> None:
-    """规格说按 action_class 计，但那样会有一个坑：
-
-    万一来一条"可恢复但极高危"的请求，它的键会和所有低风险请求一模一样
-    （都是 ``recoverable``）——点几次低风险之后，这条极高危的红字就被
-    递减掉了。用错阈值比没有阈值危险，所以这里按风险档另开一个命名空间。
+    老口径按 action_class，坑在：可恢复但极高危的请求会和所有低风险请求共用
+    ``recoverable`` 这个键，点几次低风险之后那条极高危的红字就被递减掉了。
+    四档各一个键，互不相撞。
     """
-    assert warning_key(ACTION_CLASS_RECOVERABLE, "critical") == "risk:critical"
-    assert warning_key(ACTION_CLASS_RECOVERABLE, "notice") == "risk:notice"
-    # 两个命名空间不相撞
-    assert (warning_key(ACTION_CLASS_IRREVERSIBLE, "critical")
-            != warning_key(ACTION_CLASS_RECOVERABLE, "critical"))
+    assert warning_key(TIER_EXTREME) == "tier:extreme"
+    assert warning_key(TIER_NORMAL) == "tier:normal"
+    assert warning_key(TIER_RECOVERABLE) == "tier:recoverable"
+    assert warning_key(TIER_UNKNOWN) == "tier:unknown"
+    assert len({warning_key(t) for t in TIERS}) == len(TIERS)
+
+
+def test_empty_tier_falls_back_to_unknown() -> None:
+    """拿不到档位时按 unknown 计——不猜，也不和低风险共用一个键。"""
+    assert warning_key("") == "tier:unknown"
+    assert warning_key(None) == "tier:unknown"
 
 
 # ── 计数：落盘、重启不丢、坏了不影响卡片 ─────────────────────────────────

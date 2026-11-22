@@ -102,12 +102,32 @@ def test_evaluate_delete_returns_hit() -> None:
     hit = evaluate_delete("rm -rf build/", agent="claude-code", session="s1", ts="2026-11-21T00:00:00+00:00")
     assert hit is not None
     assert hit.rule == RULE_DELETE
-    assert hit.severity == SEVERITY_CRITICAL
+    # B2 之后严重度按**目标档位**定：`build/` 是可重建的构建产物目录，
+    # 落"可恢复"档 → notice。不再是"出现删除 token 就一律 critical"。
+    assert hit.severity == SEVERITY_NOTICE
     assert hit.matched == "rm"
     # 合并键里带命令指纹：同一条命令重复出现才合并，不同命令必须各自播
     assert hit.coalesce_key.startswith("delete|s1|claude-code|rm|")
     assert len(hit.coalesce_key.rsplit("|", 1)[-1]) == 12
     assert "build/" in hit.summary
+
+
+def test_evaluate_delete_severity_follows_the_target_tier() -> None:
+    """同一个 `rm`，目标不同严重度不同（B2 的核心变化）。"""
+    def severity_of(command: str, cwd: str | None = r"D:\workspace\proj") -> str:
+        source = _source(command=command, working_directory=cwd)
+        hit = evaluate_delete(command, agent="a", session="s", source=source)
+        assert hit is not None
+        return hit.severity
+
+    assert severity_of("rm -rf ~") == SEVERITY_CRITICAL                 # 家目录
+    assert severity_of("rm -rf /etc") == SEVERITY_CRITICAL              # 系统目录
+    assert severity_of("rm -rf D:/other/x.txt") == SEVERITY_CRITICAL    # 工作区外
+    assert severity_of("rm -rf D:/workspace/proj/src") == SEVERITY_WARN  # 工作区内
+    assert severity_of("rm -rf node_modules") == SEVERITY_NOTICE        # 可重建
+    assert severity_of("rm -rf build") == SEVERITY_NOTICE
+    # 拿不到工作目录 → 说不清在不在范围内 → 按最坏的猜
+    assert severity_of("rm -rf x", None) == SEVERITY_CRITICAL
 
 
 def test_evaluate_delete_none_on_safe() -> None:
