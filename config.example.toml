@@ -136,3 +136,16 @@ base_url = "https://api.deepseek.com"
 api_key = ""
 # 模型名
 model = "deepseek-chat"
+
+# ── 自动审查档（实验性，默认关）────────────────────────────────────────
+# 让模型只看「命令、工作目录、目标本地事实、本地规则档位」这四类信息后
+# 给出风险分类；**只有它判「低风险且允许」时才替你放行**，其余一律仍然问你。
+# 模型分类可能出错，错误放行需你承担后果——所以它默认关，
+# 且必须单独签字（approval_authorize 里的第三项），不是改个 true 就能用。
+[agent_deskmate.auto_review]
+enabled = false
+# 下面四项留空表示复用 [agent_deskmate.model] 里的同一套连接信息。
+protocol = "openai"
+base_url = ""
+api_key = ""
+model = ""

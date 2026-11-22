@@ -37,6 +37,7 @@ from plugin.plugins.agent_deskmate.approval import (
     APPROVE_DENY,
     AUTH_SCOPE_ADVICE,
     AUTH_SCOPE_AUTO,
+    AUTH_SCOPE_REVIEW,
     AUTH_SCOPES,
     AUTHORIZATION_HEADLINE,
     AUTO_LOW_RISK_ONLY,
@@ -1423,13 +1424,15 @@ def test_every_card_the_user_can_see_has_no_internal_words() -> None:
             f"授权卡出现了内部词 {phrase!r}")
         assert phrase not in AUTHORIZATION_TEXT, (
             f"授权正文里出现了内部词 {phrase!r}")
-    assert scope_text(AUTH_SCOPES) == "模型建议、低风险时自动放行"
+    assert scope_text(AUTH_SCOPES) == ("模型建议、低风险时自动放行、"
+                                     "让模型先审一次，低风险才放行")
     # 结果卡（三种结局都要查）。第四条用人话版的授权溯源——
     # 它正是 _settle_approval_card 现在传进去的那一种。
     for note in ("已允许，Claude Code 继续执行。",
                  "已拒绝，这次调用被中止。",
                  "已过期：宿主已自行处理，本插件未做判断。",
-                 "已凭你的授权自动放行（模型建议、低风险时自动放行（v1 已确认），"
+                 "已凭你的授权自动放行（模型建议、低风险时自动放行、"
+                 "让模型先审一次，低风险才放行（v1 已确认），"
                  "模型 m，理由 低风险）"):
         for phrase in BANNED_INTERNAL:
             assert phrase not in _visible(build_result_html(note)), (
@@ -1641,7 +1644,7 @@ def test_grant_writes_an_audit_row_with_scope_and_version(tmp_path: Path) -> Non
     gateway = ApprovalGateway(ListLogger(), port=_free_port(),
                               authorization_path=tmp_path / "authorization.json")
     record = gateway.grant_authorization([AUTH_SCOPE_AUTO, AUTH_SCOPE_ADVICE,
-                                          "不是合法范围"])
+                                          AUTH_SCOPE_REVIEW, "不是合法范围"])
     assert set(record.scopes) == set(AUTH_SCOPES)     # 非法范围被丢掉，不猜
     assert set(gateway.authorized_scopes()) == set(AUTH_SCOPES)
 
@@ -1653,6 +1656,7 @@ def test_grant_writes_an_audit_row_with_scope_and_version(tmp_path: Path) -> Non
     assert row["decision"] is None                    # 授权不是一次审批决定
     assert "ai_judgement" in row["authorization"]
     assert "auto_decide" in row["authorization"]
+    assert "auto_review" in row["authorization"]
     assert "v1" in row["authorization"]
     assert "承担后果" in row["reason"]
     assert row["time"]                                # ISO 时间

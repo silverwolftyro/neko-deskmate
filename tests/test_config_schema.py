@@ -247,6 +247,7 @@ def test_no_other_field_is_write_only(schema: dict) -> None:
     hidden = [path for path, node in _leaf_nodes(schema)
               if node.get("writeOnly")]
     assert sorted(hidden) == ["agent_deskmate.approval.api_key",
+                              "agent_deskmate.auto_review.api_key",
                               "agent_deskmate.model.api_key"], hidden
 
 

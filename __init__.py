@@ -82,6 +82,7 @@ from .approval import (
     warning_key,
     warning_mode_for_tier,
 )
+from .auto_review import AutoReviewer
 from .broadcast import Broadcaster, describe_actor, render_text
 from .commands import (
     COMMAND_DISPLAY_MAX,
@@ -386,6 +387,46 @@ def _advisor_from_config(config: dict[str, Any]) -> ModelAdvisor:
     )
 
 
+def _reviewer_from_config(config: dict[str, Any]) -> AutoReviewer | None:
+    """按配置造 B9 的自动审查客户端。**没配就返回 None**。
+
+    返回 None 而不是"配一个 enabled=False 的"：那会让 ``_maybe_auto_allow``
+    每次都要多判一次开关，而且状态行说不清"没接"和"关了"的区别。
+    没接审查器时，B9 这条路整个不存在。
+
+    复用 ``[agent_deskmate.model]`` 的连接信息（同一个模型端点），
+    但**开关独立**：``[agent_deskmate.auto_review] enabled``。
+    模型建议开着不代表要开自动审查——前者只说话，后者真的会放行。
+    """
+    section = _model_section(config)
+    review = config.get("auto_review")
+    review = review if isinstance(review, dict) else {}
+    if not _to_bool(review.get("enabled"), False):
+        return None
+    api_key = str(review.get("api_key") or section.get("api_key") or "").strip()
+    reviewer = AutoReviewer(
+        protocol=str(review.get("protocol") or section.get("protocol")
+                     or "openai").strip().lower(),
+        base_url=str(review.get("base_url") or section.get("base_url") or "").strip(),
+        api_key=api_key,
+        model=str(review.get("model") or section.get("model") or "").strip(),
+        enabled=True,
+    )
+    gap = reviewer.missing()
+    if gap:
+        # 配了开关却缺东西：不当"没配"，要说明缺什么。
+        # 静默忽略的后果是用户以为审查在跑，其实一次都没发生过。
+        _REVIEWER_GAP[0] = gap
+        return None
+    _REVIEWER_GAP[0] = ""
+    return reviewer
+
+
+# 装配 B9 时缺的那一样。模块级而不是 self 上：_start_approval_service 里
+# 要用它打日志，而那时 self._approval 还没建起来。
+_REVIEWER_GAP: list[str] = [""]
+
+
 def _mine_roots(config: dict[str, Any]) -> list[Path]:
     """读用户声明的"这些目录里的会话是我自己开的"（``[agent_deskmate.mine].roots``）。
 
@@ -632,7 +673,13 @@ class AgentDeskmatePlugin(NekoPluginBase):
             # 曾经这里传的是"judge 在不在"，而 judge 恒为 None，于是模型建议
             # 明明在工作，启动行一直显示「生效=建议否」。
             advice_backend_ready=bool(self._advisor.enabled),
+            # B9 自动审查档。默认 None（没配 / 没签字都不接）。
+            reviewer=_reviewer_from_config(config),
         )
+        if _REVIEWER_GAP[0]:
+            self.logger.warning(
+                "自动审查档已配置但不可用（{}），该档不生效", _REVIEWER_GAP[0],
+            )
         if not self._approval.start():
             self._approval = None
             return

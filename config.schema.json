@@ -423,6 +423,93 @@
               "default": "deepseek-chat"
             }
           }
+        },
+        "auto_review": {
+          "type": "object",
+          "title": "Automatic review (experimental, off by default)",
+          "description": "Let a model classify each request from four narrow inputs, and auto-allow only when it says low risk plus allow. Off by default and needs its own authorization.",
+          "x-title-i18n": {
+            "en": "Automatic review (experimental, off by default)",
+            "zh-CN": "自动审查档（实验性，默认关）"
+          },
+          "x-description-i18n": {
+            "en": "Let a model classify each request from four narrow inputs, and auto-allow only when it says low risk plus allow. Off by default and needs its own authorization.",
+            "zh-CN": "让模型只看四类窄输入后给出风险分类，只有它判「低风险且允许」时才替你放行。默认关，且需要单独签字。"
+          },
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "title": "Enable automatic review",
+              "description": "Off by default. Turning it on is not enough on its own: the separate authorization must also be confirmed.",
+              "x-title-i18n": {
+                "en": "Enable automatic review",
+                "zh-CN": "开启自动审查"
+              },
+              "x-description-i18n": {
+                "en": "Off by default. Turning it on is not enough on its own: the separate authorization must also be confirmed.",
+                "zh-CN": "默认关。光改成 true 还不够，还要单独确认授权。"
+              },
+              "default": false
+            },
+            "protocol": {
+              "type": "string",
+              "title": "Protocol",
+              "description": "openai or anthropic. Leave empty to reuse the model section.",
+              "x-title-i18n": {
+                "en": "Protocol",
+                "zh-CN": "协议"
+              },
+              "x-description-i18n": {
+                "en": "openai or anthropic. Leave empty to reuse the model section.",
+                "zh-CN": "openai 或 anthropic。留空则复用模型那一节的设置。"
+              },
+              "enum": [
+                "openai",
+                "anthropic"
+              ],
+              "default": "openai"
+            },
+            "base_url": {
+              "type": "string",
+              "title": "Base URL",
+              "description": "Leave empty to reuse the model section.",
+              "x-title-i18n": {
+                "en": "Base URL",
+                "zh-CN": "接口地址"
+              },
+              "x-description-i18n": {
+                "en": "Leave empty to reuse the model section.",
+                "zh-CN": "留空则复用模型那一节的设置。"
+              }
+            },
+            "api_key": {
+              "type": "string",
+              "title": "API key",
+              "description": "Leave empty to reuse the model section. Never echoed back.",
+              "x-title-i18n": {
+                "en": "API key",
+                "zh-CN": "接口密钥"
+              },
+              "x-description-i18n": {
+                "en": "Leave empty to reuse the model section. Never echoed back.",
+                "zh-CN": "留空则复用模型那一节的设置。永不回显。"
+              },
+              "writeOnly": true
+            },
+            "model": {
+              "type": "string",
+              "title": "Model",
+              "description": "Leave empty to reuse the model section.",
+              "x-title-i18n": {
+                "en": "Model",
+                "zh-CN": "模型"
+              },
+              "x-description-i18n": {
+                "en": "Leave empty to reuse the model section.",
+                "zh-CN": "留空则复用模型那一节的设置。"
+              }
+            }
+          }
         }
       }
     }

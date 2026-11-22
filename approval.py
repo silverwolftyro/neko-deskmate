@@ -98,6 +98,7 @@ from .commands import (
     command_display_note,
     command_length,
     conclusion_for,
+    delete_targets,
     severity_for_tier,
     tier_for_command,
     translate,
@@ -127,7 +128,19 @@ DECIDED_BY_AUTHORIZATION = "authorization"
 AUTHORIZATION_VERSION = 1
 AUTH_SCOPE_ADVICE = "ai_judgement"
 AUTH_SCOPE_AUTO = "auto_decide"
-AUTH_SCOPES = (AUTH_SCOPE_ADVICE, AUTH_SCOPE_AUTO)
+# B9：自动审查档是**第三个**授权范围，与 auto_decide 分开签。
+# 分开的理由：它放行的东西比 auto_decide 宽（后者今天只覆盖只读白名单），
+# 用户该能只签"给建议"、或"给建议 + 只读白名单自动放行"而**不**签模型审查。
+AUTH_SCOPE_REVIEW = "auto_review"
+AUTH_SCOPES = (AUTH_SCOPE_ADVICE, AUTH_SCOPE_AUTO, AUTH_SCOPE_REVIEW)
+
+# 授权文案里关于 B9 的那一句。**必须含"分类可能出错、错误放行需你承担后果"**——
+# 任务书的硬要求，测试逐句盯着。
+AUTHORIZATION_REVIEW_TEXT = (
+    "自动审查档会让模型只看「命令、工作目录、目标本地事实、本地规则档位」"
+    "这四类信息后给出风险分类；只有它判「低风险且允许」时才会替你放行，"
+    "其余一律仍然问你。模型分类可能出错，错误放行需你承担后果。"
+)
 
 AUTHORIZATION_TITLE = "同桌猫 · 授权确认"
 # 授权文案。必须包含"模型判断可能出错"与"决定由你授权并承担后果"——
@@ -302,6 +315,52 @@ def _command_of_record(record: Any) -> str:
     return str(getattr(request, "full_command", "") or "")
 
 
+def local_facts_for(record: Any) -> str:
+    """B10 第 3 类输入：**目标本地事实**，一行给人也給模型看的话。
+
+    只收四样：存不存在 / 是文件还是目录 / 多大 / 在不在工作目录里。
+    **不看内容**（那可能是一整份源码或一份密钥），也**不读 git**
+    （一次子进程调用换来一句"被跟踪/没被跟踪"，代价与注入面都不值）。
+
+    全部来自本机文件系统，一次 ``stat`` 而已；拿不到就说"说不清"——
+    事实说不清的时候编一条，比没有更坏。
+    """
+    request = getattr(record, "request", None)
+    command = str(getattr(request, "full_command", "") or "")
+    cwd = str(getattr(request, "working_directory", "") or "")
+    targets = delete_targets(command)
+    if not targets:
+        return "（没有可检查的路径目标）"
+    bits: list[str] = []
+    for target in targets[:3]:
+        path = Path(target)
+        if not path.is_absolute() and cwd:
+            path = Path(cwd) / path
+        if not path.exists():
+            bits.append(f"{target}：不存在")
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            bits.append(f"{target}：存在，大小说不清")
+            continue
+        kind = "目录" if path.is_dir() else "文件"
+        inside = ""
+        if cwd:
+            inside = "，在工作目录内" if _is_under(path, cwd) else "，在工作目录外"
+        bits.append(f"{target}：{kind}，约 {size} 字节{inside}")
+    return "；".join(bits)
+
+
+def _is_under(path: Path, root: str) -> bool:
+    try:
+        resolved = path.resolve()
+        base = Path(root).resolve()
+    except OSError:
+        return False
+    return resolved == base or base in resolved.parents
+
+
 def effective_max_severity(configured: str) -> str:
     """把配置里的 L2 阈值夹到合法上限。纯函数，便于单测。
 
@@ -364,6 +423,43 @@ def auto_decide_gate(*, severity: str, ai_judgement: bool,
     if not readonly:
         return False, "不在 L2 只读白名单内，回落为 L1"
     return True, "L2 门控通过"
+
+
+def auto_review_gate(*, severity: str, rule: str, risk_tier: str,
+                     enabled: bool, authorized_scopes: tuple[str, ...] = (),
+                     ) -> tuple[bool, str]:
+    """B9：值得**去问模型一次**的本地门槛。过了才发起审查。
+
+    与 ``auto_decide_gate`` 是两道不同的墙，别合起来：
+
+    - ``auto_decide_gate`` 是"本地事实自己就够放行"（只读白名单），
+      所以它要求 ``readonly``；
+    - 这道是"本地说不准，让模型补一只眼"，所以**不要求白名单**——
+      否则 B9 永远只会覆盖 `ls` 这类已经放行了的东西，白做。
+
+    但本地仍然留着三道否决权（B0 原则 6：模型可能错误放权，
+    不靠模型自觉，靠结构限制）：
+
+    1. 没开 / 没签字 → 不问；
+    2. critical 严重度 → 不问（极高危档任何配置不得自动放行）；
+    3. 极高危档位 → 不问（工作区外 / 家目录 / 盘根 / 系统目录 / 目标不可解析）；
+    4. 词典认得的不可恢复动作（``discard``，如 ``git reset --hard``）→ 不问。
+       这一类本地已经知道"找不回来"，让模型一句话就放行不合理。
+
+    过了这道门也只意味着"可以问"，**最终放行与否由模型那一侧的
+    合法组合表决定**（``auto_review.parse_review``），且只有 ``low+allow`` 放行。
+    """
+    if not enabled:
+        return False, "自动审查档未开启"
+    if AUTH_SCOPE_REVIEW not in authorized_scopes:
+        return False, "未确认 auto_review 授权（见 approval_authorize）"
+    if SEVERITY_ORDER.get(severity, 99) >= SEVERITY_ORDER["critical"]:
+        return False, f"风险 {severity} 属极高危档，任何配置不得自动放行"
+    if risk_tier == TIER_EXTREME:
+        return False, "目标属极高危档位，任何配置不得自动放行"
+    if rule == RULE_DISCARD:
+        return False, "词典已认定它不可恢复，不让模型一句话放行"
+    return True, "自动审查档门控通过"
 
 
 def advice_state(*, ai_judgement: bool, has_key: bool, backend_ready: bool,
@@ -512,6 +608,10 @@ class PendingApproval:
         # L2 决定时填。
         self.judge_model: str = ""
         self.judge_reason: str = ""
+        # B9：自动审查档判出的风险档（low / medium / high）。
+        # 空 = 这条路没走过。审计要能看出"凭什么放行的"——
+        # 只写"模型说允许"不够，得写它判的是哪一档。
+        self.review_risk: str = ""
         # 生效中的授权（"v1:ai_judgement,auto_decide by=user"）——L2 审计要能
         # 追溯到"是谁授权的"，不能只写"AI 决定的"。
         self.authorization: str = ""
@@ -1267,6 +1367,7 @@ def build_authorize_actions(scopes: tuple[str, ...]) -> dict[str, dict[str, Any]
 AUTH_SCOPE_TEXT = {
     AUTH_SCOPE_ADVICE: "模型建议",
     AUTH_SCOPE_AUTO: "低风险时自动放行",
+    AUTH_SCOPE_REVIEW: "让模型先审一次，低风险才放行",
 }
 
 
@@ -1384,6 +1485,9 @@ class AuditRecord(BaseModel):
     # **必须落审计**：卡片上只看得到"无法判断"，看不到"模型本来想说 allow"——
     # 而事后复盘时这两者的差别很大（一个是模型含糊，一个是模型说反了）。
     advice_note: str = Field(default="", description="模型建议与风险档的冲突说明；空 = 无冲突")
+    # B9：自动审查档给出的风险档。**只有自动放行时才非空**——
+    # 它是"凭什么放行"的一部分，与 decision/model/reason 并列。
+    review_risk: str = Field(default="", description="自动审查档判出的风险档；空 = 未走该档")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1406,6 +1510,8 @@ class AuditRecord(BaseModel):
             "action_class": self.action_class or "-",
             "authorization": self.authorization or "-",
             "advice_note": self.advice_note or "-",
+            # B9：自动审查档的风险档。空 = 没走那条路（用 "-" 与其他空值一致）。
+            "review_risk": self.review_risk or "-",
         }
 
     def as_text(self) -> str:
@@ -1466,7 +1572,8 @@ class ApprovalGateway:
                  authorization_path: Any = None,
                  warning_counts_path: Any = None,
                  advice_backend_ready: bool = False,
-                 judge: Any = None) -> None:
+                 judge: Any = None,
+                 reviewer: Any = None) -> None:
         self._logger = logger
         self._port = int(port)
         self._timeout_seconds = float(timeout_seconds)
@@ -1496,6 +1603,9 @@ class ApprovalGateway:
         self._inflight = 0
         # 判断后端。5a 恒为 None——门控算得出来，但没有模型就不自动决定。
         self._judge = judge
+        # B9 自动审查档。**默认 None**：没接审查器时这条路整个不存在，
+        # 不是"接了但每次都失败"。接不接由 __init__ 的装配决定（配置 + 四样齐）。
+        self._reviewer = reviewer
         self._lock = threading.Lock()
         self._records: dict[tuple[str, str], PendingApproval] = {}
         self._audit: list[AuditRecord] = []
@@ -1735,10 +1845,35 @@ class ApprovalGateway:
             # 只读白名单（B2）在 rules 里算，这里只消费结论。
             readonly=l2_readonly_allowed(_command_of_record(record)),
         )
-        if not eligible:
-            # 绝大多数请求走这条（默认全关）。不打日志：每次都打就是噪音，
-            # 原因在卡片与审计里都能看到。
-            return False
+        if eligible:
+            # 本地事实自己就够（只读白名单）→ 走原来的 L2 路径。
+            # 这条路的结果**由它自己负责**：过了就不再去问 B9，
+            # 否则同一条请求会打两次模型。
+            return self._l2_decide(record, why, authorization, scopes)
+
+        # 本地门控没过。**B9 的机会在这里**——它补的正是"本地说不准、
+        # 又不想每次都问"的那一段，放行范围比只读白名单宽，但要模型点头。
+        if self._reviewer is not None:
+            allowed, review_why = auto_review_gate(
+                severity=record.severity, rule=record.rule,
+                risk_tier=record.risk_tier,
+                enabled=self._reviewer.enabled,
+                authorized_scopes=scopes,
+            )
+            if allowed:
+                return self._auto_allow_by_review(record, review_why)
+        # 绝大多数请求走这条（默认全关）。不打日志：每次都打就是噪音，
+        # 原因在卡片与审计里都能看到。
+        return False
+
+    def _l2_decide(self, record: PendingApproval, why: str,
+                   authorization: Any, scopes: tuple[str, ...]) -> bool:
+        """原来的 L2 路径：门控已过，问判断后端，只有 allow 才自动放行。
+
+        从 ``_maybe_auto_allow`` 里抽出来是为了给 B9 腾位置：
+        两条路的门槛不同（一个要求只读白名单，一个要求模型点头），
+        但"只有 allow 才放行、永不 auto-deny"是同一条不变式。
+        """
         if self._judge is None:
             # 门控算得过但没接判断后端（5a）。**不因为门控通过就自己拍一个**——
             # 那是插件在替用户判断。把请求留给用户，走到期。
@@ -1794,6 +1929,61 @@ class ApprovalGateway:
             record.request.request_id,
             authorization.as_audit_text() if authorization is not None else "-",
             record.judge_model or "-", record.judge_reason or "-",
+        )
+        return True
+
+    def _auto_allow_by_review(self, record: PendingApproval, why: str) -> bool:
+        """B9：模型审出 ``low+allow`` 才走到这里。其余一律不自动。
+
+        **永不 auto-deny**：模型说 deny 也只是个建议，拒绝必须由用户亲手点。
+        审查失败 / 不合法 / 超时 / 没 key → 全部呈现给人，走到期。
+        """
+        with self._lock:
+            authorization = self._authorization
+        try:
+            review = self._reviewer.review(
+                tool_name=record.request.tool_name,
+                command=_command_of_record(record),
+                cwd=record.request.working_directory or "",
+                tier=record.risk_tier,
+                facts=local_facts_for(record),
+            )
+        except Exception as exc:  # noqa: BLE001  审查炸了不能炸掉审批
+            self._logger.warning(
+                "请求 {} 的自动审查异常（{}），不自动决定，转交用户判断",
+                record.request.request_id, type(exc).__name__,
+            )
+            return False
+
+        if not review.auto_allows:
+            # 这里覆盖：medium（要人点）、high+deny（不自动拒绝）、
+            # 不合法组合、超时、401、网络失败。**失败一律不当放行。**
+            self._logger.info(
+                "请求 {} 的自动审查不放行（{}），转交用户判断",
+                record.request.request_id, review.detail or review.outcome,
+            )
+            return False
+
+        with self._lock:
+            # 用户可能在这一瞬间点了按钮——那种情况以用户为准，不覆盖。
+            if record.decided_by is not None:
+                return False
+            record.decision = APPROVE_ALLOW
+            record.decided_by = DECIDED_BY_AI
+            record.judge_model = review.model
+            record.judge_reason = review.reason or "模型未给理由"
+            record.review_risk = review.risk
+            record.authorization = (authorization.as_audit_text()
+                                    if authorization is not None else "")
+            record.authorization_card = (authorization.as_card_text()
+                                         if authorization is not None else "")
+            record.auto = True
+            record.card_id = ""
+            record.event.set()
+        self._logger.warning(
+            "请求 {} 由自动审查档放行（{}，模型 {} 判 {}+{}，理由 {}）",
+            record.request.request_id, why, review.model or "-",
+            review.risk, review.decision, record.judge_reason,
         )
         return True
 
@@ -1882,6 +2072,8 @@ class ApprovalGateway:
             reason=self._audit_reason(record),
             # 模型建议被风险档压掉时要能事后查到（A 批 A2 第 3 条）。
             advice_note=str(getattr(record, "advice", {}).get("conflict", "") or ""),
+            # B9：自动审查档的风险档。"凭什么放行"的一部分。
+            review_risk=str(getattr(record, "review_risk", "") or ""),
         )
         self._audit.append(entry)
         if len(self._audit) > AUDIT_MEMORY_LIMIT:
