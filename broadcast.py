@@ -128,7 +128,8 @@ def redact(text: str) -> str:
     return text
 
 
-def for_log(text: str, *, log_commands: bool = False) -> str:
+def for_log(text: str, *, log_commands: bool = False,
+            command_length: int | None = None) -> str:
     """写进日志前的最后一道处理。
 
     总是先脱敏（关掉 log_commands 也要脱敏——前 40 字照样可能含密钥）；
@@ -136,11 +137,17 @@ def for_log(text: str, *, log_commands: bool = False) -> str:
 
     默认值从这里改成 false：命令原文是用户这一侧最敏感的东西之一，
     而"默认就往磁盘写原文"是一个需要用户主动去改才安全的默认。
+
+    ``command_length`` 是**完整命令**的字数（``commands.command_length`` 算的），
+    由调用方从 RuleHit 上带下来。不传就退回数渲染行本身的长度——
+    那个数含【严重】前缀与定位尾巴，而且命令早被截断过，
+    跟卡片上"命令共 N 字"不是同一个数（B5 前的真机 bug：120 vs 268）。
     """
     safe = redact(text)
     if log_commands:
         return safe
-    return f"命令 {len(text)} 字：{safe[:LOG_COMMAND_HEAD_CHARS]}"
+    total = command_length if command_length is not None else len(text)
+    return f"命令 {total} 字：{safe[:LOG_COMMAND_HEAD_CHARS]}"
 
 # 会话短 id 的长度。全 UUID 有 36 字符，在一行播报里纯属噪音。
 SESSION_SHORT_LEN = 8
@@ -336,14 +343,17 @@ class Broadcaster:
         except Exception as exc:  # noqa: BLE001  播报失败绝不能炸掉观测循环
             self.rejected += 1
             self._logger.warning("播报抛出异常（{}）：{}", type(exc).__name__,
-                                 for_log(text, log_commands=self._log_commands))
+                                 for_log(text, log_commands=self._log_commands,
+                                         command_length=getattr(hit, "command_length",
+                                                               None)))
             return "exception"
 
         return self._handle_result(result, hit, text)
 
     def _handle_result(self, result: object, hit: RuleHit, text: str) -> str:
         # 聊天窗里给人看的是原文；落盘的一律过 for_log（脱敏 + 可选截断）
-        logged = for_log(text, log_commands=self._log_commands)
+        logged = for_log(text, log_commands=self._log_commands,
+                         command_length=getattr(hit, "command_length", None))
         if not isinstance(result, dict):
             self.rejected += 1
             self._logger.warning("播报返回了非预期类型 {}：{}", type(result).__name__, logged)

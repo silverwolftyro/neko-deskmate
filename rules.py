@@ -32,6 +32,7 @@ from .commands import (
     PRINT_ONLY_COMMANDS,
     TIER_SCOPE_UNKNOWN,
     basename,
+    command_length,
     delete_tier_for_command,
     severity_for_tier,
     simple_commands,
@@ -118,6 +119,12 @@ class RuleHit(AttributionFields):
     session: str = Field(default="", description="会话标识")
     ts: str = Field(default="", description="ISO8601 UTC")
     coalesce_key: str = Field(default="", description="合并键；相同则在窗口内只报一次")
+    # B5：完整命令的字数，**唯一来源是 commands.command_length**。
+    # 播报落盘、卡片提示、审计必须用同一个数——用户是拿它判断
+    # "我有没有看全"的。summary 里的命令已被截断，不能从它反推
+    # （老实现正是那么干的，于是同一条命令有两个字数：120 vs 268）。
+    command_length: int | None = Field(
+        default=None, description="完整命令字数；非命令类规则为 None")
 
     # 播报层归因（2026-11-21 决策记录 §5）：
     # chain_id 委托链根，**今天恒等于 session**。等将来 worker 自己的日志也可观测时，
@@ -281,6 +288,7 @@ def evaluate_delete(command: str, *, agent: str = "", session: str = "",
         # 实测依据：真实转录里一分钟内有 4 条不同 rm，按会话合并只会播 1 条。
         # 归因**不进**合并键（决策记录 §3）：合并按动作算，归因是显示层的事。
         coalesce_key=f"{RULE_DELETE}|{session}|{agent}|{matched}|{_fingerprint(command)}",
+        command_length=command_length(command),
         **_attribution_of(source),
     )
 

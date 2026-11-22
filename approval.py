@@ -803,14 +803,25 @@ class WarningPolicy:
 #
 # **爬不到就说不知道**：空链一律「上游未知」，绝不拿当前进程名凑一个。
 UPSTREAM_UNKNOWN = "上游未知"
-UPSTREAM_MAX = 3
+# 最多显示几个节点。与中继的爬取深度一致（B5 从 3 提到 5）：
+# 老口径 3 层，多套一层 shell 就断在 bash.exe ← bash.exe ← claude.exe，
+# 看不到真正的发起者（真机实测）。过滤 shell 之后仍要留得下 3 个有效节点，
+# 所以这里也跟着放到 5。
+UPSTREAM_MAX = 5
+# 纯 shell 层：**展示时跳过**（B5）。它们只是"命令怎么被递到的"，
+# 不是"谁发起的"。DSH → pwsh → claude 这条链上，用户要知道的是 DSH，
+# 不是中间那层 pwsh。爬取时仍然要爬——不爬过去就找不到更上面那个。
+UPSTREAM_SHELLS = frozenset({
+    "bash", "sh", "cmd", "pwsh", "powershell", "dash", "zsh",
+})
 # 中继写进请求体的键名。**必须与 hook_relay.py 的 UPSTREAM_FIELD 一致**，
 # 一致性由 tests/test_upstream.py 里的一条测试盯着。
 # 带前缀是因为请求体本身是 Claude Code 的：将来它加一个叫 ``upstream``
 # 的字段，不带前缀的我们就会把它的内容当成进程链显示给用户——错归因。
 UPSTREAM_FIELD = "deskmate_upstream"
-# 可执行路径里能认出来的发起者 → 友好名。按**完整词**匹配（``\b`` 边界）：
-# "desk" 不许命中 "Desktop"——那种误报比没有友好名更糟。
+# 可执行路径里能认出来的发起者 → 友好名。**按整词匹配、长词优先**：
+# 短词（``desk`` / ``dsh``）是给误判留的门，所以先试长的，
+# 而且必须整个词命中——``nodesk.exe`` 不许算命中 ``desk``。
 # 认不出来的显示 exe 名本身：宁可少说，不错说。
 UPSTREAM_FRIENDLY = (
     ("deepseek", "DeepSeek Harness"),
@@ -818,22 +829,55 @@ UPSTREAM_FRIENDLY = (
     ("mcode", "mcode"),
     ("desk", "desk"),
 )
+# 长词优先：短词恰好是长词开头时（``dsh`` / ``dsharness``），
+# 先匹配长的那个，否则短词会抢走本该归给长词的条目。
+_FRIENDLY_BY_LENGTH = tuple(sorted(UPSTREAM_FRIENDLY,
+                                   key=lambda item: -len(item[0])))
+
+
+def _exe_stem(name: str) -> str:
+    """``pwsh.exe`` → ``pwsh``。只剥可执行后缀，别的一概不动。"""
+    text = str(name or "").strip().lower()
+    for suffix in (".exe", ".com", ".bat", ".cmd", ".ps1"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def _is_shell_exe(name: str) -> bool:
+    """这一层是纯 shell 吗（bash/sh/cmd/pwsh…）。展示时跳过它。"""
+    return _exe_stem(name) in UPSTREAM_SHELLS
+
+
+def _path_words(path: str) -> set[str]:
+    """把路径切成**词**：按非字母数字切开。
+
+    用词匹配而不是 ``\\b``：``\\b`` 把下划线当词字符，于是 ``dsh_tools``
+    不匹配而 ``dsh.tools`` 匹配——同一个意思两种结果，全看用户用什么分隔符。
+    按"非字母数字即分隔"切，两条路径的答案就一致了。
+    """
+    lowered = str(path or "").lower().replace("\\", "/")
+    return {word for word in re.split(r"[^0-9a-z]+", lowered) if word}
 
 
 def _friendly_exe(path: str, name: str) -> str:
-    lowered = str(path or "").lower().replace("\\", "/")
-    for needle, friendly in UPSTREAM_FRIENDLY:
-        if re.search(rf"\b{re.escape(needle)}\b", lowered):
+    words = _path_words(path)
+    for needle, friendly in _FRIENDLY_BY_LENGTH:
+        if needle in words:
             return f"{name}（{friendly}）"
     return name
 
 
 def describe_upstream(upstream: Any) -> str:
-    """进程链 → 一行人话：``pwsh.exe ← node.exe（DeepSeek Harness）``。
+    """进程链 → 一行人话：``node.exe（DeepSeek Harness）``。
 
     链按"谁拉起了谁"从近到远排，所以用 ``←`` 连接。
     **这不是证据链，只是线索**：Windows 上父进程可能已退出、中间常隔一层
     shell，所以它只用来回答"这是我自己开的吗"，不参与任何门控判断。
+
+    B5：纯 shell 层（bash/sh/cmd/pwsh…）在展示前滤掉，**且不计入条数上限**——
+    先截断再过滤的话，三条 shell 就能把真正的发起者挤掉，
+    结果是"明明知道却显示上游未知"。
     """
     labels: list[str] = []
     if isinstance(upstream, (list, tuple)):
@@ -843,7 +887,7 @@ def describe_upstream(upstream: Any) -> str:
             if not isinstance(entry, dict):
                 continue
             name = str(entry.get("name") or "").strip()
-            if not name:
+            if not name or _is_shell_exe(name):
                 continue
             labels.append(_friendly_exe(str(entry.get("path") or ""), name))
     return " ← ".join(labels) if labels else UPSTREAM_UNKNOWN

@@ -38,6 +38,8 @@ DSH_CHAIN = [
     {"name": "node.exe",
      "path": r"C:\Users\alpha\AppData\Local\Programs\DeepSeek Harness\node.exe"},
 ]
+# B5 之后纯 shell 层在展示时被滤掉，所以这条链显示出来只剩 node 那个节点。
+DSH_RENDERED = "node.exe（DeepSeek Harness）"
 
 
 def test_the_two_sides_agree_on_the_field_name() -> None:
@@ -63,16 +65,19 @@ def test_the_wire_format_agrees_end_to_end(monkeypatch: pytest.MonkeyPatch) -> N
     request = build_request(json.loads(on_the_wire.decode("utf-8")))
 
     assert request.upstream == DSH_CHAIN
-    assert describe_upstream(request.upstream) == (
-        "pwsh.exe ← node.exe（DeepSeek Harness）")
+    assert describe_upstream(request.upstream) == DSH_RENDERED
 
 
 # ── 展示：链 → 一行人话 ───────────────────────────────────────────────────
 
 def test_chain_renders_with_arrows_and_friendly_names() -> None:
-    """规格 Q1 的原话形状：``pwsh.exe ← node.exe（DeepSeek Harness）``。"""
-    expected = "pwsh.exe ← node.exe（DeepSeek Harness）"
-    assert describe_upstream(DSH_CHAIN) == expected
+    """规格 Q1 的原话形状，B5 起纯 shell 层被滤掉。
+
+    原来这里期望 ``pwsh.exe ← node.exe（DeepSeek Harness）``。
+    真机反馈：用户要找的是 DeepSeek Harness，中间那层 pwsh 只是
+    "命令怎么被递到的"，不是"谁发起的"——所以展示时滤掉。
+    """
+    assert describe_upstream(DSH_CHAIN) == DSH_RENDERED
 
 
 def test_unknown_when_there_is_no_chain() -> None:
@@ -85,8 +90,8 @@ def test_entries_without_a_name_are_dropped() -> None:
     """没有 exe 名的条目等于没有信息，丢掉而不是显示一个空白。"""
     assert describe_upstream([{"name": "", "path": "C:/x"},
                               {"path": "C:/y"}, "str",
-                              {"name": "cmd.exe", "path": "C:/Windows/cmd.exe"}]
-                             ) == "cmd.exe"
+                              {"name": "node.exe", "path": "C:/node.exe"}]
+                             ) == "node.exe"
 
 
 def test_bad_entries_do_not_push_good_ones_out() -> None:
@@ -96,7 +101,7 @@ def test_bad_entries_do_not_push_good_ones_out() -> None:
     结果是"明明知道却显示上游未知"。
     """
     assert describe_upstream([{"name": ""}, {"name": ""}, {"name": ""},
-                              {"name": "cmd.exe", "path": "C:/c"}]) == "cmd.exe"
+                              {"name": "node.exe", "path": "C:/n"}]) == "node.exe"
 
 
 def test_chain_is_capped() -> None:
@@ -168,7 +173,7 @@ def test_card_shows_the_upstream_line() -> None:
     html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
                            session_id="800257f3", working_directory=None,
                            upstream=DSH_CHAIN)
-    assert "上游：pwsh.exe ← node.exe（DeepSeek Harness）" in html
+    assert f"上游：{DSH_RENDERED}" in html
 
 
 def test_card_says_unknown_without_an_upstream() -> None:

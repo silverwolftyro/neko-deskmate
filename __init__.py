@@ -86,6 +86,7 @@ from .broadcast import Broadcaster, describe_actor, render_text
 from .commands import (
     COMMAND_DISPLAY_MAX,
     CONCLUSION_UNSURE,
+    command_length,
 )
 from .events import UnifiedEvent, attribute, delegated_server
 from .hooksetup import (
@@ -1089,12 +1090,13 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # 理由：用户只看得到前 80 字，此时任何"建议允许"都是在信息不全的
         # 情况下替他省掉最不该省的那一步。模型照样调用（它的 prompt 里带头
         # 尾全文），理由仍进「这是什么」——但结论行必须是第三态。
-        over_limit = len(" ".join(command.split())) > COMMAND_DISPLAY_MAX
+        # 字数走 commands.command_length（B5：与播报、审计同一个数）。
+        total_chars = command_length(command)
+        over_limit = total_chars > COMMAND_DISPLAY_MAX
         if over_limit:
             self.logger.info(
                 "请求 {} 的命令 {} 字超过展示上限 {}，建议结论按无法判断呈现",
-                request.request_id, len(" ".join(command.split())),
-                COMMAND_DISPLAY_MAX,
+                request.request_id, total_chars, COMMAND_DISPLAY_MAX,
             )
         loop = asyncio.get_running_loop()
         try:

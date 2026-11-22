@@ -934,11 +934,23 @@ def command_display_note(command: str) -> str:
     信息不全的情况下点"允许"。所以超长时必须明说，并把全文指向
     「这是什么」——那里有等宽的完整原文。
     """
-    total = len(" ".join(str(command or "").split()))
+    total = command_length(command)
     if total <= COMMAND_DISPLAY_MAX:
         return ""
     return (f"命令共 {total} 字，只显示前 {COMMAND_DISPLAY_MAX} 字，"
             f"尾部未显示；完整命令在「这是什么」里")
+
+
+def command_length(command: str) -> int:
+    """命令的字数。**唯一来源**——播报、卡片、审计都用这一个数。
+
+    老实现两处各算一遍，算法还不一样：播报那边数的是**渲染后的一行**
+    （含【严重】前缀、定位尾巴，而命令本身早已被截到 80 字），
+    审批那边数的是完整命令。同一条命令于是有两个字数
+    （真机实测：播报 120 字 vs 审批 268 字）。
+    用户是拿这个数字判断"我有没有看全"的——两个数字等于没有数字。
+    """
+    return len(" ".join(str(command or "").split()))
 
 
 def first_banned(text: str) -> str | None:
