@@ -115,7 +115,12 @@ class CwdCache:
 
 
 class ClaudeCodeAdapter:
-    """一次会话一个 offset 的 tail 器。offset 存在内存里，重启后从末尾开始。"""
+    """一次会话一个 offset 的 tail 器。offset 存在内存里，重启后从末尾开始。
+
+    B4：**启动时已存在**的文件从末尾开始（不把几个月历史倒进来播），
+    **运行期新出现**的文件从 0 开始读——否则新会话的头几条事件
+    （含第一次删除）会被"首次见到就当历史"整段吃掉。
+    """
 
     def __init__(self, projects_dir: Any) -> None:
         self.projects_dir = Path(projects_dir)
@@ -123,6 +128,9 @@ class ClaudeCodeAdapter:
         # B8：跨轮次记住每个会话的 cwd。放在适配器里而不是全局——
         # 它是"这一批观测源"的状态，跟 offset 一样重启即失效。
         self._cwd = CwdCache()
+        # B4：构造时目录里已经有的文件。用于区分"历史"与"刚刚产生"。
+        self._seen_at_startup: frozenset[str] = frozenset(
+            str(path) for path in iter_transcript_files(self.projects_dir))
 
     def available(self) -> bool:
         return self.projects_dir.is_dir()
@@ -134,10 +142,15 @@ class ClaudeCodeAdapter:
             key = str(path)
             offset = self._offsets.get(key, 0)
             if offset == 0:
-                # 第一次见到这个文件：从当前末尾开始，不要把历史全量倒进来
-                offset = path.stat().st_size
-                self._offsets[key] = offset
-                continue
+                # 第一次见到这个文件。分两种：
+                # ① 构造时就在 → 历史，从当前末尾开始，不播；
+                # ② 运行期新出现 → 这个会话是插件加载后才开的，
+                #    从 0 开始读，否则它开头的事件全丢
+                #    （老实现不区分，一律跳到末尾——新会话的首次删除就这么没了）。
+                if key in self._seen_at_startup:
+                    self._offsets[key] = path.stat().st_size
+                    continue
+                # 运行期新文件：offset 保持 0，落到下面的读取里
             new_events, new_offset = read_new_transcript_events(path, offset)
             self._offsets[key] = new_offset
             events.extend(new_events)

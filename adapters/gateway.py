@@ -23,6 +23,16 @@ from ..events import UnifiedEvent, parse_gateway_row
 
 _TABLE = "proxy_request_logs"
 
+# 只取用得上的列。老实现是 ``SELECT rowid AS _rowid, *``（28 列），
+# 两个实际问题：① 表被别的程序加列/改列时，``*`` 的形状会变，
+# 而 ``parse_gateway_row`` 只认自己那几个键，多出来的静默丢弃、
+# 少一个就整行报废；② 拉 28 列读 10 个，纯浪费。
+# 显式列名 = 依赖写在明面上，表结构变了这里会当场报错，而不是安静地少一列。
+GATEWAY_COLUMNS = (
+    "app_type", "model", "input_tokens", "output_tokens", "total_cost_usd",
+    "latency_ms", "status_code", "error_message", "session_id", "created_at",
+)
+
 
 def read_new_gateway_events(db_path: Any, watermark: int = 0,
                             limit: int = 500) -> tuple[list[UnifiedEvent], int]:
@@ -30,6 +40,10 @@ def read_new_gateway_events(db_path: Any, watermark: int = 0,
 
     ``limit`` 防止第一次就吞掉几万行——水位从 0 起跑时分批拉，
     但调用方通常会给一个「已初始化」的水位（见 ``GatewayAdapter``）。
+
+    **可能抛 ``sqlite3.Error``**：库被锁、表被改名、WAL 缺 -shm……
+    调用方必须自己兜住（见 ``GatewayAdapter.poll``），一个源炸掉
+    不该把同轮已经读到的转录事件一起带走。
     """
     path = Path(db_path)
     if not path.is_file():
@@ -37,11 +51,13 @@ def read_new_gateway_events(db_path: Any, watermark: int = 0,
 
     events: list[UnifiedEvent] = []
     new_watermark = watermark
+    columns = ", ".join(GATEWAY_COLUMNS)
     connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
     try:
         connection.row_factory = sqlite3.Row
         cursor = connection.execute(
-            f"SELECT rowid AS _rowid, * FROM {_TABLE} WHERE rowid > ? ORDER BY rowid LIMIT ?",
+            f"SELECT rowid AS _rowid, {columns} FROM {_TABLE} "
+            "WHERE rowid > ? ORDER BY rowid LIMIT ?",
             (watermark, limit),
         )
         for row in cursor:
@@ -56,7 +72,12 @@ def read_new_gateway_events(db_path: Any, watermark: int = 0,
 
 
 def current_watermark(db_path: Any) -> int:
-    """取当前最大 rowid，用于「从现在开始看」而不是把历史全量倒进来。"""
+    """取当前最大 rowid，用于「从现在开始看」而不是把历史全量倒进来。
+
+    **可能抛 ``sqlite3.Error``**：构造 ``GatewayAdapter`` 时就会走到这里，
+    所以构造本身也要能被调用方单独兜住（B4：网关建不起来，
+    不该让转录也永远起不来）。
+    """
     path = Path(db_path)
     if not path.is_file():
         return 0
@@ -68,12 +89,30 @@ def current_watermark(db_path: Any) -> int:
         connection.close()
 
 
+class GatewayReadError(Exception):
+    """网关**现在**读不了：这一轮读失败，或者连构造时的取水位都失败。
+
+    单独一个异常类型而不是让 ``sqlite3.Error`` 直接冒出去：调用方要按
+    "降级这一个源"处理它，类型写明白了，就不会有人顺手写成
+    ``except Exception`` 把转录那边的 bug 一起吞掉。
+
+    它**不代表永久故障**：库锁会解开、表会被建回来，下一轮照常重试。
+    """
+
+
 class GatewayAdapter:
     """持水位位的网关账本读取器。水位在内存里，重启后从当前 max(rowid) 开始。"""
 
     def __init__(self, db_path: Any, *, start_at_end: bool = True) -> None:
         self.db_path = Path(db_path)
-        self._watermark = current_watermark(self.db_path) if start_at_end else 0
+        try:
+            self._watermark = current_watermark(self.db_path) if start_at_end else 0
+        except sqlite3.Error as exc:
+            # 构造期就要读库（取当前 rowid 水位）。库被锁 / 表被改名 /
+            # WAL 缺 -shm 都在这里抛——老实现没有任何一层兜住它，
+            # 于是 ``_ensure_watchers`` 每轮失败，转录适配器永远建不起来：
+            # **网关坏了，删了什么都不播**。
+            raise GatewayReadError(str(exc)) from exc
 
     def available(self) -> bool:
         return self.db_path.is_file()
@@ -83,5 +122,18 @@ class GatewayAdapter:
         return self._watermark
 
     def poll(self, limit: int = 500) -> list[UnifiedEvent]:
-        events, self._watermark = read_new_gateway_events(self.db_path, self._watermark, limit)
+        """读一轮增量。**水位只在成功时前移**。
+
+        B4：老实现是 ``events, self._watermark = read_new_gateway_events(...)``，
+        一次 sqlite 错误会把异常抛给调用方，而调用方那一轮已经把转录事件
+        读在手里了——整批跟着一起丢，删除播报首当其冲。
+        """
+        try:
+            events, watermark = read_new_gateway_events(
+                self.db_path, self._watermark, limit)
+        except sqlite3.Error as exc:
+            # 只转 sqlite 的错误：库锁/表改名/WAL 缺 shm 都是"这轮读不到"，
+            # 不是"以后都读不到"。别的异常（编程错误）照样原样往上抛。
+            raise GatewayReadError(str(exc)) from exc
+        self._watermark = watermark
         return events

@@ -52,7 +52,7 @@ from .adapters.claude_code import (
     iter_transcript_files,
     read_new_transcript_events,
 )
-from .adapters.gateway import current_watermark, read_new_gateway_events
+from .adapters.gateway import GatewayReadError, current_watermark, read_new_gateway_events
 from .approval import (
     ADVICE_STATE_FALLBACK,
     ADVICE_STATE_READY,
@@ -129,6 +129,11 @@ TRANSCRIPT_TAIL_BYTES = 65536
 
 # 单轮最多播几条，防止适配器积压后一次刷屏。
 MAX_BROADCAST_PER_TICK = 5
+
+# 单个观测源连续失败时，日志最短间隔多少秒（B4）。
+# 网关库锁是**持续状态**：不限制的话每 3 秒一条 warning，
+# 日志会比播报还吵，真正要看的删除记录被冲掉。
+SOURCE_ERROR_LOG_EVERY = 60.0
 
 # scan_now 每个数据源最多回看多少条事件。只读诊断，够看出规则对不对就行。
 SCAN_EVENT_COUNT = 50
@@ -773,6 +778,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._transcript_adapter = None
         self._gateway_adapter = None
         self._broadcaster = None
+        # B4：各观测源上一次报错的时间，用于限频（见 ``_poll_source``）。
+        self._source_error_at: dict[str, float] = {}
         self.logger.info("配置已变更，观测适配器将在下一轮重建（审批授权不受影响）")
         return Ok({"status": "reloaded"})
 
@@ -818,10 +825,18 @@ class AgentDeskmatePlugin(NekoPluginBase):
             ClaudeCodeAdapter(projects_dir)
             if projects_dir is not None and projects_dir.is_dir() else None
         )
-        self._gateway_adapter = (
-            GatewayAdapter(db_path)
-            if db_path is not None and db_path.is_file() else None
-        )
+        # B4：网关适配器**单独兜**。它的构造就要读库（取当前 rowid 水位），
+        # 库被锁 / 表被改名 / WAL 缺 -shm 都会在这里抛。
+        # 老实现没有这一层：GatewayAdapter 一抛，_ensure_watchers 整轮失败，
+        # 转录适配器永远建不起来——**网关坏了，删了什么都不播**。
+        self._gateway_adapter = None
+        if db_path is not None and db_path.is_file():
+            try:
+                self._gateway_adapter = GatewayAdapter(db_path)
+            except GatewayReadError as exc:
+                self.logger.warning(
+                    "网关观测源建不起来（{}），本轮起只有转录生效：{}",
+                    type(exc).__name__, exc)
         self._broadcaster = Broadcaster(
             self.push_message, self.logger, source=SOURCE,
             coalescer=Coalescer(window_seconds=coalesce_seconds),
@@ -832,6 +847,26 @@ class AgentDeskmatePlugin(NekoPluginBase):
             projects_dir, db_path, coalesce_seconds,
         )
         return self._broadcaster
+
+    def _poll_source(self, name: str, adapter: Any) -> list[UnifiedEvent]:
+        """轮询一个观测源，失败只降级**这一个**源（B4）。
+
+        老写法是两个 poll 顺序调用，网关一抛就把本轮已经读到的转录事件
+        一起带走——异常冒到 watch_tick，整轮作废，删除播报首当其冲。
+
+        限频日志：网关库锁是持续状态，不限制的话每 3 秒一条 warning，
+        日志会比播报还吵，真正要看的删除记录被冲掉。
+        """
+        try:
+            return adapter.poll()
+        except GatewayReadError as exc:
+            now = time.monotonic()
+            last = self._source_error_at.get(name, 0.0)
+            if now - last >= SOURCE_ERROR_LOG_EVERY:
+                self._source_error_at[name] = now
+                self.logger.warning("{}观测源本轮读取失败（{}），已跳过：{}",
+                                    name, type(exc).__name__, exc)
+            return []
 
     def _poll_once(self, config: dict[str, Any]) -> list[str]:
         """扫一轮观测源 → 跑规则 → 播报。同步函数，由 timer 丢进线程执行。
@@ -844,10 +879,12 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
         mine_roots = _mine_roots(config)
         events: list[UnifiedEvent] = []
+        # B4：两个源各自兜住。任何一个失败只降级它自己，
+        # 另一个源这一轮读到的事件照常播——网关库锁不该让删除播报消失。
         if self._transcript_adapter is not None:
-            events.extend(self._transcript_adapter.poll())
+            events.extend(self._poll_source("转录", self._transcript_adapter))
         if self._gateway_adapter is not None:
-            events.extend(self._gateway_adapter.poll())
+            events.extend(self._poll_source("网关", self._gateway_adapter))
 
         outcomes: list[str] = []
         for event in events:
