@@ -52,7 +52,6 @@ from plugin.plugins.agent_deskmate.approval import (
 from plugin.plugins.agent_deskmate.commands import (
     CONCLUSION_ALLOW,
     CONCLUSION_DENY,
-    CONCLUSION_UNSURE,
     CONCLUSIONS,
 )
 from plugin.plugins.agent_deskmate.model_advice import Advice, ModelAdvisor
@@ -229,10 +228,11 @@ def test_successful_advice_survives_the_whole_card_path() -> None:
         html = ctx.cards[0]["html"]
         # 主卡正文是固定四行，结论行是三种合法写法之一，且是**人话**
         assert "<strong>建议允许</strong>" in html
-        # 四行正文：动作行以 ⚠️ 开头（这条是未识别命令，所以走兜底文案），
-        # 后果行与范围行必须都在
+        # 动作行以 ⚠️ 开头（这条是未识别命令，所以走兜底文案）
         assert "⚠️" in html
-        assert "后果：" in html and "范围：" in html
+        # B7：认不出命令时后果/范围都是空话，**两行都不上卡片**
+        assert "后果：" not in html, "认不出命令还把空话写在卡片上"
+        assert "范围：" not in html, "认不出命令还把空话写在卡片上"
         # 同族第二例的守护：卡片上不许出现 allow / deny / unsure 这种 token
         visible = _visible(html)
         for token in ("allow", "deny", "unsure"):
@@ -308,9 +308,9 @@ def test_every_failure_outcome_still_produces_a_card(
         html = ctx.cards[0]["html"]
         assert "同桌猫 · 审批请求" in html
         assert 'data-neko-action="deskmate_approve"' in html
-        # 失败档位不编造结论
+        # 失败档位不编造结论：B7 之后连「无法判断」那一行都不渲染
         assert "建议：" not in html
-        assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
+        assert 'class="verdict"' not in html
     finally:
         gateway.stop()
 
@@ -339,7 +339,7 @@ def test_advisor_exploding_still_produces_a_card() -> None:
 
 
 def test_zero_key_still_produces_a_card() -> None:
-    """零 key（默认态）下结论落第三态，卡片照常。"""
+    """零 key（默认态）下没有结论行，卡片照常。"""
     gateway = _gateway()
     try:
         logger, ctx = ListLogger(), FakeCtx()
@@ -350,7 +350,8 @@ def test_zero_key_still_produces_a_card() -> None:
         assert len(ctx.cards) == 1
         html = ctx.cards[0]["html"]
         assert "同桌猫 · 审批请求" in html
-        assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
+        # B7：零 key 没有结论，**也没有结论行**——不是显示一句"无法判断"
+        assert 'class="verdict"' not in html
         assert "建议：" not in html
     finally:
         gateway.stop()
@@ -395,8 +396,8 @@ def test_unknown_advice_state_never_raises(state: str) -> None:
     # 按钮永远在——卡片的核心功能不依赖建议
     for action in ("deskmate_approve", "deskmate_deny", "deskmate_explain"):
         assert f'data-neko-action="{action}"' in html
-    # 结论行永远有值：三种合法结论之一
-    assert any(f"<strong>{text}</strong>" in html for text in CONCLUSIONS)
+    # B7：没有确定结论时**结论行整行不显示**——沉默比说"我不知道"更干净
+    assert 'class="verdict"' not in html
 
 
 @pytest.mark.parametrize("state", UNKNOWN_STATES)
@@ -407,7 +408,7 @@ def test_unknown_advice_state_falls_back_and_logs(state: str) -> None:
                            session_id="sess-xyz", working_directory=None,
                            advice_state=state,
                            logger=logger)
-    assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
+    assert 'class="verdict"' not in html, "没有建议却渲染出了结论行"
     assert "建议：" not in html
     if state in ADVICE_STATES:
         # 合法状态不该触发 warning
@@ -441,11 +442,12 @@ def test_every_known_state_renders_a_legal_conclusion() -> None:
                                session_id="s", working_directory=None,
                                advice_state=state,
                                conclusion=CONCLUSION_ALLOW)
-        assert any(f"<strong>{text}</strong>" in html for text in CONCLUSIONS), state
         if state == ADVICE_STATE_READY:
-            assert f"<strong>{CONCLUSION_ALLOW}</strong>" in html
+            assert f"<strong>{CONCLUSION_ALLOW}</strong>" in html, state
         else:
-            assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
+            # B7：建议层不就绪 → 没有结论，也**没有结论行**
+            assert 'class="verdict"' not in html, (
+                f"{state} 档位下居然渲染出了结论行")
 
 
 def test_fallback_state_is_itself_known() -> None:
@@ -464,7 +466,8 @@ def test_conclusion_cannot_appear_without_a_ready_state() -> None:
                                session_id="s", working_directory=None,
                                advice_state=state,
                                conclusion=CONCLUSION_ALLOW)
-        assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html, state
+        # B7：建议层不就绪 → 没有结论，也**没有结论行**
+        assert 'class="verdict"' not in html, state
         assert CONCLUSION_ALLOW not in _visible(html), state
 
 
@@ -478,8 +481,8 @@ def test_illegal_conclusion_never_reaches_the_card(conclusion: object) -> None:
                            working_directory=None,
                            advice_state=ADVICE_STATE_READY,
                            conclusion=conclusion)
-    assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
-    if isinstance(conclusion, str) and conclusion and conclusion != CONCLUSION_UNSURE:
+    assert 'class="verdict"' not in html, "非法结论居然渲染出了一行"
+    if isinstance(conclusion, str) and conclusion:
         assert conclusion not in _visible(html), (
             f"非法结论 {conclusion!r} 外溢到卡片上了")
 
@@ -736,8 +739,9 @@ def test_no_allow_when_the_command_is_longer_than_the_card_shows() -> None:
         asyncio.run(plugin._create_approval_card(pending))  # noqa: SLF001
 
         html = ctx.cards[0]["html"]
-        assert "<strong>建议允许</strong>" not in html
-        assert "<strong>无法判断，需要你决定</strong>" in html
+        # B7：结论被压掉时**整行不显示**，不是显示一句"无法判断"
+        assert 'class="verdict"' not in html
+        assert "建议允许" not in _visible(html)
         # 模型的理由没被扔掉——它进「这是什么」
         assert pending.advice["reason"] == "读起来像构建脚本，无副作用"
     finally:
@@ -787,8 +791,8 @@ def test_critical_request_never_shows_allow_even_if_the_model_insists() -> None:
         asyncio.run(plugin._create_approval_card(pending))  # noqa: SLF001
 
         html = ctx.cards[0]["html"]
-        assert "<strong>建议允许</strong>" not in html
-        assert "<strong>无法判断，需要你决定</strong>" in html
+        assert 'class="verdict"' not in html
+        assert "建议允许" not in _visible(html)
         # 冲突要留在记录上，审计才查得到"模型本来想放行"
         assert pending.advice["conflict"]
         assert "模型建议与风险档冲突" in pending.advice["conflict"]

@@ -85,6 +85,7 @@ from pydantic import BaseModel, Field, ValidationError
 # 审批自己不再长第二套——两套脱敏规则等于没有规则。
 from .broadcast import redact
 from .commands import (
+    COMMAND_DISPLAY_MAX,
     CONCLUSION_ALLOW,
     CONCLUSION_UNSURE,
     CONCLUSIONS,
@@ -95,6 +96,7 @@ from .commands import (
     card_lines,
     command_body_unknown,
     command_display_note,
+    command_length,
     conclusion_for,
     severity_for_tier,
     tier_for_command,
@@ -774,6 +776,16 @@ WARNING_BANNER = ("高风险动作：任何配置都不会让它自动放行，"
                   "必须由你亲自点允许或拒绝。")
 WARNING_BADGE = "⚠ 高风险"
 
+# B7：主卡辅助行的上限。预算是「动作（1–2 行）+ 至多两行辅助 + 三个按钮」——
+# 真机反馈原话：这些东西对 UI 的侵占过于厉害，去掉才能凸显主体。
+# 辅助行按**信息价值**排序，不是按规格 P3 的列举顺序：
+#   结论（有确定结论时）> 「你看全了吗」> 范围 > 后果。
+# 范围排在后果前面，是因为删除类的后果基本是同一句（"删了找不回来"），
+# 而范围（"这个文件在它的工作目录之外"）才是**这条请求独有**的判据——
+# 每张卡都重复的那句话，正是 B7 说的"没有判定价值"。
+# 被挤掉的一律进「这是什么」，那里没有行数限制。
+MAX_CARD_AUX_LINES = 2
+
 
 def normalize_warning_mode(value: object) -> str:
     """配置里的档位名 → 合法取值。认不出按默认（first_n）处理，不抛。"""
@@ -1018,21 +1030,20 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
     else:
         warn_html = ""
 
-    # 主卡正文固定四行（规格 P3）：结论 / 动作 / 后果 / 范围。
-    # 前三行由命令翻译词典产出（本地、零 key），结论行由调用方填——
-    # 词典只描述事实，不给结论。
+    # 主卡正文（B7 重排）：**空字段不占位，无价值不显示**。
+    #
+    # 真机反馈：卡片上常年挂着几行没有判定价值的内容——「无法判断，需要你决定」
+    # 只是承认"我不知道"却占着最显眼的位置；「后果」「范围」在认不出命令时
+    # 只能写空话；「执行 / 上游」两行多数场景用户根本不看。
+    # 用户原话：这些东西对 UI 的侵占过于厉害，去掉才能凸显主体。
+    #
+    # 预算：**动作（1–2 行）+ 至多两行辅助 + 三个按钮**，超出的一律进「这是什么」。
     lines = card_lines(command=command or tool_summary,
                        working_directory=working_directory)
-    # 命令超过展示上限时那一行提示（A 批 A1）。放在四行正文之后、
-    # 执行者信息之前：它是关于"你看全了吗"的警告，得在按钮之前。
+    # 命令超过展示上限时那一行提示（A 批 A1）。它是关于"你看全了吗"的警告，
+    # 算一行辅助——安全件，优先级高于后果/范围。
     note = command_display_note(command or tool_summary)
-    note_html = f'<p class="src">{_escape(note)}</p>' if note else ""
-    # B3：一条命令里有多个动作时（`rm a && git reset --hard`），**每一段都要
-    # 列出来**，最危险的在前。老实现只列第一个——没被描述的动作等于被默认
-    # 批准，用户点"允许"时根本不知道还有第二个。超出的进「这是什么」。
-    action_html = "".join(f'<p class="act">{_escape(text)}</p>'
-                          for text in lines["actions"]) or \
-        f'<p class="act">{_escape(lines["action"])}</p>'
+
     # 结论行的取值受 advice_state 约束：**只有真的拿到了模型建议，
     # 结论才可能是"建议允许/建议拒绝"**。建议层降级时（没 key、没签字、
     # 调用失败、状态未知）一律落最保守的第三态——哪怕调用方误传了一个结论，
@@ -1040,29 +1051,49 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
     if advice_state == ADVICE_STATE_READY and conclusion in CONCLUSIONS:
         conclusion_text = conclusion
     else:
-        conclusion_text = CONCLUSION_UNSURE
-    body_lines = [
-        # 结论行**置于最上**（规格 P2）：快速扫读时眼睛先落在哪里，
-        # 结论就该在那里。P3 的四行样例把结论排在最后，与 P2 的"置于最上"
-        # 冲突；这里按 P2 排，因为 P2 给了理由（误读），P3 只给了内容清单。
-        f'<p class="verdict"><strong>{_escape(conclusion_text)}</strong></p>',
-        action_html,
-        f"<p>{_escape(lines['consequence'])}</p>",
-        f"<p>{_escape(lines['scope'])}</p>",
-        warn_html,
-        note_html,
-    ]
+        conclusion_text = ""
+    # A 批 A1 第 5 条：命令超过展示上限时结论必须是空的。
+    # **放在渲染边界，不只放在调用方**——卡片是纯函数，别的调用方漏了这道
+    # 检查，一个没有依据的"建议允许"照样会印到卡上。用户只看得到前 80 字，
+    # 此时给他"建议允许"就是替他省掉最不该省的那一步。
+    if command and command_length(command) > COMMAND_DISPLAY_MAX:
+        conclusion_text = ""
+    # **「无法判断」整行不显示**（B7 第 1 条）。它没告诉用户任何新东西，
+    # 只是承认"我不知道"；而沉默比说"我不知道"更干净——那一行留给
+    # 「这是什么」去解释为什么没有结论。
+    auxiliary: list[str] = []
+    if conclusion_text and conclusion_text != CONCLUSION_UNSURE:
+        auxiliary.append(f'<p class="verdict"><strong>{_escape(conclusion_text)}'
+                         "</strong></p>")
+    if note:
+        auxiliary.append(f'<p class="src">{_escape(note)}</p>')
+    # 范围 / 后果：只在说得清具体内容时才上卡片（B7 第 2 条）。
+    # 范围优先——它是这条请求独有的判据；后果对删除类基本是同一句。
+    if lines["scope_specific"]:
+        auxiliary.append(f"<p>{_escape(lines['scope'])}</p>")
+    if lines["consequence_specific"]:
+        auxiliary.append(f"<p>{_escape(lines['consequence'])}</p>")
+    auxiliary = auxiliary[:MAX_CARD_AUX_LINES]
 
-    # 执行者与上游：压成两行小字放在最下面。它们回答"这是我自己开的吗"，
-    # 属于定位信息，不该挤占结论的位置（规格 Q2）。
-    short_session = (session_id or "")[:8]
-    who = f"执行：{subject}" + (f" 会话 {short_session}" if short_session else "")
+    # B3：一条命令里有多个动作时（`rm a && git reset --hard`），**每一段都要
+    # 列出来**，最危险的在前。老实现只列第一个——没被描述的动作等于被默认
+    # 批准，用户点"允许"时根本不知道还有第二个。超出的进「这是什么」。
+    action_html = "".join(f'<p class="act">{_escape(text)}</p>'
+                          for text in lines["actions"]) or \
+        f'<p class="act">{_escape(lines["action"])}</p>'
+    # 结论行**置于最上**（规格 P2）：快速扫读时眼睛先落在哪里，
+    # 结论就该在那里。P3 的四行样例把结论排在最后，与 P2 的"置于最上"冲突；
+    # 这里按 P2 排，因为 P2 给了理由（误读），P3 只给了内容清单。
+    body_lines = auxiliary[:1] + [action_html] + auxiliary[1:] + [warn_html]
+
+    # B7 第 3 条：执行者与上游**移出主卡**，进「这是什么」。
+    # 它们回答"这是我自己开的吗"，属于定位信息；原来压在卡片最下面两行，
+    # 把动作行挤得看不见。（真出现"可疑来源"这类需要警示的情况时，
+    # 可以按同样的预算加回来——但那需要一个新的判据，今天没有。）
     return (
         "<section>"
         "<strong>同桌猫 · 审批请求</strong>"
         + "".join(body_lines)
-        + f"<p class=\"src\">{_escape(who)}</p>"
-        + f"<p class=\"src\">上游：{_escape(describe_upstream(upstream))}</p>"
         + f"<button data-neko-action=\"{ACTION_APPROVE}\">允许</button>"
         + f"<button data-neko-action=\"{ACTION_DENY}\">拒绝</button>"
         + f"<button data-neko-action=\"{ACTION_EXPLAIN}\">这是什么</button>"
@@ -1077,7 +1108,8 @@ def explain_request(*, tool_name: str, tool_summary: str,
                     model_note: str = "", session_id: str = "",
                     full_command: str = "",
                     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-                    verbosity: str = DEFAULT_VERBOSITY) -> dict[str, str]:
+                    verbosity: str = DEFAULT_VERBOSITY,
+                    subject: str = "", upstream: Any = ()) -> dict[str, str]:
     """「这是什么」按钮的落点：解释，只说事实，不猜意图。
 
     主卡的正文只有四行（规格 P3），所以**会话 id、工作目录、超时说明、
@@ -1133,6 +1165,14 @@ def explain_request(*, tool_name: str, tool_summary: str,
     # 等宽块 + 保留换行：多行脚本要照着原样读才判断得准。
     if full_command.strip():
         explanation["full_command"] = full_command
+    # B7：主卡不再显示执行者与上游，它们搬到这里。
+    # 「这是我自己开的吗」是个合理的问题，只是不该占每次审批最显眼的位置。
+    if subject:
+        explanation["actor"] = (f"执行：{subject}"
+                                + (f" 会话 {short_session}" if short_session else ""))
+    rendered_upstream = describe_upstream(upstream)
+    if rendered_upstream != UPSTREAM_UNKNOWN:
+        explanation["upstream"] = f"上游：{rendered_upstream}"
     # B3：一条命令里有多个动作时，主卡只列最危险的 ``MAX_CARD_ACTIONS`` 条，
     # **剩下的在这里一条不少地列全**。主卡装不下不等于可以不知道——
     # 那是"没被描述的动作被默认批准"的另一种形式。
@@ -1186,6 +1226,11 @@ def build_explain_html(explanation: dict[str, str]) -> str:
            if explanation.get("all_actions") else "")
         + (f"<p class=\"src\">{_escape(explanation['model_note'])}</p>"
            if explanation.get("model_note") else "")
+        # B7：执行者与上游从主卡搬到这里。
+        + (f"<p class=\"src\">{_escape(explanation['actor'])}</p>"
+           if explanation.get("actor") else "")
+        + (f"<p class=\"src\">{_escape(explanation['upstream'])}</p>"
+           if explanation.get("upstream") else "")
         + (f"<p><strong>{_escape(explanation['model_reason'])}</strong></p>"
            if explanation.get("model_reason") else "")
         + (f"<p>{_escape(explanation['timeout'])}</p>"

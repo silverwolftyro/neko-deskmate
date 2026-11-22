@@ -1289,6 +1289,12 @@ class AgentDeskmatePlugin(NekoPluginBase):
             session_id=pending.request.session_id,
             timeout_seconds=self._approval.timeout_seconds,
             verbosity=_verbosity_of(getattr(self, "_last_config", {}) or {}),
+            # B7：执行者与上游从主卡搬进「这是什么」。
+            subject=describe_actor(
+                executor=pending.request.agent or "claude-code",
+                requester_evidence="", requester=None,
+            ),
+            upstream=pending.request.upstream,
         )
         await self._show_explain_card(pending, explanation)
         return Ok(explanation)

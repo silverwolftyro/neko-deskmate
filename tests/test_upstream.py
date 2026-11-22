@@ -30,6 +30,7 @@ from plugin.plugins.agent_deskmate.approval import (
     build_card_html,
     build_request,
     describe_upstream,
+    explain_request,
 )
 
 DSH_CHAIN = [
@@ -169,17 +170,22 @@ def test_request_caps_and_clips_the_upstream() -> None:
 
 # ── 卡片：上游是其中一行小字 ──────────────────────────────────────────────
 
-def test_card_shows_the_upstream_line() -> None:
+def test_the_main_card_no_longer_carries_the_upstream_line() -> None:
+    """B7 第 3 条：上游移出主卡，进「这是什么」。
+
+    原来它压在卡片最下面，把动作行挤得看不见。用户要找的是"它要干什么"，
+    不是"这条进程链"——后者点「这是什么」照样看得到。
+    """
     html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
                            session_id="800257f3", working_directory=None,
                            upstream=DSH_CHAIN)
-    assert f"上游：{DSH_RENDERED}" in html
-
-
-def test_card_says_unknown_without_an_upstream() -> None:
-    html = build_card_html(subject="claude-code", tool_summary="Bash: ls",
-                           session_id="800257f3", working_directory=None)
-    assert f"上游：{UPSTREAM_UNKNOWN}" in html
+    assert "上游" not in html
+    assert DSH_RENDERED not in html
+    # 但「这是什么」里有
+    explanation = explain_request(
+        tool_name="Bash", tool_summary="Bash: ls", working_directory=None,
+        rule="", severity="notice", upstream=DSH_CHAIN)
+    assert f"上游：{DSH_RENDERED}" in explanation["upstream"]
 
 
 def test_card_escapes_an_upstream_supplied_path() -> None:

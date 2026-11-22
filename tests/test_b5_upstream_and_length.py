@@ -114,13 +114,14 @@ def test_an_all_shell_chain_says_unknown() -> None:
 
 
 def test_the_card_line_reflects_the_filtering() -> None:
+    """B7 之后主卡不再有上游那一行；过滤逻辑由解释卡那边验。"""
     html = build_card_html(
         subject="claude-code", tool_summary="Bash: ls", session_id="s",
         working_directory=None,
         upstream=[{"name": "bash.exe", "path": "C:/git/bash.exe"},
                   {"name": "node.exe",
                    "path": r"C:\Program Files\DeepSeek Harness\node.exe"}])
-    assert "上游：node.exe（DeepSeek Harness）" in html
+    assert "上游" not in html
     assert "bash.exe" not in html
 
 

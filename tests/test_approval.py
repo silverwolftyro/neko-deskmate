@@ -78,7 +78,6 @@ from plugin.plugins.agent_deskmate.commands import (
     CONCLUSION_ALLOW,
     CONCLUSION_DENY,
     CONCLUSION_UNSURE,
-    CONCLUSIONS,
 )
 
 PAYLOAD = {
@@ -1296,46 +1295,76 @@ def _card(**overrides) -> str:
 
 
 def test_card_html_has_all_four_blocks() -> None:
-    """主卡只有决策需要的东西（规格 Q2）：结论 / 动作 / 后果 / 范围 + 三按钮。
+    """主卡只有决策需要的东西（B7 之后）：结论 / 动作 / 至多两行辅助 + 三按钮。
 
-    会话 id 压成一行小字，工作目录与超时说明**不在主卡上**——
-    它们搬到「这是什么」了（规格 Q2）。这条测试两头都盯：
-    该在的必须在，不该在的不许在。
+    会话 id、工作目录、超时说明、免责说明、执行者、上游**全不在主卡上**——
+    它们搬到「这是什么」了。这条测试两头都盯：该在的必须在，不该在的不许在。
     """
     html = _card()
     # 1) 标题
     assert "同桌猫 · 审批请求" in html
-    # 2) 主卡正文固定四行（规格 P3）
+    # 2) 动作行（主体，永远在）
     assert "⚠️ 它要删除文件 D:/other/x.txt" in html
-    assert "后果：不进回收站，删了就找不回来" in html
-    assert "范围：这个文件在它的工作目录之外" in html
-    # 3) 结论行
+    # 3) 结论行（有确定结论时置顶）
     assert "<strong>建议拒绝</strong>" in html
-    # 4) 执行者 + 上游，压成一行小字
-    assert "执行：claude-code 会话 800257f3" in html
-    assert "上游：" in html
-    # 5) **不在主卡上的东西**（规格 Q2）
+    # 4) **不在主卡上的东西**（B7：空字段不占位，无价值不显示）
+    assert "执行：" not in html, "执行者还压在卡片上（B7 搬去「这是什么」了）"
+    assert "上游：" not in html, "上游还压在卡片上（B7 搬去「这是什么」了）"
     assert "@ D:\\workspace" not in html, "工作目录还压在卡片上"
     assert "宿主会自行处理" not in html, "超时说明还压在卡片上"
     assert "不掐掉整个回合" not in html, "免责说明还压在卡片上"
-    # 6) 三个按钮
+    # 5) 三个按钮
     for action in (ACTION_APPROVE, ACTION_DENY, ACTION_EXPLAIN):
         assert f'data-neko-action="{action}"' in html
+
+
+def test_the_moved_lines_land_in_the_explain_card() -> None:
+    """B7 第 3 条：执行者与上游搬去「这是什么」，不是删掉。"""
+    explanation = explain_request(
+        tool_name="Bash", tool_summary="Bash: rm -f x",
+        working_directory=r"D:\workspace", rule="delete", severity="critical",
+        subject="claude-code", session_id="800257f3",
+        upstream=[{"name": "node.exe",
+                   "path": r"C:\Program Files\DeepSeek Harness\node.exe"}])
+    assert explanation["actor"].startswith("执行：claude-code")
+    assert "会话 800257f3" in explanation["actor"]
+    assert "上游：" in explanation["upstream"]
+    assert "DeepSeek Harness" in explanation["upstream"]
+
+
+def test_the_explain_card_does_not_invent_an_upstream() -> None:
+    explanation = explain_request(
+        tool_name="Bash", tool_summary="Bash: ls", working_directory=None,
+        rule="", severity="notice", upstream=[])
+    assert "upstream" not in explanation
 
 
 def test_card_conclusion_line_is_independent_and_first() -> None:
     """规格 P2：结论独立成行、加粗，而且排在正文最前面。"""
     html = _card()
     verdict_at = html.index("<strong>建议拒绝</strong>")
-    for later in ("⚠️ 它要", "后果：", "范围："):
+    for later in ("⚠️ 它要", "范围："):
         assert verdict_at < html.index(later), f"{later} 排在结论前面了"
 
 
-@pytest.mark.parametrize("conclusion", CONCLUSIONS)
-def test_card_accepts_only_the_three_legal_conclusions(conclusion: str) -> None:
-    """规格 P2：结论只准三种，一个不多一个不少。"""
+@pytest.mark.parametrize("conclusion", [CONCLUSION_ALLOW, CONCLUSION_DENY])
+def test_card_accepts_the_two_definite_conclusions(conclusion: str) -> None:
+    """规格 P2：确定的结论只有两种，原样加粗置顶。"""
     html = _card(conclusion=conclusion, advice_state=ADVICE_STATE_READY)
     assert f"<strong>{conclusion}</strong>" in html
+
+
+def test_the_unsure_conclusion_is_not_rendered_at_all() -> None:
+    """B7 第 1 条：「无法判断，需要你决定」**整行不显示**。
+
+    它没告诉用户任何新东西，只是承认"我不知道"；而沉默比说"我不知道"
+    更干净——为什么没有结论，由「这是什么」去解释。
+    """
+    html = _card(conclusion=CONCLUSION_UNSURE, advice_state=ADVICE_STATE_READY)
+    assert CONCLUSION_UNSURE not in _visible(html)
+    # 但卡片本身照样成立：动作行和按钮都在
+    assert "⚠️ 它要删除文件" in html
+    assert 'data-neko-action="deskmate_approve"' in html
 
 
 @pytest.mark.parametrize("conclusion", [
@@ -1343,23 +1372,23 @@ def test_card_accepts_only_the_three_legal_conclusions(conclusion: str) -> None:
     "allow", "deny", "", "建议放行", "同意", "批准", None,
 ])
 def test_card_rejects_any_other_conclusion(conclusion: object) -> None:
-    """非法结论一律落最保守的第三态，原文不外溢。"""
+    """非法结论**一行都不渲染**，原文也不外溢。"""
     html = _card(conclusion=conclusion, advice_state=ADVICE_STATE_READY)
-    assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html
-    if isinstance(conclusion, str) and conclusion and conclusion != CONCLUSION_UNSURE:
+    assert 'class="verdict"' not in html, "非法结论居然渲染出了一行"
+    if isinstance(conclusion, str) and conclusion:
         assert conclusion not in _visible(html), (
             f"非法结论 {conclusion!r} 外溢到卡片上了")
 
 
 def test_conclusion_requires_a_real_advice_state() -> None:
-    """建议层降级时，结论只能是第三态——哪怕调用方误传了一个结论。
+    """建议层降级时**没有结论行**——哪怕调用方误传了一个结论。
 
     这是防"没有依据的建议允许出现在卡片上"：调用方说 ready 却给了降级的
     状态，或者状态是 disabled 却给了结论，两种都不许放行。
     """
     for state in ("disabled", "unauthorized", "no_key", "pending_backend"):
         html = _card(conclusion=CONCLUSION_ALLOW, advice_state=state)
-        assert f"<strong>{CONCLUSION_UNSURE}</strong>" in html, state
+        assert 'class="verdict"' not in html, state
         assert CONCLUSION_ALLOW not in _visible(html), state
 
 
@@ -1428,11 +1457,15 @@ def test_card_scope_says_inside_the_working_directory() -> None:
 
 
 def test_card_unknown_command_is_not_guessed() -> None:
-    """未命中的命令原样显示 + 明说未识别，不许瞎猜。"""
+    """未命中的命令原样显示 + 明说未识别，不许瞎猜。
+
+    B7：**「看不出」那句不上卡片**。认不出命令时，后果行只能是空话，
+    而空话占着最显眼的位置——那一行让给「这是什么」。
+    """
     html = _card(command="npm run build", conclusion="")
     assert "未识别的命令" in html
     assert "npm run build" in html
-    assert "看不出" in html
+    assert "看不出" not in html, "认不出命令还把空话写在卡片上"
 
 
 def test_card_echo_of_a_delete_is_not_a_delete() -> None:

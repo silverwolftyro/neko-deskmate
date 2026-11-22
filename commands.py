@@ -878,13 +878,33 @@ def severity_for_tier(tier: str) -> str:
 
 
 
-def scope_line(facts: CommandFacts, working_directory: str | None) -> str:
-    """第三行：影响范围。只讲事实——在工作目录内还是外、是不是系统目录。
+# B7：这两句是"说不出具体内容"时的占位。它们不许出现在卡片上——
+# 用户读到的是没有信息量的一句话，而它占的位置本可以放有用的东西。
+# 真正影响判定的那句（"这个文件在它的工作目录之外"）**不算**占位，照常显示。
+NON_SPECIFIC_SCOPES = frozenset({
+    "看不出它会影响哪些文件",
+    "影响范围不止一个文件",
+})
 
-    **有明确目标时，按目标推**：规格 P3 要求这一行说清"是否在工作目录外"，
-    而词条自带的 scope（"整个磁盘" / "这张表"）答不了这个问题。
-    只有拿不到目标时才退回词条自带的说法。
+
+def scope_is_specific(scope: str) -> bool:
+    """这一行范围说得清具体内容吗。空话不算。"""
+    text = str(scope or "").strip()
+    return bool(text) and text not in NON_SPECIFIC_SCOPES
+
+
+def consequence_is_specific(consequence: str) -> bool:
+    """这一行后果说得清最坏结果吗。
+
+    门槛是"比占位句长"：``UNKNOWN_CONSEQUENCE`` 与它的任何缩写都不算。
     """
+    text = str(consequence or "").strip()
+    if not text or text == UNKNOWN_CONSEQUENCE:
+        return False
+    return len(text) > len("后果：") + 4
+
+
+def scope_line(facts: CommandFacts, working_directory: str | None) -> str:
     if not facts.known:
         return "看不出它会影响哪些文件"
     target = facts.targets[0] if facts.targets else ""
@@ -912,15 +932,22 @@ def card_lines(*, command: str, working_directory: str | None) -> dict[str, Any]
     ``actions`` 是主卡上要列的全部动作短语（最危险的最多
     ``MAX_CARD_ACTIONS`` 条）。保留单数键是为了不打断既有调用方，
     真正决定"列几条"的是 ``actions``。
+
+    B7：``consequence_specific`` / ``scope_specific`` 说这两行**有没有实质内容**。
+    说不清的时候就别上卡片——一句「未知」占着最显眼的位置，
+    比什么都不说更糟（用户会把它当成又一条废话划过去）。
     """
     facts = translate_segments(command, working_directory=working_directory)
     top = facts[0] if facts else translate(command)
     actions = card_actions(command, working_directory=working_directory)
+    scope = scope_line(top, working_directory)
     return {
         "action": actions[0] if actions else action_phrase(top),
         "actions": actions,
         "consequence": f"后果：{top.consequence}",
-        "scope": f"范围：{scope_line(top, working_directory)}",
+        "scope": f"范围：{scope}",
+        "consequence_specific": consequence_is_specific(top.consequence),
+        "scope_specific": scope_is_specific(scope),
         "known": top.known,
         "irreversible": top.irreversible,
     }
