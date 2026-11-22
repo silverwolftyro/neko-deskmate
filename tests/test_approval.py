@@ -226,15 +226,22 @@ def _post_status(port, payload: dict, timeout: float = 30.0) -> tuple[int, dict]
 
 
 def _only_pending(gateway: ApprovalGateway) -> PendingApproval:
-    """等挂起并取走唯一一条待建卡的审批。
+    """等挂起并取回唯一一条待建卡的审批。
 
     断言"恰好一条"：记录现在过期也不删，若同一 gateway 上有前一条没清，
-    take_new 会返回多条，默默取 [0] 会点到错的请求上——那种错很难查。
+    这里会默默点到错的请求上——那种错很难查。
+
+    **P1 之后不再用 ``take_new``**：审查结果出来之前记录不建卡
+    （``needs_card`` 在看 ``reviewing``），``take_new`` 会返回空。
+    而这些用例验的是"用户点了算什么 / 到期算什么"，与建不建卡无关，
+    所以只**找**不**取**——卡片照旧由 approval_tick 去建。
     """
     _wait_for_pending(gateway)
-    fresh = gateway.take_new()
-    assert len(fresh) == 1, f"期望恰好一条待建卡审批，实际 {len(fresh)}"
-    return fresh[0]
+    rows = [row for row in gateway.snapshot() if row["state"] == "pending"]
+    assert len(rows) == 1, f"期望恰好一条待建卡审批，实际 {len(rows)}"
+    record = gateway.find(rows[0]["request_id"])
+    assert record is not None
+    return record
 
 
 def _decide_later(gateway: ApprovalGateway, port: int, payload: dict,

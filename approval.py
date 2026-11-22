@@ -462,6 +462,49 @@ def auto_review_gate(*, severity: str, rule: str, risk_tier: str,
     return True, "自动审查档门控通过"
 
 
+def auto_allow_notice(*, tool_name: str, command: str, reason: str,
+                      rule: str = "") -> str:
+    """自动放行的通知。**固定三行，不加第四行**（P2，真机验收后重写）。
+
+        已自动放行（低风险）
+        它要执行：<命令>        ← 删除类写「它要删除：<目标>」
+        理由：<一句，来自模型>
+
+    为什么是这个形状：真机原文把模型名、授权版本、三重括号全挤进一行，
+    主信息（到底放了什么）被埋在最里面，读起来像机制说明而不是一件事。
+    用户在这一刻要回答的是"它干了什么、凭什么"，不是"这是哪一版授权"。
+
+    **不进这里的东西**（全部只进审计，``audit_list`` 看得见）：
+    模型名、授权版本、「模型建议 / 让模型先审一次」这类机制说明、
+    以及怎么把它关掉。通知只留人做判断需要的那三行——
+    多一行都是把最该被看见的那行往下推。
+
+    **全文不许出现内部词**：``L2`` / ``auto_review`` / ``auto_decide`` /
+    ``ai_judgement`` 一个都不许（P3）。用户不知道那些是什么。
+    """
+    text = " ".join(str(command or "").split())
+    if not text:
+        text = str(tool_name or "").strip() or "某个工具"
+    if rule == RULE_DELETE or match_delete(text):
+        targets = delete_targets(text)
+        what = f"它要删除：{targets[0]}" if targets else f"它要删除：{text}"
+    else:
+        what = f"它要执行：{text}"
+    return (f"已自动放行（低风险）\n"
+            f"{what}\n"
+            f"理由：{str(reason or '').strip() or '模型未给理由'}")
+
+
+def auto_allow_setting_line(*, enabled: bool) -> str:
+    """设置页常驻那一行：自动放行开着没有、怎么关（P2）。
+
+    **只在这里说一次**：通知里再说一遍"可关闭"就是每件事都提醒一遍，
+    而那正是用户被训练成无视提示的路径。放「这是什么」与首启日志各一处，
+    notification 里没有。
+    """
+    return "自动放行：已开启（可关闭）" if enabled else "自动放行：未开启"
+
+
 def advice_state(*, ai_judgement: bool, has_key: bool, backend_ready: bool,
                  authorized: bool = True) -> str:
     """卡片上"建议"那块显示成什么样。四种状态，都不许假装成功。
@@ -622,6 +665,12 @@ class PendingApproval:
         # L2 自动放行标记 + 通知是否已发。
         self.auto = False
         self.auto_announced = False
+        # B9/P1：**正在等审查结果**。这期间不建卡片——建了就得带
+        # 「允许 / 拒绝」两个按钮，而结果可能是自动放行，那一屏按钮
+        # 等于请用户点一个已经决定完的动作（真机实测到的竞态：
+        # 建卡 tick 1s vs 审查 1-2s，卡先弹出来）。
+        # 审查结束（无论放行还是转人工）都会清掉它。
+        self.reviewing = False
         # 已经进内存的审计行。投递失败时要把它改成最终状态（见 note_host_timeout）。
         self.audit_entry: AuditRecord | None = None
         # 这一条拿到的模型建议。**只给「这是什么」卡用**——主卡只显示结论行，
@@ -643,7 +692,8 @@ class PendingApproval:
         return self.decided_by is not None
 
     def needs_card(self) -> bool:
-        return self.card_id is None and not self.auto
+        """该建卡片吗。**审查结果出来之前不算**（P1）。"""
+        return self.card_id is None and not self.auto and not self.reviewing
 
     def needs_announce(self) -> bool:
         return self.card_id is not None and self.settled() and not self.card_announced
@@ -1884,6 +1934,7 @@ class ApprovalGateway:
             )
             return False
 
+        record.reviewing = True
         try:
             verdict = self._judge(record)
         except Exception as exc:  # noqa: BLE001  后端炸了不能炸掉审批
@@ -1892,6 +1943,8 @@ class ApprovalGateway:
                 record.request.request_id, type(exc).__name__,
             )
             return False
+        finally:
+            record.reviewing = False
         if not isinstance(verdict, dict) or verdict.get("decision") not in DECISIONS:
             self._logger.warning(
                 "请求 {} 的 L2 判断没给出有效决定，不自动决定，转交用户判断",
@@ -1921,8 +1974,10 @@ class ApprovalGateway:
                                          if authorization is not None else "")
             record.auto = True
             # 自动放行不该再弹卡片等人点——但要发一条 blind 通知 + 一条审计。
-            # card_id 置成占位空串，timer 就不会为它建卡。
-            record.card_id = ""
+            # ``card_id`` 置成占位空串，timer 就不会为它建卡。
+            # **但已经建出来的卡片不许被这个空串覆盖**：竞态下卡片可能先弹出
+            # （P1），那时要留着真 id，让 settle 把它改成结果卡并清掉按钮。
+            record.card_id = record.card_id if record.card_id else ""
             record.event.set()
         self._logger.warning(
             "请求 {} 由 L2 自动放行（用户已授权 {}，模型 {}，理由 {}）",
@@ -1940,6 +1995,10 @@ class ApprovalGateway:
         """
         with self._lock:
             authorization = self._authorization
+        # 审查要 1-2 秒。这期间先把卡片按住（P1）：建卡 tick 是 1 秒，
+        # 不按住的话卡片先弹出来，带着「允许 / 拒绝」两个按钮，
+        # 而这一步的结果可能是自动放行——那是在请用户点一个已经决定完的动作。
+        record.reviewing = True
         try:
             review = self._reviewer.review(
                 tool_name=record.request.tool_name,
@@ -1954,6 +2013,9 @@ class ApprovalGateway:
                 record.request.request_id, type(exc).__name__,
             )
             return False
+        finally:
+            # 无论放行还是转人工，都要放开——转人工时下一轮 tick 就该建卡。
+            record.reviewing = False
 
         if not review.auto_allows:
             # 这里覆盖：medium（要人点）、high+deny（不自动拒绝）、
@@ -1978,7 +2040,13 @@ class ApprovalGateway:
             record.authorization_card = (authorization.as_card_text()
                                          if authorization is not None else "")
             record.auto = True
-            record.card_id = ""
+            # 自动放行不该再弹卡片等人点——但要发一条 blind 通知 + 一条审计。
+            # ``card_id`` 置成占位空串，timer 就不会为它建卡。
+            # **但已经建出来的卡片不许被这个空串覆盖**：竞态下卡片可能先弹出
+            # （P1），那时要留着真 id，让 settle 把它改成结果卡并清掉按钮——
+            # 否则那张卡会永远留着「允许 / 拒绝」，点下去得到的是一个
+            # 已经执行完的动作。
+            record.card_id = record.card_id if record.card_id else ""
             record.event.set()
         self._logger.warning(
             "请求 {} 由自动审查档放行（{}，模型 {} 判 {}+{}，理由 {}）",
@@ -2382,6 +2450,14 @@ class ApprovalGateway:
                 if record.request.request_id == request_id:
                     return record
         return None
+
+    def reviewer_connected(self) -> bool:
+        """B9 的审查器接上了吗。只读，不发起任何请求。
+
+        「怎么关自动放行」那句话要能条件显示：没接审查器时根本没有自动放行，
+        提示一句"可关闭"是让用户去找一个不存在的开关。
+        """
+        return self._reviewer is not None and self._reviewer.enabled
 
     def stats(self) -> dict[str, int]:
         return {

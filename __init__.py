@@ -70,6 +70,8 @@ from .approval import (
     ApprovalGateway,
     WarningPolicy,
     advice_text,
+    auto_allow_notice,
+    auto_allow_setting_line,
     build_authorize_actions,
     build_authorize_html,
     build_card_actions,
@@ -602,6 +604,27 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # 5b：模型建议客户端 + 跑它的线程池。advisor 为 None 表示零 key 默认态。
         self._advisor: ModelAdvisor | None = None
         self._advice_pool: ThreadPoolExecutor | None = None
+        # **观测层的可变状态集中在这里创建**（B 批回归：曾把 _source_state
+        # 只写在 on_config_change 里，于是每次重载后第一轮 poll 就
+        # AttributeError，播报全停）。新加一个字段只许改这一个方法。
+        self._reset_watch_state()
+
+    def _reset_watch_state(self) -> None:
+        """观测层的可变状态归零。``__init__`` 与配置变更都走这里。
+
+        **必须在 ``__init__`` 里就调**：watch_tick 是 3 秒 timer，
+        它不等配置变更就可能跑第一轮。少建一个字段的后果不是
+        "某个功能没有"，而是那一轮整个抛异常、播报全停——
+        而这种故障在日志里只是一行 AttributeError，极容易被忽略。
+        """
+        self._watch_paths = None
+        self._transcript_adapter = None
+        self._gateway_adapter = None
+        self._broadcaster = None
+        # B4：各观测源上一次报错的时间，用于限频（见 ``_poll_source``）。
+        self._source_error_at: dict[str, float] = {}
+        # B6：各观测源的真实就绪状态（见 ``_adapter_status``）。
+        self._source_state: dict[str, str] = {}
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     # startup 用 async def、shutdown 用 def，刻意对齐官方 memo_reminder 的写法：
@@ -802,6 +825,14 @@ class AgentDeskmatePlugin(NekoPluginBase):
             "自己接手，插件不代你判断，也不把「一直没点」记成拒绝。"
             "卡片上点「这是什么」可以看到这段说明、会话与工作目录。"
         )
+        # P2：「怎么关」只在这里说一次。通知里再说一遍就是每件事都提醒一遍，
+        # 而那正是用户被训练成无视提示的路径。
+        if self._approval is not None and self._approval.reviewer_connected():
+            self.logger.info(
+                "{}；要关掉，把配置里的自动审查档改回关闭即可"
+                "（授权记录仍在，开关关着一样不动作）。",
+                auto_allow_setting_line(enabled=True),
+            )
 
     @lifecycle(id="shutdown")
     def on_shutdown(self, **_):
@@ -826,14 +857,12 @@ class AgentDeskmatePlugin(NekoPluginBase):
         规格 §2 硬规则 2 明令禁止。真要撤授权，用户改配置关掉 L1/L2 即可
         （授权记录在手，开关关着，一样不动作）。
         """
-        self._watch_paths = None
-        self._transcript_adapter = None
-        self._gateway_adapter = None
-        self._broadcaster = None
-        # B4：各观测源上一次报错的时间，用于限频（见 ``_poll_source``）。
-        self._source_error_at: dict[str, float] = {}
-        # B6：各观测源的真实就绪状态（见 ``_adapter_status``）。
-        self._source_state: dict[str, str] = {}
+        # 观测层的可变状态全部归零，下一轮按新配置重建。
+        # 审批授权**刻意不碰**：授权是用户在卡片上签过字的，不是配置项。
+        # 配置变更自动恢复/修改授权，就等于插件能自己给自己授权——
+        # 规格 §2 硬规则 2 明令禁止。真要撤授权，用户改配置关掉 L1/L2 即可
+        # （授权记录在手，开关关着，一样不动作）。
+        self._reset_watch_state()
         self.logger.info("配置已变更，观测适配器将在下一轮重建（审批授权不受影响）")
         return Ok({"status": "reloaded"})
 
@@ -1007,21 +1036,29 @@ class AgentDeskmatePlugin(NekoPluginBase):
             self.logger.warning("审批卡片处理异常（{}）：{}", type(exc).__name__, exc)
 
     async def _announce_auto_allow(self, pending: Any) -> None:
-        """L2 自动放行后发一条 blind 通知（规格 §2 硬规则 4）。
+        """自动放行后发一条 blind 通知（规格 §2 硬规则 4）。
 
         自动放行**不弹卡片**（要人点就失去意义），但绝不能不吭声——
-        看不见的放行等于后门。所以这里必须说清"放了什么、凭什么放的"：
-        授权溯源、模型、理由都带上，用户事后能拿 audit_list 对账。
+        看不见的放行等于后门。所以这里必须说清"放了什么、凭什么"。
+
+        **P2 之后只发三行**（见 ``auto_allow_notice``）：放了什么 /
+        它要干什么 / 凭什么。授权溯源、模型名、机制说明、关闭方法
+        **一律不进通知**——它们全在审计里（``audit_list`` 看得见），
+        通知里多一行就是把最该被看见的那行往下推。
         """
         request = pending.request
         self.logger.info(
-            "L2 自动放行通知：请求 {}（{}，{}）", request.request_id,
+            "自动放行通知：请求 {}（{}，{}）", request.request_id,
             pending.judge_model or "-", pending.judge_reason or "-",
         )
-        text = (
-            f"同桌猫：已按你的授权自动放行 {request.tool_summary or request.tool_name}"
-            f"（低风险，授权 {pending.authorization_card or '已确认'}，"
-            f"模型 {pending.judge_model or '-'}，理由 {pending.judge_reason or '低风险'}）"
+        # P2：固定三行——放了什么 / 它要干什么 / 凭什么。
+        # 模型名、授权版本、机制说明、关闭方法**一律不进通知**，全进审计
+        # （audit_list 看得见）；「怎么关」由设置页那一行常驻显示。
+        text = auto_allow_notice(
+            tool_name=request.tool_name or "",
+            command=_command_of(request),
+            reason=pending.judge_reason or "",
+            rule=pending.rule or "",
         )
         try:
             self.push_message(
@@ -1032,7 +1069,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 priority=4,
             )
         except Exception as exc:  # noqa: BLE001  通知发不出去不影响已放行的调用
-            self.logger.warning("L2 自动放行通知发送失败（{}）：{}", type(exc).__name__, exc)
+            self.logger.warning("自动放行通知发送失败（{}）：{}",
+                                type(exc).__name__, exc)
 
     async def _push_hud_if_changed(self) -> None:
         """未决数量进 HUD。**只在数量变化时发一次**——每轮都发就是刷屏。
@@ -1247,8 +1285,13 @@ class AgentDeskmatePlugin(NekoPluginBase):
             # **两处都不写内部词**：不写"L2"（层级名），也不用审计那一版
             # 授权溯源（``v1:ai_judgement,auto_decide by=user``）——那是给
             # 事后对账的精确写法，印在卡片上就是让用户猜配置键名。
-            note = (f"已凭你的授权自动放行（{pending.authorization_card or '授权'}，"
-                    f"模型 {pending.judge_model or '-'}，理由 {pending.judge_reason or '低风险'}）")
+            # P2：与通知同一套三行。授权溯源与模型名进审计，不上屏。
+            note = auto_allow_notice(
+                tool_name=pending.request.tool_name or "",
+                command=_command_of(pending.request),
+                reason=pending.judge_reason or "",
+                rule=pending.rule or "",
+            )
         else:
             # 到期：只陈述事实——宿主自己处理的，我们没做判断。
             # **不许出现"已自动拒绝"**，那是把宿主的决定安到插件头上。
