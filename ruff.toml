@@ -7,3 +7,14 @@ respect-gitignore = false
 
 [lint]
 select = ["E4", "E7", "E9", "F", "I"]
+
+# 导入分组必须与宿主 CLI 的那一份（``neko-plugin precheck`` 内部用默认配置跑
+# ruff）说同一套话。**不加这一段的话两边会互相打架**：
+# 默认配置把 ``plugin.*`` 认成本包、``pytest`` 认成第三方，要求中间空一行；
+# 而本文件没提 first-party，于是它把两者归成同一组、要求**不留**空行。
+# 结果是 HEAD 上的测试文件（带空行的那种写法）过得了 precheck、过不了
+# ``neko-plugin lint``，反过来也一样——同一个仓库两种"正确"，
+# 谁都不敢跑 --fix，跑了就把一批没打算改的文件改掉。
+# 这里显式声明 first-party，让本文件与默认配置的判断一致。
+[lint.isort]
+known-first-party = ["plugin"]

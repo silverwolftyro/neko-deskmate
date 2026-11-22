@@ -56,11 +56,33 @@ _PUSH_REJECTION_INFO = frozenset({"backpressure", "transport_error", "transport_
 # AGENTS.md 要求不得记录会话文本/密钥——这里用"写日志前打码"落地，
 # 而不是把日志删掉（排查时还要靠它确认到底播了什么）。
 #
-# 覆盖：-p<密码>、--token/--api-key/--password 后的值、password=…、
-# api_key=…、sk-…、Bearer …。宁可比必要多打一点——漏一个密钥比多几个
-# *** 严重得多。
+# 覆盖：环境变量与配置项（任意前缀 + KEY/TOKEN/SECRET/PASSWORD）、
+# 已知令牌形状（GitHub / AWS / Slack / PEM 私钥）、40 字以上的无分隔长串。
+# 宁可比必要多打一点——漏一个密钥比多几个 *** 严重得多。
+#
+# 第一版的 ``\b(password|api_key|token)\s*[=:]\s*\S+`` 有个静默漏洞：
+# ``\b`` 在下划线之前**不成立**，于是 ``GITHUB_TOKEN=ghp_…``、
+# ``OPENAI_API_KEY=…``、``AWS_SECRET_ACCESS_KEY=…`` 一个都不匹配——
+# 而它们恰是真机上最常见的写法。所以改成"任意标识符 + 关键字 + 任意标识符"。
+
+def _REDACTED_ASSIGNMENT(match: "re.Match[str]") -> str:
+    """把 ``NAME=value`` 换成 ``NAME=***``：**保留名字，只打掉值**。
+
+    写成函数而不是替换串，是因为要留下等号左边那段。名字不是秘密，
+    而"哪个变量带着密钥"正是排障时最想要的那一条信息。
+    """
+    text = match.group(0)
+    head, separator, _ = (text.partition("=") if "=" in text
+                          else text.partition(":"))
+    return f"{head}{separator}***"
+
 
 _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # PEM 私钥块必须排在最前：它跨多行，单行规则会把每一行各打一遍，
+    # 留下还能看出结构的残骸。整体换成一个标记。
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?"
+                r"-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
+     "[私钥块已打码]"),
     # Bearer 令牌必须排在 KEY=value 之前：否则 `Authorization: Bearer eyJ…`
     # 会先被后者匹配成 `Authorization=***`，把真正的令牌原样留下。
     (re.compile(r"(?i)\bbearer\s+\S+"), "Bearer ***"),
@@ -71,10 +93,22 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)((?:^|\s)-p\s*)(\S+)"), r"\1***"),
     # --token=xxx / --api-key xxx / --password=xxx
     (re.compile(r"(?i)(--(?:token|api-key|apikey|password|passwd|secret)[= ]+)(\S+)"), r"\1***"),
-    # KEY=value / KEY: value（.env、JSON、URL query 的惯用写法）
-    (re.compile(r"(?i)\b(password|passwd|api_key|apikey|secret|token)\s*[=:]\s*\S+"),
-     r"\1=***"),
-    # OpenAI/DeepSeek 风格的 key
+    # 任意前缀的 KEY / TOKEN / SECRET / PASSWORD 赋值：
+    #   GITHUB_TOKEN=…、OPENAI_API_KEY: …、my_secret=…、DB_PASSWORD=…
+    # 两侧的 ``[A-Za-z0-9_]*`` 都可以为空，所以裸写 token=… 也照样命中。
+    (re.compile(r"(?i)[A-Za-z0-9_]*(?:key|token|secret|password|passwd|credential)"
+                r"[A-Za-z0-9_]*\s*[=:]\s*\S+"),
+     _REDACTED_ASSIGNMENT),
+    # 已知令牌形状。按前缀认，不用通用规则——通用规则要么漏要么误伤。
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}"), "gh***"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "github_pat_***"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AKIA***"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}"), "xox***"),
+    # 40 字以上、不含空白与路径分隔符的一整块。这是"形状像令牌"的兜底：
+    # 认不出品种的长串宁可打掉。**刻意不含 ``/``、``\``、``:``**——
+    # 否则长 URL 和长路径会被整段打飞，日志就没法看了（那也是一种静默失败）。
+    (re.compile(r"(?<![A-Za-z0-9_\-])[A-Za-z0-9_\-]{40,}"), "***"),
+    # OpenAI/DeepSeek 风格的 key（比 40 字规则更早的形状，保留原替换文案）
     (re.compile(r"sk-[A-Za-z0-9_\-]{6,}"), "sk-***"),
 )
 
@@ -83,17 +117,25 @@ LOG_COMMAND_HEAD_CHARS = 40
 
 
 def redact(text: str) -> str:
-    """把文本里的密钥形状打成 `***`。纯函数，便于单测。"""
+    """把文本里的密钥形状打成 `***`。纯函数，便于单测。
+
+    **审计写盘、模型 prompt、日志，三条出口都要过它**——漏掉哪一条，
+    另外两条做得再好也白搭。聊天窗里给人看的是原文（那是用户自己的屏
+    幕，他要看全文才能判断），打码只针对"会离开本机或落盘"的那几份。
+    """
     for pattern, replacement in _SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
 
 
-def for_log(text: str, *, log_commands: bool = True) -> str:
+def for_log(text: str, *, log_commands: bool = False) -> str:
     """写进日志前的最后一道处理。
 
     总是先脱敏（关掉 log_commands 也要脱敏——前 40 字照样可能含密钥）；
-    ``log_commands=false`` 时进一步只留「长度 + 前 40 字」。
+    ``log_commands=false``（**默认**）时进一步只留「长度 + 前 40 字」。
+
+    默认值从这里改成 false：命令原文是用户这一侧最敏感的东西之一，
+    而"默认就往磁盘写原文"是一个需要用户主动去改才安全的默认。
     """
     safe = redact(text)
     if log_commands:
@@ -262,7 +304,7 @@ class Broadcaster:
         *,
         source: str,
         coalescer: Any = None,
-        log_commands: bool = True,
+        log_commands: bool = False,
     ) -> None:
         self._push = push
         self._logger = logger

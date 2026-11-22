@@ -215,7 +215,7 @@ def test_successful_advice_survives_the_whole_card_path() -> None:
     走完整链路：真 advisor（假 HTTP）→ _advice_for_card →
     build_card_html → ctx.create_card。任何一步抛异常这里都会红。
     """
-    advisor, server = _live_advisor("建议：放行\n理由：只读命令，无副作用")
+    advisor, server = _live_advisor("ALLOW\n理由：只读命令，无副作用")
     gateway = _gateway(ai_judgement=True, has_api_key=True)
     try:
         gateway.grant_authorization(("ai_judgement", "auto_decide"))
@@ -257,7 +257,7 @@ def test_successful_advice_survives_the_whole_card_path() -> None:
 
 def test_advice_state_reaching_the_card_is_a_known_one() -> None:
     """_advice_for_card 交出来的 state 必须是卡片认得的那个词。"""
-    advisor, server = _live_advisor("建议：别放行\n理由：会影响工作区")
+    advisor, server = _live_advisor("DENY\n理由：会影响工作区")
     gateway = _gateway(ai_judgement=True, has_api_key=True)
     try:
         gateway.grant_authorization(("ai_judgement", "auto_decide"))
@@ -650,3 +650,248 @@ def test_no_entry_is_left_pointing_at_the_deleted_approval_show() -> None:
              if callable(obj)]
     assert "approval_show" not in [
         meta.id for meta in metas if meta is not None]
+
+
+# ── A 批 A1：完整命令贯通到卡片 ────────────────────────────────────────────
+
+# 一条"看得见的部分无害、尾部致命"的命令。这正是 A1 的事故形状：
+# 判定读全文，人和模型原来都只有前 120 字。
+TAIL_COMMAND = (
+    "npm run build -- --workspace=packages/core --workspace=packages/ui "
+    "--workspace=packages/agent --sourcemap --verbose && rm -rf ~"
+)
+
+
+def _pending_with_command(gateway: ApprovalGateway, command: str,
+                          rid: str = "r1") -> PendingApproval:
+    """摆一条带完整命令的记录。``tool_summary`` 仍是截断的那一份。"""
+    request = ApprovalRequest(
+        session_id="sess-abc", request_id=rid, tool_name="Bash",
+        tool_summary=f"Bash: {command[:40]}…",
+        full_command=command, working_directory=r"D:\workspace")
+    record = PendingApproval(request)
+    with gateway._lock:  # noqa: SLF001  测试直接摆一条记录进去
+        gateway._records[record.key] = record  # noqa: SLF001
+    return record
+
+
+def test_card_warns_when_the_command_is_longer_than_it_shows() -> None:
+    """超长命令 → 卡片必须说「尾部未显示」，并指去向哪里看全文。"""
+    advisor, server = _live_advisor("ALLOW\n理由：只读命令，无副作用")
+    gateway = _gateway(ai_judgement=True, has_api_key=True)
+    try:
+        gateway.grant_authorization(("ai_judgement", "auto_decide"))
+        logger, ctx = ListLogger(), FakeCtx()
+        plugin = _plugin(gateway, advisor, logger, ctx)
+        pending = _pending_with_command(gateway, TAIL_COMMAND)
+
+        asyncio.run(plugin._create_approval_card(pending))  # noqa: SLF001
+
+        html = ctx.cards[0]["html"]
+        assert "尾部未显示" in html
+        assert f"命令共 {len(TAIL_COMMAND)} 字" in html
+        # 提示必须出现在按钮之前：点"允许"之前就该知道自己没看全
+        assert html.index("尾部未显示") < html.index("允许</button>")
+    finally:
+        server.shutdown()
+        server.server_close()
+        gateway.stop()
+
+
+def test_short_command_card_stays_clean() -> None:
+    """不超长就不多那一行——卡片是瘦的，每行噪音都要付代价。"""
+    advisor, server = _live_advisor("ALLOW\n理由：只读命令，无副作用")
+    gateway = _gateway(ai_judgement=True, has_api_key=True)
+    try:
+        gateway.grant_authorization(("ai_judgement", "auto_decide"))
+        ctx = FakeCtx()
+        plugin = _plugin(gateway, advisor, ListLogger(), ctx)
+        pending = _pending_with_command(gateway, "rm -rf build/")
+
+        asyncio.run(plugin._create_approval_card(pending))  # noqa: SLF001
+
+        assert "尾部未显示" not in ctx.cards[0]["html"]
+        assert "<strong>建议允许</strong>" in ctx.cards[0]["html"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        gateway.stop()
+
+
+def test_no_allow_when_the_command_is_longer_than_the_card_shows() -> None:
+    """A1 第 5 条：超过展示上限 → 结论强制「无法判断」。
+
+    模型照样被调用（它的 prompt 里带头尾全文），理由仍进「这是什么」，
+    但**结论行不许出现"建议允许"**——用户只看得到前 80 字，
+    此时给他一个"建议允许"就是替他省掉最不该省的那一步。
+    """
+    advisor, server = _live_advisor("ALLOW\n理由：读起来像构建脚本，无副作用")
+    gateway = _gateway(ai_judgement=True, has_api_key=True)
+    try:
+        gateway.grant_authorization(("ai_judgement", "auto_decide"))
+        ctx = FakeCtx()
+        plugin = _plugin(gateway, advisor, ListLogger(), ctx)
+        pending = _pending_with_command(gateway, TAIL_COMMAND)
+
+        asyncio.run(plugin._create_approval_card(pending))  # noqa: SLF001
+
+        html = ctx.cards[0]["html"]
+        assert "<strong>建议允许</strong>" not in html
+        assert "<strong>无法判断，需要你决定</strong>" in html
+        # 模型的理由没被扔掉——它进「这是什么」
+        assert pending.advice["reason"] == "读起来像构建脚本，无副作用"
+    finally:
+        server.shutdown()
+        server.server_close()
+        gateway.stop()
+
+
+def test_explain_entry_passes_the_full_command_through() -> None:
+    """「这是什么」必须拿到全文，否则「尾部未显示」是句死路。"""
+    gateway = _gateway()
+    try:
+        plugin, ctx, pending = _approval_card_ctx(gateway)
+        pending.request.full_command = TAIL_COMMAND
+
+        asyncio.run(plugin.approval_explain("r1", {}))  # noqa: SLF001
+
+        # 解释卡是**新发的那一条**（cards[0] 是审批卡，原地不动）
+        assert len(ctx.cards) == 2
+        html = ctx.cards[1]["html"]
+        assert 'class="cmd"' in html
+        assert "rm -rf ~" in html
+    finally:
+        gateway.stop()
+
+
+# ── A 批 A2：高风险不显示「建议允许」 ──────────────────────────────────────
+
+def test_critical_request_never_shows_allow_even_if_the_model_insists() -> None:
+    """规格 §2 硬规则 3：critical / 不可恢复的请求上，模型硬说 ALLOW
+    也压成「无法判断」，并把这次冲突写进审计。
+
+    这类动作一旦放行就没有第二次机会，而模型会错。一个没有依据的
+    "建议允许"会替用户把最不该省的那一步省掉。
+    """
+    advisor, server = _live_advisor("ALLOW\n理由：看起来就是个删除，放行吧")
+    gateway = _gateway(ai_judgement=True, has_api_key=True)
+    try:
+        gateway.grant_authorization(("ai_judgement", "auto_decide"))
+        ctx = FakeCtx()
+        plugin = _plugin(gateway, advisor, ListLogger(), ctx)
+        # delete 规则 → critical + irreversible
+        pending = _pending_with_command(gateway, "rm -rf build/")
+        pending.severity, pending.rule, pending.action_class = (
+            "critical", "delete", "irreversible")
+
+        asyncio.run(plugin._create_approval_card(pending))  # noqa: SLF001
+
+        html = ctx.cards[0]["html"]
+        assert "<strong>建议允许</strong>" not in html
+        assert "<strong>无法判断，需要你决定</strong>" in html
+        # 冲突要留在记录上，审计才查得到"模型本来想放行"
+        assert pending.advice["conflict"]
+        assert "模型建议与风险档冲突" in pending.advice["conflict"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        gateway.stop()
+
+
+def test_the_conflict_lands_in_the_audit_row() -> None:
+    """审计里要能看出"模型说 allow 被压掉了"——事后复盘时差别很大。
+
+    卡片上只显示"无法判断"，看不出模型本来想放行；而这两件事
+    （模型含糊 vs 模型说反了）在复盘时完全不同。
+    """
+    advisor, server = _live_advisor("ALLOW\n理由：放行")
+    gateway = _gateway(ai_judgement=True, has_api_key=True)
+    try:
+        gateway.grant_authorization(("ai_judgement", "auto_decide"))
+        plugin = _plugin(gateway, advisor, ListLogger(), FakeCtx())
+        pending = _pending_with_command(gateway, "rm -rf build/")
+        pending.severity, pending.rule, pending.action_class = (
+            "critical", "delete", "irreversible")
+
+        advice = asyncio.run(plugin._advice_for_card(pending))  # noqa: SLF001
+        pending.advice = advice
+        pending.decision, pending.decided_by = "allow", "user"
+        with gateway._lock:  # noqa: SLF001  直接走到记账那一步
+            gateway._write_audit_locked(pending)  # noqa: SLF001
+
+        rows = [row for row in gateway.audit_rows() if row["kind"] == "decision"]
+        assert len(rows) == 1
+        assert "模型建议与风险档冲突" in rows[0]["advice_note"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        gateway.stop()
+
+
+def test_a_row_without_a_conflict_says_so_plainly() -> None:
+    """没有冲突的审计行写 ``-``，不留空——空字段看着像漏了东西。"""
+    gateway = _gateway()
+    try:
+        pending = _pending_with_command(gateway, "rm -rf build/")
+        pending.decision, pending.decided_by = "deny", "user"
+        with gateway._lock:  # noqa: SLF001
+            gateway._write_audit_locked(pending)  # noqa: SLF001
+        rows = [row for row in gateway.audit_rows() if row["kind"] == "decision"]
+        assert rows[0]["advice_note"] == "-"
+    finally:
+        gateway.stop()
+
+
+def test_a_deny_on_a_critical_request_still_shows_deny() -> None:
+    """阀门是**单向**的：只压 allow，不把建议整条关掉。
+
+    模型说 DENY 时照样显示"建议拒绝"——那也是用户该看到的信息。
+    """
+    advisor, server = _live_advisor("DENY\n理由：删掉整个目录，不可恢复")
+    gateway = _gateway(ai_judgement=True, has_api_key=True)
+    try:
+        gateway.grant_authorization(("ai_judgement", "auto_decide"))
+        ctx = FakeCtx()
+        plugin = _plugin(gateway, advisor, ListLogger(), ctx)
+        pending = _pending_with_command(gateway, "rm -rf build/")
+        pending.severity, pending.rule, pending.action_class = (
+            "critical", "delete", "irreversible")
+
+        asyncio.run(plugin._create_approval_card(pending))  # noqa: SLF001
+
+        assert "<strong>建议拒绝</strong>" in ctx.cards[0]["html"]
+        assert not pending.advice["conflict"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        gateway.stop()
+
+
+@pytest.mark.parametrize("reply", [
+    "不放行",
+    "不建议放行",
+    "不允许",
+    "别允许",
+])
+def test_a_negative_answer_never_reaches_the_card_as_allow(reply: str) -> None:
+    """端到端再钉一次 A2 的那四种否定句。
+
+    单元测试盯着 ``_parse``，这里盯着"解析结果真的到了卡片上"——
+    中间还要过 ``conclusion_for`` 与 ``safe_conclusion`` 两层翻译，
+    任何一层把 unsure 翻成 allow 都会被抓住。
+    """
+    advisor, server = _live_advisor(f"{reply}\n理由：会删东西")
+    gateway = _gateway(ai_judgement=True, has_api_key=True)
+    try:
+        gateway.grant_authorization(("ai_judgement", "auto_decide"))
+        ctx = FakeCtx()
+        plugin = _plugin(gateway, advisor, ListLogger(), ctx)
+        pending = _pending_with_command(gateway, "rm -rf build/")
+
+        asyncio.run(plugin._create_approval_card(pending))  # noqa: SLF001
+
+        assert "<strong>建议允许</strong>" not in ctx.cards[0]["html"], reply
+    finally:
+        server.shutdown()
+        server.server_close()
+        gateway.stop()

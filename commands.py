@@ -61,6 +61,12 @@ BANNED_INTERNAL = (
 # 后果行必须出现这几个词之一（规格 P3）：说不出最坏结果就等于没说。
 RECOVERY_WORDS = ("不可恢复", "找不回来", "永久")
 
+# 主卡上一行最多显示多少字命令内容。**超过就必须明说**（2026-11-22 A 批）：
+# 风险判定读的是完整命令，卡片只显示这么长——一条 150 字的命令在末尾
+# 挂 `&& rm -rf ~`，判定看得见、人看不见，那就是在请用户盲签。
+# 所以超过这个上限时卡片上要多一行「尾部未显示」，全文进「这是什么」。
+COMMAND_DISPLAY_MAX = 80
+
 UNKNOWN_ACTION = "未识别的命令"
 UNKNOWN_CONSEQUENCE = "看不出这一步最坏会怎样"
 
@@ -211,7 +217,9 @@ def _clean_target(raw: str) -> str:
     if not text:
         return ""
     head = text.split()[0]
-    return _clip(head, 120)
+    # 上限与整条命令的展示上限取同一个数：卡片上从命令里搬出来的字
+    # 不许比"直接显示命令"还多，否则"只显示前 N 字"就是句假话。
+    return _clip(head, COMMAND_DISPLAY_MAX)
 
 
 # 只是打印/回显，不是真执行。规格 §5.2 明确把 `echo "rm -rf C:\"` 列为
@@ -229,7 +237,7 @@ def translate(command: str) -> CommandFacts:
                             consequence=UNKNOWN_CONSEQUENCE, known=False)
     if _PRINT_ONLY_RE.match(text):
         return CommandFacts(
-            action=f"{UNKNOWN_ACTION}：{_clip(text, 80)}",
+            action=f"{UNKNOWN_ACTION}：{_clip(text, COMMAND_DISPLAY_MAX)}",
             consequence="这一步只是打印一句话，不会真的动文件",
             known=False)
     rm = _rm_facts(text)
@@ -242,7 +250,7 @@ def translate(command: str) -> CommandFacts:
                                 targets=(), known=True,
                                 irreversible=rule.irreversible,
                                 scope=rule.scope)
-    return CommandFacts(action=f"{UNKNOWN_ACTION}：{_clip(text, 80)}",
+    return CommandFacts(action=f"{UNKNOWN_ACTION}：{_clip(text, COMMAND_DISPLAY_MAX)}",
                         consequence=UNKNOWN_CONSEQUENCE, known=False)
 
 
@@ -311,6 +319,21 @@ def card_lines(*, command: str, working_directory: str | None) -> dict[str, Any]
         "known": facts.known,
         "irreversible": facts.irreversible,
     }
+
+
+def command_display_note(command: str) -> str:
+    """命令超过卡片展示上限时的那一行提示。没超就返回空串。
+
+    **这一行是安全件，不是装饰**：卡片只显示前 ``COMMAND_DISPLAY_MAX``
+    字，而风险判定读的是全文。不告诉用户"你没看全"，就等于让他在
+    信息不全的情况下点"允许"。所以超长时必须明说，并把全文指向
+    「这是什么」——那里有等宽的完整原文。
+    """
+    total = len(" ".join(str(command or "").split()))
+    if total <= COMMAND_DISPLAY_MAX:
+        return ""
+    return (f"命令共 {total} 字，只显示前 {COMMAND_DISPLAY_MAX} 字，"
+            f"尾部未显示；完整命令在「这是什么」里")
 
 
 def first_banned(text: str) -> str | None:

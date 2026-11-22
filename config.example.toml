@@ -15,12 +15,13 @@ auto_start = false
 # L0 规则层：同一事件在该秒数内合并成一条播报（防刷屏）。
 coalesce_seconds = 60
 
-# 播报正文是否原样写进插件日志。
-#   true  = 写，但写之前先脱敏（-p<密码>、--token/--api-key 的值、password=、
-#           api_key=、sk-…、Bearer … 一律打成 ***）
-#   false = 只写「命令长度 + 前 40 字」（照样先脱敏）
-# 聊天窗里给人看的永远是原文——打码只针对落盘日志。
-log_commands = true
+# 播报与审批的正文是否原样写进插件日志。
+#   true  = 写，但写之前先脱敏（环境变量形式的 KEY/TOKEN/SECRET/PASSWORD、
+#           -p<密码>、--token/--api-key 的值、GitHub/AWS/Slack 令牌形状、
+#           PEM 私钥块、40 字以上无分隔长串，一律打成 ***）
+#   false = 只写「命令长度 + 前 40 字」（照样先脱敏）**默认**
+# 聊天窗里给人看的永远是原文——打码只针对落盘日志与发给模型的那一份。
+log_commands = false
 
 
 # 停滞判定：同一会话超过该分钟数没有新事件且未结束，报一次。

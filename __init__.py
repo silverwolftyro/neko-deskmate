@@ -78,12 +78,13 @@ from .approval import (
     explain_request,
     is_known_advice_state,
     normalize_warning_mode,
+    safe_conclusion,
     warning_key,
 )
 from .broadcast import Broadcaster, describe_actor, render_text
 from .commands import (
+    COMMAND_DISPLAY_MAX,
     CONCLUSION_UNSURE,
-    conclusion_for,
 )
 from .events import UnifiedEvent, attribute, delegated_server
 from .hooksetup import (
@@ -196,7 +197,7 @@ class StatusReply(BaseModel):
     )
     authorization: dict | None = Field(
         default=None,
-        description="L1/L2 授权状态：granted / scopes / version / confirmed_time。"
+        description="授权状态：granted / scopes / version / confirmed_time。"
                     "审批服务未运行时为 null",
     )
     build: str = Field(default="", description="代码指纹：git short sha 或内容哈希")
@@ -325,11 +326,20 @@ _DISPLAY_STATE_FOR_OUTCOME = {
 
 
 def _command_of(request: Any) -> str:
-    """从审批请求里取命令原文，只取命令。
+    """从审批请求里取**完整**命令原文。
 
-    ``tool_summary`` 是"工具名: 命令"的一行摘要，模型那边再包一次工具名就重复了，
-    所以这里把前缀去掉。取不到就回 tool_summary 本身——宁可少切，不要切错。
+    2026-11-22 A 批之前这里是从 ``tool_summary`` 反推的：摘要被截到
+    120 字，于是模型与卡片都只看得到命令的开头，而风险判定读的是全文——
+    一条 150 字的命令在末尾挂 ``&& rm -rf ~``，判定看得见、人和模型都
+    看不见。现在 ``ApprovalRequest`` 上直接带一份 ``full_command``，
+    这里优先用它，不再有人从截断文本里反推。
+
+    回退分支留给不带的调用方（老测试、别的构造路径）：宁可少一截，
+    不要切错——所以仍按"工具名:"前缀剥一次。
     """
+    full = str(getattr(request, "full_command", "") or "")
+    if full.strip():
+        return full
     summary = str(getattr(request, "tool_summary", "") or "")
     name = str(getattr(request, "tool_name", "") or "")
     if name and summary.startswith(f"{name}:"):
@@ -811,7 +821,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._broadcaster = Broadcaster(
             self.push_message, self.logger, source=SOURCE,
             coalescer=Coalescer(window_seconds=coalesce_seconds),
-            log_commands=_to_bool(config.get("log_commands"), True),
+            log_commands=_to_bool(config.get("log_commands"), False),
         )
         self.logger.info(
             "观测适配器就绪 transcript={} gateway={} 合并窗口={}s",
@@ -901,7 +911,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
         )
         text = (
             f"同桌猫：已按你的授权自动放行 {request.tool_summary or request.tool_name}"
-            f"（L2 低风险，授权 {pending.authorization or '-'}，"
+            f"（低风险，授权 {pending.authorization_card or '已确认'}，"
             f"模型 {pending.judge_model or '-'}，理由 {pending.judge_reason or '低风险'}）"
         )
         try:
@@ -971,12 +981,14 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # 红字递减（规格 Q3）：先记一次命中，再按"第几次"决定警示长成
         # 红字还是徽标。**只影响外观**——门控那边一个字节都没改。
         warning = self._warning_policy(pending)
+        # 卡片与模型用**同一份完整命令**（A 批 A1）：不再从截断的摘要反推。
+        command = _command_of(request)
         html = build_card_html(
             subject=subject, tool_summary=body, session_id=request.session_id,
             working_directory=request.working_directory,
             advice_state=advice["state"],
             risk=pending.severity, action_class=pending.action_class,
-            command=_command_of(request), conclusion=advice["conclusion"],
+            command=command, conclusion=advice["conclusion"],
             upstream=request.upstream, warning=warning,
             logger=self.logger,
         )
@@ -1025,12 +1037,24 @@ class AgentDeskmatePlugin(NekoPluginBase):
             return self._degraded_advice("no_key")
 
         request = pending.request
+        command = _command_of(request)
+        # 命令超过卡片展示上限时（A 批 A1 第 5 条）：**结论强制「无法判断」**。
+        # 理由：用户只看得到前 80 字，此时任何"建议允许"都是在信息不全的
+        # 情况下替他省掉最不该省的那一步。模型照样调用（它的 prompt 里带头
+        # 尾全文），理由仍进「这是什么」——但结论行必须是第三态。
+        over_limit = len(" ".join(command.split())) > COMMAND_DISPLAY_MAX
+        if over_limit:
+            self.logger.info(
+                "请求 {} 的命令 {} 字超过展示上限 {}，建议结论按无法判断呈现",
+                request.request_id, len(" ".join(command.split())),
+                COMMAND_DISPLAY_MAX,
+            )
         loop = asyncio.get_running_loop()
         try:
             advice = await loop.run_in_executor(
                 self._advice_pool, lambda: advisor.suggest(
                     tool_name=request.tool_name,
-                    command=_command_of(request),
+                    command=command,
                     cwd=request.working_directory or "",
                     risk=pending.severity,
                 ))
@@ -1048,6 +1072,23 @@ class AgentDeskmatePlugin(NekoPluginBase):
             degraded["conclusion"] = CONCLUSION_UNSURE
             return degraded
 
+        # **高风险不显示「建议允许」**（A 批 A2 第 3 条，规格 §2 硬规则 3）：
+        # critical / 不可恢复的请求上，模型硬说 allow 也压成"无法判断"，
+        # 并把这次冲突写进审计。卡片上只看得到结果，看不到"模型本来想放行"，
+        # 而事后复盘时这两件事的差别很大。
+        conclusion, conflict = safe_conclusion(
+            advice.suggestion, risk=pending.severity,
+            action_class=pending.action_class)
+        if over_limit:
+            # 看不全的时候不给"建议允许"（A 批 A1 第 5 条）。
+            conclusion = CONCLUSION_UNSURE
+        if conflict:
+            self.logger.warning(
+                "请求 {}：{}（模型说 {}，风险 {}，类别 {}）",
+                request.request_id, conflict, advice.suggestion,
+                pending.severity, pending.action_class,
+            )
+
         basis = (f"工具 {request.tool_name or '未知'}；"
                  f"工作目录 {request.working_directory or '未知'}；"
                  f"本地规则风险档 {pending.severity}"
@@ -1057,8 +1098,9 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # 翻译成人话，绝不上卡片。理由与依据不进主卡（规格 P3：折叠进
         # 「这是什么」），但它们要留在记录上，解释卡用。
         return {"state": _DISPLAY_STATE_FOR_OUTCOME[STATE_OK],
-                "conclusion": conclusion_for(advice.suggestion),
-                "reason": advice.reason, "basis": basis}
+                "conclusion": conclusion,
+                "reason": advice.reason, "basis": basis,
+                "conflict": conflict}
 
     def _degraded_advice(self, state: str,
                          reason_override: str | None = None) -> dict[str, str]:
@@ -1086,7 +1128,10 @@ class AgentDeskmatePlugin(NekoPluginBase):
                     else "已拒绝，这次调用被中止。")
         elif pending.decided_by == DECIDED_BY_AI:
             # L2 只可能自动 allow。文案必须点明"凭你的授权"，不能写成插件自己的决定。
-            note = (f"已由 L2 自动放行（凭你的授权 {pending.authorization or '-'}，"
+            # **两处都不写内部词**：不写"L2"（层级名），也不用审计那一版
+            # 授权溯源（``v1:ai_judgement,auto_decide by=user``）——那是给
+            # 事后对账的精确写法，印在卡片上就是让用户猜配置键名。
+            note = (f"已凭你的授权自动放行（{pending.authorization_card or '授权'}，"
                     f"模型 {pending.judge_model or '-'}，理由 {pending.judge_reason or '低风险'}）")
         else:
             # 到期：只陈述事实——宿主自己处理的，我们没做判断。
@@ -1164,6 +1209,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
             rule=pending.rule,
             severity=pending.severity,
             command=_command_of(pending.request),
+            # 完整命令原文（A 批 A1）：主卡只显示前 80 字，全文在这里。
+            full_command=_command_of(pending.request),
             model_reason=advice.get("reason", ""),
             basis=advice.get("basis", ""),
             # 没接入模型/没签字时那句陈述。主卡不放它（正文四行），
@@ -1360,7 +1407,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
         name=tr("entry.approval_authorize.name", default="授权确认"),
         description=tr(
             "entry.approval_authorize.description",
-            default="L1/L2 的授权入口：弹出授权文案让用户确认（含「模型判断可能出错，"
+            default="授权入口：弹出授权文案让用户确认（含「模型判断可能出错，"
                     "决定由你授权并承担后果」）。用户点「确认授权」后才写入授权记录并"
                     "审计。插件永不会自行调用它。",
         ),
@@ -1401,7 +1448,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
             snapshot = self._approval.authorization_snapshot()
             return Ok({
                 "granted": False,
-                "message": "请在卡片上点「确认授权」；未确认前 L1/L2 均不生效。",
+                "message": ("请在卡片上点「确认授权」；未确认前，"
+                            "模型建议与自动放行都不会生效。"),
                 "text": snapshot["text"],
                 "headline": snapshot["headline"],
                 "scopes": list(wanted),

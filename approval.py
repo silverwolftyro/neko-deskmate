@@ -71,10 +71,16 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
+# redact 只有一份，在 broadcast 里（A 批 A4：三条出口共用一套形状）。
+# 审批自己不再长第二套——两套脱敏规则等于没有规则。
+from .broadcast import redact
 from .commands import (
+    CONCLUSION_ALLOW,
     CONCLUSION_UNSURE,
     CONCLUSIONS,
     card_lines,
+    command_display_note,
+    conclusion_for,
 )
 from .warncount import WarningCounter
 
@@ -105,21 +111,33 @@ AUTH_SCOPES = (AUTH_SCOPE_ADVICE, AUTH_SCOPE_AUTO)
 AUTHORIZATION_TITLE = "同桌猫 · 授权确认"
 # 授权文案。必须包含"模型判断可能出错"与"决定由你授权并承担后果"——
 # 这是用户签字前该看到的话，测试逐句盯着。
+# **全文人话**：原来这里写着"命中的 L0 规则"，那是内部词，
+# 用户在签字这一刻不该去猜 L0 是什么（C5 同类缺陷）。
 AUTHORIZATION_TEXT = (
-    "开启后，插件会把「命令原文、工作目录、命中的 L0 规则、会话标识」"
-    "交给你的配置里指定的模型，由它给出建议（ai_judgement），"
-    "或在你授权的低风险动作上替你放行（auto_decide）。"
+    "开启后，插件会把「命令原文、工作目录、本地规则判定的结果、会话标识」"
+    "交给你的配置里指定的模型，由它给出建议，"
+    "或者在你授权的低风险动作上替你放行。"
 )
 AUTHORIZATION_HEADLINE = "模型判断可能出错，决定由你授权并承担后果"
 AUTHORIZATION_FOOTER = (
     "插件不会在运行时自行开启以上任何一项；想关闭只需把配置改回 "
-    "false / off。确认记录会写进审批审计（含时间、范围、授权版本）。"
+    "关闭 / 不自动决定。确认记录会写进审批审计（含时间、范围、授权版本）。"
 )
 
 HOOK_PATH = "/hook/permission"
 # 探活端点。中继转发之前先打这里；插件没起来时中继据此交还原生权限流程。
 HEALTH_PATH = "/health"
 MAX_BODY_BYTES = 256 * 1024
+# 同时挂起的审批请求上限。每个请求占一个 handler 线程，而且会一直阻塞到
+# 用户点按钮或到期（默认 570s）——不设上限的话，一个乱发的客户端就能
+# 把线程吃光。超出的请求回 503，中继把它当"没有决定"交还原生流程。
+MAX_INFLIGHT = 32
+# 探活应答里的身份标识。**中继靠它确认"对面是自己这一版插件"**：
+# 端口上住的可能是别的程序（A 批 A3：插件没启动时若其它进程占了 48921，
+# 中继会把完整命令发给它，还会把它返回的任意内容转交 Claude Code）。
+# 只答 "ok" 是不够的——那只能证明"有个 HTTP 服务在听"。
+HEALTH_SERVICE = "agent_deskmate"
+HEALTH_TOKEN = "deskmate-approval-v1"
 
 # 默认到期时间。必须**明显小于** hooks.json 里的 hook timeout（600s），
 # 否则我们还没到期宿主就先断了。留 30 秒余量。
@@ -310,6 +328,33 @@ def is_known_advice_state(state: Any) -> bool:
     return state in ADVICE_STATES
 
 
+# 模型建议与风险档冲突时，写进审计的那句话。
+ADVICE_CONFLICT_NOTE = "模型建议与风险档冲突，已按无法判断呈现"
+
+
+def safe_conclusion(suggestion: str, *, risk: str,
+                    action_class: str) -> tuple[str, str]:
+    """把模型的建议收拢到安全区间。返回 ``(结论, 冲突说明)``。
+
+    **critical / 不可恢复的请求永不显示「建议允许」**（规格 §2 硬规则 3）：
+    模型硬说 allow 也降级成「无法判断」。理由很直白——这类动作一旦放行
+    就没有第二次机会，而模型会错；一个没有依据的"建议允许"会替用户
+    把最不该省的那一步省掉。
+
+    注意它**只压 allow**：模型说 deny 时照样显示"建议拒绝"，说 unsure
+    时照样显示"无法判断"。这是单向阀门，不是把建议整条关掉。
+
+    放在这个模块而不是 model_advice：判据（风险档、动作类别）在这边，
+    而建议客户端不该知道规则库怎么分级。
+    """
+    conclusion = conclusion_for(suggestion)
+    high_risk = (action_class in IRREVERSIBLE_CLASSES
+                 or SEVERITY_ORDER.get(risk, 0) >= SEVERITY_ORDER["critical"])
+    if high_risk and conclusion == CONCLUSION_ALLOW:
+        return CONCLUSION_UNSURE, ADVICE_CONFLICT_NOTE
+    return conclusion, ""
+
+
 class ApprovalRequest(BaseModel):
     """一次审批请求。request_id 由我们生成，不用 Claude 的 tool_use_id——
     那个 id 在父子代理间会重复，而我们可能要同时挂多个请求。"""
@@ -318,6 +363,13 @@ class ApprovalRequest(BaseModel):
     request_id: str = Field(description="我们生成的请求 id")
     tool_name: str = Field(default="", description="要执行的工具名")
     tool_summary: str = Field(default="", description="工具调用的一行摘要（给人看）")
+    # 完整命令/目标原文，**不截断**。存在的理由（2026-11-22 A 批）：
+    # 风险判定用的是完整命令，而卡片与模型原来都只有截到 120 字的
+    # tool_summary——一条 150 字的命令在末尾挂 `&& rm -rf ~`，
+    # 判定看得见、人和模型都看不见。所以这里单独存一份全文，
+    # 卡片/解释卡/模型 prompt 统一用它，不再从 summary 反推。
+    # **只在内存里流转**：任何出口（日志/审计）都要先过 broadcast.for_log。
+    full_command: str = Field(default="", description="未经截断的命令原文，仅内存流转")
     working_directory: str | None = Field(default=None, description="会话 cwd")
     agent: str = Field(default="claude-code", description="来源 Agent")
     # 上游进程链：谁拉起了这个 Agent。由中继在转发时爬进程树填
@@ -355,6 +407,10 @@ class PendingApproval:
         # 生效中的授权（"v1:ai_judgement,auto_decide by=user"）——L2 审计要能
         # 追溯到"是谁授权的"，不能只写"AI 决定的"。
         self.authorization: str = ""
+        # 同一件事的**人话版**，给卡片与通知用。审计要精确到配置键名，
+        # 用户屏幕上不能出现键名（C5 同类缺陷）——两个字段各管一头，
+        # 谁也不许替谁说话。
+        self.authorization_card: str = ""
         # L2 自动放行标记 + 通知是否已发。
         self.auto = False
         self.auto_announced = False
@@ -415,14 +471,40 @@ def _tool_summary(tool_name: str, tool_input: Any) -> str:
     只取一个最有信息量的字段，不把整个 input 倒出来（可能含密钥/长文本）。
     取不到的就只写工具名——**不猜它要干什么**。
     """
-    if not isinstance(tool_input, dict):
+    key = _primary_key(tool_input)
+    if key is None:
         return tool_name or "未知工具"
+    return f"{tool_name}: {_clip(tool_input[key])}"
+
+
+def _primary_key(tool_input: Any) -> str | None:
+    """tool_input 里"最有信息量的那个字段"的键名。取不到返回 None。
+
+    ``_tool_summary`` 与 ``_full_command`` **共用这一个顺序表**：
+    两份各自维护一份的话，摘要显示 A 字段、全文取 B 字段，
+    卡片上就会出现"看得见的不完整、完整的不对应"。
+    """
+    if not isinstance(tool_input, dict):
+        return None
     for key in ("command", "file_path", "path", "pattern", "query", "url",
                 "prompt", "description"):
         value = tool_input.get(key)
         if isinstance(value, str) and value.strip():
-            return f"{tool_name}: {_clip(value)}"
-    return tool_name or "未知工具"
+            return key
+    return None
+
+
+def _full_command(tool_name: str, tool_input: Any) -> str:
+    """未经截断的命令/目标原文。取不到就空串——**不猜、不补**。
+
+    刻意保留换行：多行脚本在等宽块里才读得下去，压成一行会把
+    ``if …; then rm -rf x; fi`` 这种结构读错。清洗只去掉首尾空白。
+    """
+    key = _primary_key(tool_input)
+    if key is None:
+        return ""
+    value = tool_input[key]
+    return str(value).strip()
 
 
 def build_request(payload: Any) -> ApprovalRequest:
@@ -435,11 +517,15 @@ def build_request(payload: Any) -> ApprovalRequest:
     """
     data = payload if isinstance(payload, dict) else {}
     tool_name = str(data.get("tool_name") or "")
+    tool_input = data.get("tool_input")
     return ApprovalRequest(
         session_id=str(data.get("session_id") or ""),
         request_id=uuid.uuid4().hex[:12],
         tool_name=tool_name,
-        tool_summary=_tool_summary(tool_name, data.get("tool_input")),
+        tool_summary=_tool_summary(tool_name, tool_input),
+        # 全文单独存一份：卡片、解释卡、模型 prompt 都用它，
+        # 不再有人从截断的 summary 里反推命令。
+        full_command=_full_command(tool_name, tool_input),
         working_directory=(str(data["cwd"]) if data.get("cwd") else None),
         upstream=_clean_upstream(data.get(UPSTREAM_FIELD)),
     )
@@ -695,6 +781,12 @@ CARD_CSS = (
     " margin: 6px 0 0; }"
     ".src { color: #888; font-size: 12px; margin: 8px 0 2px; }"
     ".hint { color: #aaa; font-size: 12px; margin-top: 8px; }"
+    # 完整命令：等宽 + 保留换行 + 自动换行。它是「这是什么」里唯一一段
+    # 原文，长命令可能几百字，不能把它撑破卡片。
+    ".cmd { font-family: Consolas, 'Courier New', monospace; font-size: 12px;"
+    " white-space: pre-wrap; word-break: break-all; background: #f5f5f5;"
+    " border-left: 3px solid #ccc; padding: 6px 8px; margin: 6px 0;"
+    " max-height: 240px; overflow: auto; }"
     "button { margin: 8px 8px 0 0; padding: 6px 18px; }"
 )
 
@@ -763,6 +855,10 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
     # 词典只描述事实，不给结论。
     lines = card_lines(command=command or tool_summary,
                        working_directory=working_directory)
+    # 命令超过展示上限时那一行提示（A 批 A1）。放在四行正文之后、
+    # 执行者信息之前：它是关于"你看全了吗"的警告，得在按钮之前。
+    note = command_display_note(command or tool_summary)
+    note_html = f'<p class="src">{_escape(note)}</p>' if note else ""
     # 结论行的取值受 advice_state 约束：**只有真的拿到了模型建议，
     # 结论才可能是"建议允许/建议拒绝"**。建议层降级时（没 key、没签字、
     # 调用失败、状态未知）一律落最保守的第三态——哪怕调用方误传了一个结论，
@@ -780,6 +876,7 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
         f"<p>{_escape(lines['consequence'])}</p>",
         f"<p>{_escape(lines['scope'])}</p>",
         warn_html,
+        note_html,
     ]
 
     # 执行者与上游：压成两行小字放在最下面。它们回答"这是我自己开的吗"，
@@ -804,6 +901,7 @@ def explain_request(*, tool_name: str, tool_summary: str,
                     severity: str, command: str = "",
                     model_reason: str = "", basis: str = "",
                     model_note: str = "", session_id: str = "",
+                    full_command: str = "",
                     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
                     verbosity: str = DEFAULT_VERBOSITY) -> dict[str, str]:
     """「这是什么」按钮的落点：解释，只说事实，不猜意图。
@@ -857,8 +955,14 @@ def explain_request(*, tool_name: str, tool_summary: str,
         "note": ("以上是插件能讲准的事实。看不出来的地方不会替你猜——"
                  "要不要放行由你定。"),
     }
+    # 完整命令原文（A 批 A1）：主卡只显示前 80 字，**全文在这里**。
+    # 等宽块 + 保留换行：多行脚本要照着原样读才判断得准。
+    if full_command.strip():
+        explanation["full_command"] = full_command
     # 讲多细由配置决定（规格 P5.3）。brief 只留结论与后果；standard 加范围
     # 与规则判据；detailed 再叠加模型给的理由与依据。
+    # **full_command 不在这三个档次里被裁掉**：它是主卡看不全的那部分，
+    # 删了它，「尾部未显示」那句提示就变成了死路。
     if verbosity == VERBOSITY_BRIEF:
         for key in ("location", "extra", "timeout"):
             explanation.pop(key, None)
@@ -891,6 +995,10 @@ def build_explain_html(explanation: dict[str, str]) -> str:
         f"<p>{_escape(explanation['verdict'])}</p>"
         f"<p>{_escape(explanation['extra'])}</p>"
         f"<p class=\"loc\">{_escape(explanation['location'])}</p>"
+        # 完整命令：等宽块。放在位置信息之后、模型理由之前——
+        # 先看清事实，再看别人的意见。
+        + (f"<pre class=\"cmd\">{_escape(explanation['full_command'])}</pre>"
+           if explanation.get("full_command") else "")
         + (f"<p class=\"src\">{_escape(explanation['model_note'])}</p>"
            if explanation.get("model_note") else "")
         + (f"<p><strong>{_escape(explanation['model_reason'])}</strong></p>"
@@ -926,6 +1034,24 @@ def build_authorize_actions(scopes: tuple[str, ...]) -> dict[str, dict[str, Any]
     }
 
 
+AUTH_SCOPE_TEXT = {
+    AUTH_SCOPE_ADVICE: "模型建议",
+    AUTH_SCOPE_AUTO: "低风险时自动放行",
+}
+
+
+def scope_text(scopes: tuple[str, ...]) -> str:
+    """授权范围 → 人话。**不把配置键名印在卡上**。
+
+    原来这里直接 ``'、'.join(scopes)``，卡片上于是出现
+    「本次确认范围：ai_judgement、auto_decide」——用户在签字这一刻
+    不该去猜那两个词是什么（C5 同类缺陷：内部词泄到界面）。
+    认不出的范围原样给：那是新加的 scope，宁可显示原名也不编一个说法。
+    """
+    return "、".join(AUTH_SCOPE_TEXT.get(str(scope), str(scope))
+                     for scope in scopes)
+
+
 def build_authorize_html(*, scopes: tuple[str, ...]) -> str:
     """授权确认卡。文案固定，不掺变量——用户签字前看到的话不该随上下文变。"""
     return (
@@ -933,7 +1059,7 @@ def build_authorize_html(*, scopes: tuple[str, ...]) -> str:
         f"<strong>{_escape(AUTHORIZATION_TITLE)}</strong>"
         f"<p>{_escape(AUTHORIZATION_TEXT)}</p>"
         f"<p class=\"risk\">{_escape(AUTHORIZATION_HEADLINE)}</p>"
-        f"<p>本次确认范围：{_escape('、'.join(scopes))}（授权版本 "
+        f"<p>本次确认范围：{_escape(scope_text(scopes))}（授权版本 "
         f"v{AUTHORIZATION_VERSION}）</p>"
         f"<p class=\"hint\">{_escape(AUTHORIZATION_FOOTER)}</p>"
         f"<button data-neko-action=\"{ACTION_AUTH_CONFIRM}\">确认授权</button>"
@@ -962,8 +1088,22 @@ class AuthorizationRecord(BaseModel):
     note: str = Field(default="")
 
     def as_audit_text(self) -> str:
-        """审计里的授权溯源：版本 + 范围 + 谁签的字。"""
+        """审计里的授权溯源：版本 + 范围 + 谁签的字。
+
+        **这一版给审计用**：键名（``ai_judgement``）在审计里是有用的
+        精确信息，事后对账要靠它。卡片上看的是 ``as_card_text``——
+        同一个事实的两种写法，别混用。
+        """
         return f"v{self.version}:{','.join(self.scopes) or '-'} by={self.confirmed_by}"
+
+    def as_card_text(self) -> str:
+        """卡片上的授权溯源：同一件事的人话版。
+
+        结果卡上原来直接印 ``as_audit_text()``，于是用户看到
+        「授权 v1:ai_judgement,auto_decide by=user」——那是在让用户
+        猜配置键名（C5 同类缺陷）。审计要精确，卡片要能读。
+        """
+        return f"{scope_text(tuple(self.scopes))}（v{self.version} 已确认）"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1010,6 +1150,10 @@ class AuditRecord(BaseModel):
     action_class: str = Field(
         default="", description="动作类别：recoverable / irreversible；空 = 未涉及")
     authorization: str = Field(default="", description="生效中的授权溯源；空 = 未涉及授权")
+    # 模型建议被风险档压掉时的那句说明（2026-11-22 A 批 A2）。
+    # **必须落审计**：卡片上只看得到"无法判断"，看不到"模型本来想说 allow"——
+    # 而事后复盘时这两者的差别很大（一个是模型含糊，一个是模型说反了）。
+    advice_note: str = Field(default="", description="模型建议与风险档的冲突说明；空 = 无冲突")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1018,6 +1162,10 @@ class AuditRecord(BaseModel):
             "time": _iso(self.ts),
             "request_id": self.request_id,
             "session_id": self.session_id,
+            # tool_summary 里带命令原文，**这里是原文**：审计列表是给用户
+            # 自己对账看的，看不清当时放行了什么就没法对账（与卡片同理）。
+            # 落盘那一份由 ``audit_row_for_disk`` 脱敏——两件事分开做，
+            # 因为"用户要看全文"和"磁盘不许留密钥"是两个方向的要求。
             "tool_summary": self.tool_summary,
             "decision": self.decision,
             "decided_by": self.decided_by,
@@ -1027,21 +1175,51 @@ class AuditRecord(BaseModel):
             "severity": self.severity or "-",
             "action_class": self.action_class or "-",
             "authorization": self.authorization or "-",
+            "advice_note": self.advice_note or "-",
         }
 
     def as_text(self) -> str:
+        note = f" | {self.advice_note}" if self.advice_note else ""
         return (f"{_iso(self.ts)} | {self.kind} | {self.decision or '无决定'} | "
                 f"by={self.decided_by} | rule={self.rule or '-'} | "
                 f"class={self.action_class or '-'} | "
                 f"auth={self.authorization or '-'} | model={self.model or '-'} | "
                 f"req={self.request_id or '-'} | "
-                f"session={self.session_id or '无'} | {self.tool_summary} | {self.reason}")
+                f"session={self.session_id or '无'} | {self.tool_summary}"
+                f" | {self.reason}{note}")
+
+
+def audit_row_for_disk(entry: AuditRecord) -> dict[str, Any]:
+    """审计行的**落盘版**：每个字符串字段都过一遍脱敏。
+
+    A 批 A4 第 4 条。审计是唯一一份"用户没点也会落盘"的记录（到期同样
+    写一行），所以它的泄露面比日志还大——``tool_summary`` 里带着命令
+    原文，命令里就可能带着 ``GITHUB_TOKEN=…``。
+
+    刻意只在这一层脱敏：``as_dict`` / ``as_text`` 保持原文，因为用户
+    在 ``audit_list`` 里要看全文才能对账。把脱敏塞进 ``as_dict`` 会让
+    用户自己的屏幕也变成马赛克，而那是另一种失败。
+    """
+    row = entry.as_dict()
+    for key, value in row.items():
+        if isinstance(value, str):
+            row[key] = redact(value)
+    return row
 
 
 def _iso(epoch: float) -> str:
     from datetime import datetime, timezone
 
     return datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat()
+
+
+# decided_by → stats() 里的计数字段名。**user 有两个字段**（allow / deny），
+# 所以不能只按 decided_by 查表，得连 decision 一起看（见 _count_field）。
+_COUNT_FIELDS = {
+    DECIDED_BY_AI: "stats_ai",
+    DECIDED_BY_EXPIRED: "stats_expired",
+    DECIDED_BY_HOST_TIMEOUT: "stats_host_timeout",
+}
 
 
 class ApprovalGateway:
@@ -1083,6 +1261,9 @@ class ApprovalGateway:
         # 启动行却显示「生效=建议否」。建议层和自动决定层是两件事，
         # 判据必须分开（规格 Q4）。
         self._advice_backend_ready = bool(advice_backend_ready)
+        # 同时挂起的请求数（A 批 A3）。``acquire_slot`` / ``release_slot``
+        # 用它把并发挡住 MAX_INFLIGHT，保护的是线程，不是业务逻辑。
+        self._inflight = 0
         # 判断后端。5a 恒为 None——门控算得出来，但没有模型就不自动决定。
         self._judge = judge
         self._lock = threading.Lock()
@@ -1106,6 +1287,32 @@ class ApprovalGateway:
     @property
     def timeout_seconds(self) -> float:
         return self._timeout_seconds
+
+    # ── 并发额度（A 批 A3） ─────────────────────────────────────────────────
+
+    def acquire_slot(self) -> bool:
+        """占一个挂起额度。满了返回 False，调用方应回 503。
+
+        每个审批请求会占一个 handler 线程并阻塞到用户决定或到期，
+        所以这个计数就是"同时能等多少人"。计数只增不减地涨到上限，
+        之后的请求一个都进不来——那正是要的效果。
+        """
+        with self._lock:
+            if self._inflight >= MAX_INFLIGHT:
+                return False
+            self._inflight += 1
+            return True
+
+    def release_slot(self) -> None:
+        """还回一个额度。**只减不增**：重复释放会把额度越放越多。"""
+        with self._lock:
+            if self._inflight > 0:
+                self._inflight -= 1
+
+    @property
+    def inflight(self) -> int:
+        with self._lock:
+            return self._inflight
 
     def running(self) -> bool:
         return self._server is not None
@@ -1239,12 +1446,15 @@ class ApprovalGateway:
                 # 拦住这次调用的是宿主自己的 onFailure:"block"，不是我们的判断。
                 self._mark_expired_locked(record)
 
-        # 审计行进内存必须**早于**投递：客户端一收到回填就可能来查审计，
+        # 审计行与计数都必须在**投递之前**进内存：客户端一收到回填就可能来查，
         # "先回客户端后记账"会让 audit_rows() 偶发少一行——实测 CI seed 下
-        # 约 1/4 概率红一次。落盘则必须晚于投递：host_timeout 是投递失败才
-        # 知道的，JSONL 是追加写的，只能写最终状态。
+        # 约 1/4 概率红一次。stats() 是同道理的第二次：它晚一步落地的话，
+        # 状态行会短那一刻显示"allow=0"，而审计里明明躺着一条 allow。
+        # 落盘仍必须晚于投递：host_timeout 是投递失败才知道的，
+        # JSONL 是追加写的，只能写最终状态。
         with self._lock:
             entry = self._write_audit_locked(record)
+            self._count_locked(record)
 
         result = self._response_for(record)
         if respond is not None:
@@ -1261,8 +1471,6 @@ class ApprovalGateway:
                 self.note_host_timeout(request.request_id)
 
         with self._lock:
-            # 计数只按**最终**状态记一次：投递失败时这条不算"已允许"。
-            self._count_locked(record)
             self._append_audit_file(entry)
             # **不删记录**：过期条目要留在 _records 里供 pending_list 事后查，
             # 由 _prune_locked 按保留期统一清理。删在这里就等于"过期即消失"，
@@ -1335,6 +1543,8 @@ class ApprovalGateway:
             record.judge_reason = str(verdict.get("reason") or "")
             record.authorization = (authorization.as_audit_text()
                                     if authorization is not None else "")
+            record.authorization_card = (authorization.as_card_text()
+                                         if authorization is not None else "")
             record.auto = True
             # 自动放行不该再弹卡片等人点——但要发一条 blind 通知 + 一条审计。
             # card_id 置成占位空串，timer 就不会为它建卡。
@@ -1382,18 +1592,35 @@ class ApprovalGateway:
 
         集中在一处：早期版本把计数写在各个分支里，结果 stats_ai 永远是 0——
         因为那时 if/elif 已经走完，加在分支里的计数没人执行。
+
+        字段名由 ``_count_field`` 给，所以"往哪一格加"也只有一处知道。
         """
+        field = self._count_field(record)
+        if field is not None:
+            setattr(self, field, getattr(self, field) + 1)
+
+    def _count_field(self, record: PendingApproval) -> str | None:
+        """这条记录该进 stats() 的哪一格。认不出返回 None（不计数）。"""
         if record.decided_by == DECIDED_BY_USER:
-            if record.decision == APPROVE_ALLOW:
-                self.stats_allow += 1
-            else:
-                self.stats_deny += 1
-        elif record.decided_by == DECIDED_BY_AI:
-            self.stats_ai += 1
-        elif record.decided_by == DECIDED_BY_EXPIRED:
-            self.stats_expired += 1
-        elif record.decided_by == DECIDED_BY_HOST_TIMEOUT:
-            self.stats_host_timeout += 1
+            return ("stats_allow" if record.decision == APPROVE_ALLOW
+                    else "stats_deny")
+        return _COUNT_FIELDS.get(record.decided_by)
+
+    def _shift_count_locked(self, previous: str | None,
+                            current: str | None) -> None:
+        """把一笔计数从一格挪到另一格。总数不变，一条请求始终只计一次。
+
+        只有 ``note_host_timeout`` 用它：投递失败时状态从"用户点了允许"
+        变成"没送达"，而计数早就按前一个状态记过了。
+        **只减不增到负数**：重复调用的后果是多减几次，不是计出个负数来。
+        """
+        if previous == current:
+            return
+        for field, delta in ((previous, -1), (current, 1)):
+            if field is None:
+                continue
+            value = getattr(self, field, 0) + delta
+            setattr(self, field, max(0, value))
 
     def _write_audit_locked(self, record: PendingApproval) -> AuditRecord:
         """建一条审计行并放进内存，返回它。调用方必须已持有锁。
@@ -1414,6 +1641,8 @@ class ApprovalGateway:
             action_class=record.action_class,
             authorization=record.authorization,
             reason=self._audit_reason(record),
+            # 模型建议被风险档压掉时要能事后查到（A 批 A2 第 3 条）。
+            advice_note=str(getattr(record, "advice", {}).get("conflict", "") or ""),
         )
         self._audit.append(entry)
         if len(self._audit) > AUDIT_MEMORY_LIMIT:
@@ -1441,13 +1670,18 @@ class ApprovalGateway:
         return "到期无人决定；宿主已自行处理，本插件未做判断"
 
     def _append_audit_file(self, entry: AuditRecord) -> None:
-        """审计落一份 JSONL，插件重启后仍可查。写失败只记日志，不丢内存里的那份。"""
+        """审计落一份 JSONL，插件重启后仍可查。写失败只记日志，不丢内存里的那份。
+
+        写出去的是 ``audit_row_for_disk``——**脱敏版**。内存里那份保持原文，
+        用户查 ``audit_list`` 时要看全文。
+        """
         if self._audit_path is None:
             return
         try:
             self._audit_path.parent.mkdir(parents=True, exist_ok=True)
             with self._audit_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(entry.as_dict(), ensure_ascii=False) + "\n")
+                handle.write(json.dumps(audit_row_for_disk(entry),
+                                        ensure_ascii=False) + "\n")
         except OSError as exc:
             self._logger.warning("审计写入失败（{}）：{}", type(exc).__name__, exc)
 
@@ -1527,12 +1761,17 @@ class ApprovalGateway:
         **同时改已经写进内存的那条审计行**：它比投递更早落（见 submit 里的注释），
         不改的话内存里会留着"by=user"，而落盘的 JSONL 是"by=host_timeout"——
         同一份审计两种说法，比没有审计更糟。
-        计数交给 ``_count_locked``，这里只改状态，避免两处各加一次。
+
+        **计数也跟着搬**：计数现在与审计行同时落（早于投递），所以这里要把
+        已经记下的那一笔从原状态挪到 ``host_timeout``。不搬的话这条请求会被
+        计两次（一次 allow、一次 host_timeout），而"一条请求只计一次、
+        且按最终状态计"是 stats() 的语义。挪而不是重计，所以总数不变。
         """
         with self._lock:
             for record in self._records.values():
                 if record.request.request_id != request_id:
                     continue
+                previous = self._count_field(record)
                 if record.decided_by != DECIDED_BY_HOST_TIMEOUT:
                     record.decided_by = DECIDED_BY_HOST_TIMEOUT
                 entry = record.audit_entry
@@ -1540,6 +1779,7 @@ class ApprovalGateway:
                     entry.decided_by = DECIDED_BY_HOST_TIMEOUT
                     entry.decision = record.decision
                     entry.reason = self._audit_reason(record)
+                self._shift_count_locked(previous, self._count_field(record))
                 return
 
     def _prune_locked(self) -> None:
@@ -1753,14 +1993,37 @@ class _HookHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802  标准库命名
         """探活。中继（hook_relay.py）在转发之前先打这里，1s 超时。
 
-        只回答"活着"，不带任何状态——中继需要知道的就是这一个比特。
+        回答里带**服务标识与 token**：中继要确认对面是自己这一版插件，
+        而不是端口上随便一个 HTTP 服务（见 HEALTH_TOKEN 的说明）。
+        只回答"活着"是不够的——那证明不了一件事：对面不会把命令送给别人。
+
+        这个端点**不占 in-flight 额度**：它必须一直应答，否则插件一忙，
+        中继就会以为插件死了，从此不再转发（那比忙更糟）。
         """
         if self.path.split("?", 1)[0] != HEALTH_PATH:
             self._respond(404, {"ok": False, "reason": "not_found"})
             return
-        self._respond(200, {"ok": True, "service": "agent_deskmate"})
+        self._respond(200, {"ok": True, "service": HEALTH_SERVICE,
+                            "token": HEALTH_TOKEN})
 
     def do_POST(self) -> None:  # noqa: N802  标准库命名
+        if self.path.split("?", 1)[0] != HOOK_PATH:
+            self._respond(404, {"ok": False, "reason": "not_found"})
+            return
+        # 挂起数量有上限（见 MAX_INFLIGHT）。拿不到额度就回 503：
+        # 中继把 503 当"插件没有决定"，于是交还原生权限流程——
+        # 用户照样能批准，只是不走我们的卡片。
+        if not self.gateway.acquire_slot():
+            self._respond(503, {"ok": False, "reason": "busy"})
+            return
+        try:
+            self._handle_post()
+        finally:
+            # 必须在 submit 返回之后放：它要阻塞到用户点按钮或到期，
+            # 提前放就等于没限流。
+            self.gateway.release_slot()
+
+    def _handle_post(self) -> None:
         if self.path.split("?", 1)[0] != HOOK_PATH:
             self._respond(404, {"ok": False, "reason": "not_found"})
             return

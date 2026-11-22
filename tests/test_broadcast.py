@@ -390,9 +390,65 @@ def test_severity_and_attribution_stay_orthogonal() -> None:
     ("export api_key: abc123def456", "abc123def456"),
     ("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9", "eyJhbGciOiJIUzI1NiJ9"),
     ("neko --secret topsecret", "topsecret"),
+    # ── A 批 A4：带下划线前缀的环境变量风格 ──
+    # 第一版的正则用 ``\b`` 开头，而 ``\b`` 在下划线之前**不成立**，
+    # 于是下面三条一个都不匹配——它们恰是真机上最常见的写法。
+    ("export GITHUB_TOKEN=ghp_realtokenvalue123456", "ghp_realtokenvalue123456"),
+    ("OPENAI_API_KEY=sk-abcdef123456 ls", "sk-abcdef123456"),
+    ("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCY"),
+    ("DB_PASSWORD: hunter2", "hunter2"),
+    ("my_credential=x", "x"),
+    # ── 已知令牌形状 ──
+    ("git push https://gho_16C7e42F292c6912E7710c838347Ae178B4a@github.com/x",
+     "gho_16C7e42F292c6912E7710c838347Ae178B4a"),
+    ("git push https://github_pat_11ABCDEFG0abcdefghijklm@github.com/x",
+     "github_pat_11ABCDEFG0abcdefghijklm"),
+    ("aws --key AKIAIOSFODNN7EXAMPLE --region us-east-1", "AKIAIOSFODNN7EXAMPLE"),
+    ("slack notify --token xoxb-1234567890-abcdefghijkl", "xoxb-1234567890-abcdefghijkl"),
 ])
 def test_redact_removes_secret_values(command: str, secret: str) -> None:
     assert secret not in redact(command)
+
+
+def test_redact_masks_a_pem_private_key_block_whole() -> None:
+    """私钥块要**整体**打码，不能逐行各打一遍。
+
+    逐行打会留下 ``***\\n***\\n***`` 这种还能看出"这里有东西"的残骸，
+    而且行与行之间的结构信息（这是 RSA 还是 EC）照样漏出去。
+    """
+    block = ("-----BEGIN RSA PRIVATE KEY-----\n"
+             "MIIEowIBAAKCAQEA\n"
+             "aVerySecretLookingLine\n"
+             "-----END RSA PRIVATE KEY-----")
+    text = redact(f"ssh-add <(cat <<'EOF'\n{block}\nEOF\n)")
+    assert "MIIEowIBAAKCAQEA" not in text
+    assert "aVerySecretLookingLine" not in text
+    assert "PRIVATE KEY-----\nMIIEow" not in text
+
+
+def test_redact_masks_a_long_undelimited_token() -> None:
+    """40 字以上、没有分隔的一整块，按"形状像令牌"打掉。"""
+    token = "a" * 48
+    assert token not in redact(f"curl -H 'X-Api: {token}' https://x")
+
+
+def test_redact_leaves_long_urls_and_paths_alone() -> None:
+    """长 URL / 长路径**不打**——那是日志里最需要的排查信息。
+
+    这条与上一条是同一枚硬币的两面：通用的"长串就打"规则会把它们一起
+    打飞，而一个被打成马赛克的日志等于没有日志（那也是一种静默失败）。
+    所以通用规则刻意不含 ``/``、``\\``、``:``。
+    """
+    url = "https://example.com/api/v1/users/1234567890/profile?expand=all&fields=a,b,c"
+    path = r"D:\workspace\N.E.K.O\neko-src\some\deeply\nested\folder\name\file.txt"
+    assert redact(f"curl {url}") == f"curl {url}"
+    assert redact(f"rm -rf {path}") == f"rm -rf {path}"
+
+
+def test_redact_keeps_the_variable_name() -> None:
+    """打掉值，留下名字——"哪个变量带着密钥"正是排障要用的信息。"""
+    text = redact("GITHUB_TOKEN=ghp_abc123")
+    assert text == "GITHUB_TOKEN=***"
 
 
 def test_redact_keeps_the_rest_readable() -> None:
@@ -418,6 +474,37 @@ def test_for_log_disabled_keeps_only_length_and_head() -> None:
     assert "Secret123" not in text
     assert f"命令 {len(long_command)} 字" in text
     assert "x" * 200 not in text          # 超过 40 字的原文不落盘
+
+
+def test_log_commands_defaults_to_off() -> None:
+    """**默认不记原文**（A 批 A4 第 3 条）。
+
+    原来默认是 true：命令原文是用户这一侧最敏感的东西之一，
+    而"默认就往磁盘写"是一个需要用户主动去改才安全的默认。
+    新装的插件必须一上来就是关的。
+    """
+    assert "命令 13 字" in for_log("rm -rf build/")
+    # 前 40 字照样会露出来（那是设计：要能排查），但**整条不落盘**
+    long_command = "rm -rf " + "x" * 200
+    assert "命令" in for_log(long_command)
+    assert "x" * 200 not in for_log(long_command)
+
+
+def test_broadcaster_defaults_to_not_logging_commands() -> None:
+    """构造 Broadcaster 时不给 log_commands，也必须是关的。
+
+    两处默认值（for_log 与 Broadcaster）说的是同一件事，写歪一个
+    就会出现"以为关了、其实在记"——所以两个都钉住。
+    """
+    logger = FakeLogger()
+    long_command = "rm -rf " + "y" * 200
+    hit = _hit(summary=f"删除文件：{long_command}")
+    Broadcaster(RecordingPush(), logger, source=SOURCE).broadcast(hit)
+    joined = " ".join(message for _, message in logger.lines)
+    # 前 40 字仍可能含一段短命令（那是设计：要能排查），
+    # 但**整条原文不许落盘**——这里用一条 200 字以上的命令来判。
+    assert "y" * 200 not in joined
+    assert "命令 2" in joined
 
 
 def test_for_log_disabled_still_redacts_the_head() -> None:

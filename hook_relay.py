@@ -13,10 +13,16 @@ command hook 的失败语义正好是我们要的：命令退出码 0 且不给 
 
 两种结局，都 exit 0：
 
-* 插件活着（``/health`` 探通，1s 超时）→ 把请求原样转发给 ``/hook/permission``，
-  再把插件的响应体原样打印出来。
-* 插件死了 / 转发失败 / 插件回 503（= 插件没有决定）→ 打印空对象 ``{}``，
-  交还 Claude Code 原生流程。
+* 插件活着（``/health`` 探通**并核对身份**，1s 超时）→ 把请求原样转发给
+  ``/hook/permission``，**校验应答形状**后打出来。
+* 插件死了 / 端口上住的是别的程序 / 转发失败 / 插件回 503 / 应答不合法
+  → 打印空对象 ``{}``，交还 Claude Code 原生流程。
+
+**校验是 2026-11-22 A 批补的第二道门**：第一道门只管"插件在不在"，
+管不了"端口上是不是插件"。插件没启动时若别的进程占了 48921，中继会把
+完整命令发给它，还会把它返回的任意内容转交 Claude Code。所以转发前核对
+``/health`` 的服务标识与 token，转发后用 ``_valid_decision`` 验形状——
+任何一条不过都按"没有决定"处理，**宁可多弹一次原生权限框**。
 
 **上游进程链**（规格 §11）：转发前顺手从本进程的父进程往上爬 2–3 层，
 把 ``[{name, path}]`` 塞进请求体的 ``upstream`` 字段。理由：真实链路常常是
@@ -185,17 +191,29 @@ def _upstream() -> list[dict[str, str]]:
         pid = ppid
     return chain
 
-# 探活路径。必须与 approval.py 里的 HEALTH_PATH 一致——两边各写一份是因为
-# 中继是独立脚本，不能 import 插件包（hook 触发时的 sys.path 里没有它）。
-# 一致性由 test_hooksetup 里的一条测试盯着。
-HEALTH_PATH = "/health"
+# ── 应答校验（A 批 A3） ────────────────────────────────────────────────────
+# 为什么必须校验：**端口上住的不一定是我们的插件**。插件没启动时若别的进程
+# 占了 48921，中继会把完整命令发给它，还会把它返回的任意内容（包括一个
+# 长得像 allow 的对象）原样转交 Claude Code——那是把审批权交给一个来路不明
+# 的对端。所以转发之前先探活核对身份，转发之后先校验应答形状。
+#
+# 校验失败一律按"没有决定"处理：输出空对象，交还原生权限流程。
+# 宁可多弹一次原生权限框，不能把一个非法应答当成批准。
 
-# 探活超时。1s：插件在本机，活的话几十毫秒就应；慢了说明它卡住了，
-# 那时交还原生流程比让用户干等好。
-HEALTH_TIMEOUT = 1.0
-# 转发超时。必须 ≥ 插件的到期时间（默认 570s），否则我们还没到期中继先断。
-# 官方 command hook 默认 timeout 就是 600s，这里对齐。
-FORWARD_TIMEOUT = 600.0
+# 探活应答里的服务标识。必须与 approval.py 的 HEALTH_SERVICE 一致。
+HEALTH_SERVICE = "agent_deskmate"
+# 探活应答里 token 的前缀。**只认前缀**：将来插件升级换了 token 尾巴，
+# 老中继不会因此把插件当敌人（那是另一种静默失败）。
+HEALTH_TOKEN_PREFIX = "deskmate-approval-"
+# 官方 hook 事件名。应答里它必须对得上，否则说明对面不知道自己在回什么。
+HOOK_EVENT_NAME = "PermissionRequest"
+# decision.behavior 只准这两个值。
+DECISION_BEHAVIOURS = ("allow", "deny")
+# 读应答的上限（1 MiB）。一个合法的 decision 只有几百字节；大到这个程度
+# 只能说明对面在塞别的东西，那就别读下去。
+MAX_RESPONSE_BYTES = 1024 * 1024
+# 探活应答的读取上限。它只有一个身份对象，几十字节就够了。
+MAX_HEALTH_BYTES = 64 * 1024
 
 
 def _emit(payload: dict) -> None:
@@ -211,15 +229,79 @@ def _read_stdin() -> bytes:
         return b""
 
 
+def _warn(message: str) -> None:
+    """往 stderr 写一行诊断。**不往 stdout 写**——stdout 是给宿主的应答。"""
+    sys.stderr.write(f"deskmate-relay: {message}\n")
+    sys.stderr.flush()
+
+
 def _alive(port: str) -> bool:
-    """探活。任何异常都算"不在"——不细分，中继不需要知道原因。"""
+    """探活，并核对对面**是不是自己这一版插件**（A 批 A3）。
+
+    三个条件全中才算活：200、服务标识对、token 前缀对。
+    任何异常都算"不在"——不细分，中继不需要知道原因。
+
+    只答 ``{"ok": true}`` 是不够的：那证明不了对面不会把命令送给别人。
+    """
     try:
         with urllib.request.urlopen(
             f"http://127.0.0.1:{port}{HEALTH_PATH}", timeout=HEALTH_TIMEOUT
         ) as response:
-            return response.status == 200
+            if response.status != 200:
+                return False
+            raw = response.read(MAX_HEALTH_BYTES)
+        payload = json.loads(raw.decode("utf-8", "replace"))
     except Exception:  # noqa: BLE001  探活失败的原因不影响下一步：交还原生流程
         return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("service") != HEALTH_SERVICE:
+        _warn(f"端口 {port} 上的服务不是同桌猫（{payload.get('service')!r}），不转发")
+        return False
+    token = payload.get("token")
+    if not (isinstance(token, str) and token.startswith(HEALTH_TOKEN_PREFIX)):
+        _warn(f"端口 {port} 上的服务版本对不上（token={token!r}），不转发")
+        return False
+    return True
+
+
+def _valid_decision(body: bytes) -> dict | None:
+    """校验插件的应答是不是一个合法的 decision。不合法返回 None。
+
+    三条硬条件（A 批 A3）：是 JSON 对象、``hookEventName`` 对得上、
+    ``decision.behavior`` 是 allow / deny 之一。少一条就整个丢掉。
+
+    **不看内容、只看形状**：我们不该因为"这个 allow 长得不像"就二次判断
+    该不该放行——那是替用户做决定。形状不对只说明对面不是能回话的那一方，
+    那时正确的做法是当它没回答。
+    """
+    if len(body) > MAX_RESPONSE_BYTES:
+        _warn(f"应答 {len(body)} 字节超过上限 {MAX_RESPONSE_BYTES}，丢弃")
+        return None
+    try:
+        payload = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        _warn("应答不是合法 JSON，丢弃")
+        return None
+    if not isinstance(payload, dict):
+        _warn("应答不是 JSON 对象，丢弃")
+        return None
+    output = payload.get("hookSpecificOutput")
+    if not isinstance(output, dict):
+        _warn("应答里没有 hookSpecificOutput，丢弃")
+        return None
+    if output.get("hookEventName") != HOOK_EVENT_NAME:
+        _warn(f"应答的 hookEventName 是 {output.get('hookEventName')!r}，丢弃")
+        return None
+    decision = output.get("decision")
+    if not isinstance(decision, dict):
+        _warn("应答里没有 decision，丢弃")
+        return None
+    behavior = decision.get("behavior")
+    if behavior not in DECISION_BEHAVIOURS:
+        _warn(f"应答的 behavior 是 {behavior!r}，丢弃")
+        return None
+    return payload
 
 
 def _with_upstream(body: bytes) -> bytes:
@@ -245,10 +327,11 @@ def _with_upstream(body: bytes) -> bytes:
 
 
 def _forward(port: str, body: bytes) -> None:
-    """转发给插件，并把它的应答原样交给 Claude Code。
+    """转发给插件，并把它的应答交给 Claude Code——**先验形状，再转交**。
 
-    HTTP 200 = 插件给了决定，原样透传（它的 body 就是官方 decision schema）。
-    其它一切（503 = 插件没有决定 / 连接断 / 超时）→ 空对象，交还原生流程。
+    HTTP 200 + 合法 decision → 原样透传。
+    其它一切（503 = 插件没有决定 / 连接断 / 超时 / 应答不合法）→ 空对象，
+    交还原生流程。原样透传的只能是通过 ``_valid_decision`` 的那一份。
     """
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/hook/permission",
@@ -261,14 +344,24 @@ def _forward(port: str, body: bytes) -> None:
             if response.status != 200:
                 _emit({})
                 return
-            sys.stdout.write(response.read().decode("utf-8", "replace"))
-            sys.stdout.flush()
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError:
         # 503 = 到期无人决定。这不是错误，是插件明确的"我没有决定"，
         # 交还原生流程正是规格要的行为。
         _emit({})
-    except Exception:  # noqa: BLE001  转发失败不能把 hook 变成阻断性错误
+        return
+    except Exception as exc:  # noqa: BLE001  转发失败不能把 hook 变成阻断性错误
+        _warn(f"转发失败（{type(exc).__name__}）：{exc}")
         _emit({})
+        return
+
+    decision = _valid_decision(raw)
+    if decision is None:
+        # 已经打过 warning 了。**不把原始应答交出去**——那正是要防的那件事。
+        _emit({})
+        return
+    sys.stdout.write(json.dumps(decision, ensure_ascii=False))
+    sys.stdout.flush()
 
 
 def main(argv: list[str]) -> int:

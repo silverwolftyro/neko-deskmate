@@ -78,16 +78,16 @@
         "log_commands": {
           "type": "boolean",
           "title": "Keep command text in logs",
-          "description": "When off, logs keep only the command length and its first few characters. Either way, secrets are masked before anything is written.",
+          "description": "Off by default: logs keep only the command length and its first few characters. Either way, secrets are masked before anything is written.",
           "x-title-i18n": {
             "en": "Keep command text in logs",
             "zh-CN": "日志里保留命令原文"
           },
           "x-description-i18n": {
-            "en": "When off, logs keep only the command length and its first few characters. Either way, secrets are masked before anything is written.",
-            "zh-CN": "关闭后日志只记命令长度和前几十个字；两种情况都会先给敏感信息打码。"
+            "en": "Off by default: logs keep only the command length and its first few characters. Either way, secrets are masked before anything is written.",
+            "zh-CN": "默认关闭：日志只记命令长度和前几十个字；两种情况都会先给敏感信息打码。"
           },
-          "default": true
+          "default": false
         },
         "stall_minutes": {
           "type": "integer",

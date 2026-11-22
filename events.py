@@ -34,8 +34,14 @@ EVENT_TURN_END = "turn_end"
 EVENT_ERROR = "error"
 EVENT_TYPES = (EVENT_TOOL_USE, EVENT_TURN_END, EVENT_ERROR)
 
-# summary 里工具输入摘要的最大长度。命令可能含敏感信息，一律截断，
-# 且插件日志不得记录 summary（见 AGENTS.md「不得记录会话文本/密钥」）。
+# summary 里工具输入摘要的最大长度。命令可能含敏感信息，一律截断。
+#
+# **关于"日志记不记命令原文"的统一口径**（2026-11-22 订正）：
+# 这里原来写"插件日志不得记录 summary"，而 broadcast.py 那边说
+# "脱敏后可以记"——两句话互相矛盾，而矛盾的说法等于没有说法。
+# 现在两边都按同一条：日志**默认不记**命令原文（``log_commands=false``），
+# 只记「长度 + 前 40 字」；打开之后也**必须先脱敏**再写。
+# 权威实现在 ``broadcast.for_log``，本模块不重复第二套。
 SUMMARY_INPUT_MAX = 80
 
 AGENT_CLAUDE_CODE = "claude-code"
@@ -198,7 +204,8 @@ class UnifiedEvent(AttributionFields):
     # source_type —— 出问题时能回溯到是哪种记录产生的，否则只能瞎猜
     source_type: str = Field(default="", description="产生该事件的源记录 type")
     # command —— summary 被截到 80 字，删除类规则需要完整命令才不漏判；
-    #            只对 Bash 的 tool_use 填充，且不进出日志（红线：不记录会话文本）
+    #            只对 Bash 的 tool_use 填充。它**只在内存里流转**，
+    #            任何出口（日志/审计）都要先过 broadcast.for_log 脱敏。
     command: str | None = Field(default=None, description="Bash 工具调用的完整命令，仅 tool_use 有")
     # status_code —— 失败类规则要按状态码定严重度，不能从 summary 文本反解析
     status_code: int | None = Field(default=None, description="网关请求的 HTTP 状态码")

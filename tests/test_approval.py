@@ -70,6 +70,7 @@ from plugin.plugins.agent_deskmate.approval import (
     hook_response,
     load_authorization,
     no_decision_response,
+    safe_conclusion,
 )
 from plugin.plugins.agent_deskmate.commands import (
     BANNED_INTERNAL,
@@ -618,6 +619,99 @@ def test_expiry_audit_never_says_deny(port: int, tmp_path: Path) -> None:
         assert "拒绝" not in written
     finally:
         gateway.stop()
+
+
+def test_audit_rows_keep_the_command_for_the_human_reader(port: int) -> None:
+    """内存里的审计行**不打码**：那是给用户自己对账看的。
+
+    打码只针对落盘那一份。卡片、审计列表给用户看的都该是原文——
+    看不清当时放行了什么就没法对账。
+    """
+    gateway = _gateway(port, timeout=0.3, audit_path=None)
+    try:
+        _post_status(port, PAYLOAD)
+        row = gateway.audit_rows()[0]
+        assert "rm -rf build/" in row["tool_summary"]
+    finally:
+        gateway.stop()
+
+
+def test_the_disk_copy_is_redacted_even_though_the_memory_copy_is_not(
+        port: int, tmp_path: Path) -> None:
+    """同一行审计，两个版本：内存给用户看全文，磁盘脱敏（A 批 A4 第 4 条）。
+
+    这两件事必须分开做。只在内存版脱敏 → 用户自己的屏幕变马赛克，
+    对不了账；只在磁盘版脱敏（也就是不脱敏）→ 密钥留在 JSONL 里。
+    所以这里两个方向都断言。
+    """
+    from plugin.plugins.agent_deskmate.approval import AuditRecord, audit_row_for_disk
+
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    command = f"git push https://{secret}@github.com/x"
+    entry = AuditRecord(tool_summary=f"Bash: {command}", decided_by="expired",
+                        request_id="r1", ts=1.0)
+
+    # 内存版（用户看的）：原文
+    assert secret in entry.as_dict()["tool_summary"]
+    assert secret in entry.as_text()
+    # 落盘版：打码，而且非字符串字段不被碰
+    row = audit_row_for_disk(entry)
+    assert secret not in row["tool_summary"]
+    assert row["ts"] == 1.0
+    assert row["decision"] is None
+    assert row["reason"] == ""
+
+    # 端到端：真的写进文件的那一份也必须是打码的
+    audit = tmp_path / "audit.jsonl"
+    gateway = _gateway(port, timeout=0.3, audit_path=audit)
+    try:
+        payload = dict(PAYLOAD)
+        payload["tool_input"] = {"command": command}
+        _post_status(port, payload)
+        written = _wait_for_audit_file(audit, 1)
+        assert secret not in written, "密钥进了审计文件"
+        assert "***" in written
+        # 而内存里那条仍是原文
+        assert secret in gateway.audit_rows()[0]["tool_summary"]
+    finally:
+        gateway.stop()
+
+
+# ── A 批 A2：高风险不显示「建议允许」 ──────────────────────────────────────
+
+@pytest.mark.parametrize("risk,action_class,expected", [
+    # critical / 不可恢复：模型硬说 allow 也压成"无法判断"
+    ("critical", "irreversible", CONCLUSION_UNSURE),
+    ("critical", "recoverable", CONCLUSION_UNSURE),
+    ("notice", "irreversible", CONCLUSION_UNSURE),
+    # 其余照原样翻译
+    ("notice", "recoverable", CONCLUSION_ALLOW),
+    ("warn", "recoverable", CONCLUSION_ALLOW),
+    # deny / unsure 不受影响——阀门是单向的
+    ("critical", "irreversible", CONCLUSION_DENY),
+])
+def test_safe_conclusion_only_caps_allow(risk: str, action_class: str,
+                                         expected: str) -> None:
+    """``safe_conclusion`` 是单向阀门：**只压 allow**。
+
+    压全部的话，模型说"建议拒绝"也会消失，而那也是用户该看到的信息。
+    """
+    suggestion = {CONCLUSION_ALLOW: "allow", CONCLUSION_DENY: "deny",
+                  CONCLUSION_UNSURE: "unsure"}[expected]
+    conclusion, conflict = safe_conclusion(suggestion, risk=risk,
+                                           action_class=action_class)
+    assert conclusion == expected
+    if expected == CONCLUSION_UNSURE and suggestion == "allow":
+        assert conflict, "压掉了一次 allow，却没说为什么"
+    else:
+        assert conflict == ""
+
+
+def test_safe_conclusion_never_invents_a_value() -> None:
+    """认不出的模型取值 → 最保守的第三态，绝不外溢原始 token。"""
+    conclusion, _ = safe_conclusion("banana", risk="notice",
+                                    action_class="recoverable")
+    assert conclusion == CONCLUSION_UNSURE
 
 
 def test_expired_entry_is_kept_not_deleted(port: int) -> None:
@@ -1241,6 +1335,47 @@ def test_card_has_no_banned_words() -> None:
         assert phrase not in _visible(_card()), f"卡片出现了禁用词 {phrase!r}"
 
 
+def test_every_card_the_user_can_see_has_no_internal_words() -> None:
+    """**每一张**给用户看的卡都不许泄内部词。
+
+    原来只查审批卡，于是授权卡上留着「命中的 L0 规则」、
+    「本次确认范围：ai_judgement、auto_decide」，结果卡上留着
+    「已由 L2 自动放行」——用户在签字那一刻和看到结果的那一刻，
+    都不该去猜那些词是什么（C5 同类缺陷）。
+
+    ``BANNED_PHRASES`` 里的"放行"**不在授权卡这一列**：它是主卡的
+    禁用词（防"倾向别放行"被扫读成"放行"），而授权卡是签字前逐句
+    读的同意书，"低风险时自动放行"正是要写明白的那件事。
+    """
+    from plugin.plugins.agent_deskmate.approval import (
+        AUTHORIZATION_TEXT,
+        build_authorize_html,
+        build_result_html,
+        scope_text,
+    )
+
+    # 授权卡（签字前必须看懂的文案）
+    for phrase in BANNED_INTERNAL:
+        assert phrase not in _visible(build_authorize_html(scopes=AUTH_SCOPES)), (
+            f"授权卡出现了内部词 {phrase!r}")
+        assert phrase not in AUTHORIZATION_TEXT, (
+            f"授权正文里出现了内部词 {phrase!r}")
+    assert scope_text(AUTH_SCOPES) == "模型建议、低风险时自动放行"
+    # 结果卡（三种结局都要查）。第四条用人话版的授权溯源——
+    # 它正是 _settle_approval_card 现在传进去的那一种。
+    for note in ("已允许，Claude Code 继续执行。",
+                 "已拒绝，这次调用被中止。",
+                 "已过期：宿主已自行处理，本插件未做判断。",
+                 "已凭你的授权自动放行（模型建议、低风险时自动放行（v1 已确认），"
+                 "模型 m，理由 低风险）"):
+        for phrase in BANNED_INTERNAL:
+            assert phrase not in _visible(build_result_html(note)), (
+                f"结果卡出现了内部词 {phrase!r}")
+    # 签字前必须看到的那两句仍在（在标题行里，测试原本就逐句盯着）
+    assert "模型判断可能出错" in AUTHORIZATION_HEADLINE
+    assert "决定由你授权并承担后果" in AUTHORIZATION_HEADLINE
+
+
 def test_card_has_no_english_command_tokens() -> None:
     """规格 P3：除路径外不许出现英文命令 token。"""
     text = _visible(_card(command="rm -rf D:/other/dir"))
@@ -1499,11 +1634,18 @@ def test_grant_rejects_an_empty_scope_list() -> None:
 
 
 def test_authorize_card_carries_the_consent_text() -> None:
-    """授权卡片的文案是验收项：必须含"可能出错"与"用户担责"。"""
+    """授权卡片的文案是验收项：必须含"可能出错"与"用户担责"。
+
+    范围那一行原来直接印配置键名（``ai_judgement、auto_decide``），
+    用户在签字这一刻不该去猜它们是什么。现在必须是人话，
+    而且**两种 scope 都要点到自己**（不然就是含糊其辞的同意书）。
+    """
     html = build_authorize_html(scopes=AUTH_SCOPES)
     assert AUTHORIZATION_HEADLINE in html
     assert "决定由你授权并承担后果" in html
-    assert "ai_judgement" in html and "auto_decide" in html
+    assert "模型建议" in html and "自动放行" in html
+    assert "ai_judgement" not in html
+    assert "auto_decide" not in html
     assert f'data-neko-action="{ACTION_AUTH_CONFIRM}"' in html
     assert f'data-neko-action="{ACTION_AUTH_CANCEL}"' in html
     # 两个按钮都指向授权入口，用 args 区分签不签字
@@ -1512,6 +1654,21 @@ def test_authorize_card_carries_the_consent_text() -> None:
     assert actions[ACTION_AUTH_CONFIRM]["entry"] == ENTRY_AUTHORIZE
     assert actions[ACTION_AUTH_CONFIRM]["args"]["confirm"] is True
     assert actions[ACTION_AUTH_CANCEL]["args"]["confirm"] is False
+
+
+def test_audit_and_card_use_different_wordings_for_the_same_authorization() -> None:
+    """同一份授权，两种写法：审计要精确，卡片要能读。
+
+    合并成一种的两种死法都见过：全用审计版 → 用户屏幕上出现配置键名；
+    全用卡片版 → 事后对账说不清当时授的到底是哪个范围。
+    """
+    record = AuthorizationRecord(scopes=AUTH_SCOPES, confirmed_by="user")
+    assert "ai_judgement" in record.as_audit_text()
+    assert "ai_judgement" not in record.as_card_text()
+    assert "模型建议" in record.as_card_text()
+    # 版本号两处都要有——它是授权记录的代次，缺了就没法对账
+    assert f"v{record.version}" in record.as_audit_text()
+    assert f"v{record.version}" in record.as_card_text()
 
 
 # ── 纪律：没有显式授权就不动作（规格 §2 硬规则 2） ─────────────────────────
