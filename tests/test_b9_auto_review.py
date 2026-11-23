@@ -24,6 +24,7 @@ import pytest
 
 from plugin.plugins.agent_deskmate.approval import (
     AUTH_SCOPE_REVIEW,
+    AUTO_LOW_RISK_ONLY,
     RULE_DISCARD,
     ApprovalGateway,
     ApprovalRequest,
@@ -728,3 +729,91 @@ def test_the_review_scope_is_separate_from_the_other_two() -> None:
     assert AUTH_SCOPE_REVIEW in AUTH_SCOPES
     assert AUTH_SCOPE_REVIEW not in (AUTH_SCOPE_ADVICE, AUTH_SCOPE_AUTO)
     assert len(AUTH_SCOPES) == 3
+
+
+# ── 7. 命题 3：只读白名单内的命令必须够得到 B9 ───────────────────────────
+#
+# 2026-11-23 修。原来的控制流是 `if eligible: return self._l2_decide(...)`，
+# 而 `_judge` 在这个 build 里**恒为 None**（`__init__.py` 构造 ApprovalGateway
+# 时从不传 judge，源码注释里也写着"judge 恒为 None"），`_l2_decide` 一进去就
+# return False。后果是方向反的：
+#
+#   `cat x` / `git status` 全在只读白名单里 → 永远到不了 B9 → **一定弹卡**
+#   `rm -rf build/` 不在白名单          → 落到 B9   → **可能被自动放行**
+#
+# 最安全的命令最打扰人。修法：门控过了但后端没接，就不在那里拦，
+# 落到下面让 B9 用同一道门再判。
+
+
+def _l2_ready_gateway(reviewer, tmp_path: Path, *, judge=None) -> ApprovalGateway:
+    """L2 门控六条全中的配置——正是命题 3 那个 bug 出现的场景。"""
+    from plugin.plugins.agent_deskmate.approval import (
+        AUTH_SCOPE_ADVICE,
+        AUTH_SCOPE_AUTO,
+    )
+
+    gateway = ApprovalGateway(
+        ListLogger(), port=_free_port(),
+        authorization_path=tmp_path / "authorization.json",
+        ai_judgement=True,
+        auto_decide=AUTO_LOW_RISK_ONLY,
+        has_api_key=True,
+        judge=judge,
+        reviewer=reviewer,
+    )
+    gateway.grant_authorization(
+        (AUTH_SCOPE_ADVICE, AUTH_SCOPE_AUTO, AUTH_SCOPE_REVIEW))
+    return gateway
+
+
+def test_a_readonly_command_reaches_the_reviewer(tmp_path: Path) -> None:
+    """`git status` 过得了 L2 门控，就必须也够得到 B9，不能被"后端未接入"吞掉。"""
+    from plugin.plugins.agent_deskmate.auto_review import Review
+
+    reviewer = _FakeReviewer(Review(OUTCOME_AUTO_ALLOW, risk=RISK_LOW,
+                                    decision=DECISION_ALLOW,
+                                    reason="只读命令", model="m1"))
+    gateway = _l2_ready_gateway(reviewer, tmp_path)
+    try:
+        pending = _record("git status", severity="notice")
+        assert gateway._maybe_auto_allow(pending) is True  # noqa: SLF001
+        assert len(reviewer.calls) == 1        # 真问到了 B9，没有打两次
+        assert pending.review_risk == RISK_LOW
+    finally:
+        gateway.stop()
+
+
+def test_a_readonly_command_without_a_reviewer_still_presents(
+        tmp_path: Path) -> None:
+    """不配 B9（默认）时行为和修复前完全一样：照样弹卡，不自动决定。
+
+    这条是安全边界——修复**没有**把只读命令变成无条件放行，只是让它走同一道门。
+    没签字开审查档的人看到的东西一点没变。
+    """
+    gateway = _l2_ready_gateway(None, tmp_path)
+    try:
+        pending = _record("git status", severity="notice")
+        assert gateway._maybe_auto_allow(pending) is False
+        assert pending.decided_by is None     # 没有任何东西决定它
+        assert not pending.auto               # 也没被标成"自动放行"
+    finally:
+        gateway.stop()
+
+
+def test_a_wired_judge_still_short_circuits_before_the_reviewer(
+        tmp_path: Path) -> None:
+    """judge 真接上时旧不变式仍成立：L2 判过就不再问 B9（不打两次模型）。"""
+    from plugin.plugins.agent_deskmate.approval import APPROVE_ALLOW
+
+    def judge(_: PendingApproval) -> dict:
+        return {"decision": APPROVE_ALLOW, "model": "m2", "reason": "本地判断"}
+
+    reviewer = _FakeReviewer(None)
+    gateway = _l2_ready_gateway(reviewer, tmp_path, judge=judge)
+    try:
+        pending = _record("git status", severity="notice")
+        assert gateway._maybe_auto_allow(pending) is True  # noqa: SLF001
+        assert reviewer.calls == []             # 没有打第二次模型
+        assert pending.judge_model == "m2"
+    finally:
+        gateway.stop()

@@ -1895,14 +1895,26 @@ class ApprovalGateway:
             # 只读白名单（B2）在 rules 里算，这里只消费结论。
             readonly=l2_readonly_allowed(_command_of_record(record)),
         )
-        if eligible:
-            # 本地事实自己就够（只读白名单）→ 走原来的 L2 路径。
-            # 这条路的结果**由它自己负责**：过了就不再去问 B9，
-            # 否则同一条请求会打两次模型。
+        # 本地门控过了**且**判断后端接着，才走 L2 这条路；它的结果由它自己负责——
+        # 过了就不再去问 B9，否则同一条请求会打两次模型。
+        #
+        # 2026-11-23 修（待处理命题 3）：原来是 `if eligible: return self._l2_decide(...)`，
+        # 而 `_judge` 在这个 build 里**恒为 None**（`__init__.py` 构造 ApprovalGateway
+        # 时从不传 judge，代码注释里也写着"judge 恒为 None"），`_l2_decide` 一进去就
+        # return False。于是**最安全的命令反而一定弹卡**——`cat x` / `git status` 全在
+        # 只读白名单里，永远到不了下面；`rm -rf build/` 这类不在白名单的倒能落到 B9
+        # 被自动放行。方向是反的，且正是用户觉得最吵的那一档。
+        #
+        # 现在：门控过了但后端没接，就**不在这里拦**，落到下面让 B9 用同一道门再判。
+        # 不会打两次模型——`_l2_decide` 在 `_judge is None` 时一次都没调就返回了，
+        # 所以"judge 判过就不再问 B9"这条不变式仍然成立（judge 真接上时也成立）。
+        if eligible and self._judge is not None:
             return self._l2_decide(record, why, authorization, scopes)
 
-        # 本地门控没过。**B9 的机会在这里**——它补的正是"本地说不准、
-        # 又不想每次都问"的那一段，放行范围比只读白名单宽，但要模型点头。
+        # 本地门控没过，**或者**本地门控过了但 L2 判断后端没接（当前 build 属于后者）。
+        # **B9 的机会在这里**——它补的正是"本地说不准、又不想每次都问"的那一段，
+        # 放行范围比只读白名单宽，但要模型点头。
+        # B9 默认全关且要用户单独签字，所以**不配置的用户看到的行为和修复前完全一样**。
         if self._reviewer is not None:
             allowed, review_why = auto_review_gate(
                 severity=record.severity, rule=record.rule,

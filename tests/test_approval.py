@@ -828,6 +828,13 @@ def test_l2_gate_open_without_backend_still_refuses(port: int) -> None:
     """门控算得过但没接判断后端（5a）→ 不自动决定，转交用户。
 
     这正是"插件不许因为门控通过就替用户判断"的机械保证。
+
+    2026-11-23 更新（待处理命题 3）：这里原来还断言一条「不自动决定」的日志。
+    旧控制流是 `if eligible: return self._l2_decide(...)`，`_judge is None` 时
+    那个分支会打这句；修复后这类请求改成**落到 B9**（见 test_b9_auto_review 第 7 节），
+    没有 reviewer 时那个分支不打日志，日志断言因此失效。
+    **行为保证一条没少，反而更强**：到期仍是"没决定"而不是"自动拒绝"，
+    且插件自己没拍任何板——要放行得 B9 的模型点头，而 B9 要用户单独签过字。
     """
     gateway = _l2_gateway(port, None)
     try:
@@ -838,7 +845,9 @@ def test_l2_gate_open_without_backend_still_refuses(port: int) -> None:
         rows = gateway.audit_rows()
         assert rows[0]["decided_by"] == DECIDED_BY_EXPIRED
         assert rows[0]["decision"] is None
-        assert any("不自动决定" in message for _, message in gateway._logger.lines)
+        # 反向保证：全程没有任何东西被自动放行（L2 和 B9 两条路都没放）。
+        assert not any("自动放行" in message
+                       for _, message in gateway._logger.lines)
     finally:
         gateway.stop()
 
