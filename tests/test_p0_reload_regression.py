@@ -121,7 +121,9 @@ def test_every_watch_field_is_created_by_the_reset() -> None:
     """
     plugin = _plugin()
     expected = {"_watch_paths", "_transcript_adapter", "_gateway_adapter",
-                "_broadcaster", "_source_error_at", "_source_state"}
+                "_broadcaster", "_source_error_at", "_source_state",
+                # C 批 §三：进度状态机 + 它的阈值缓存 + 积压推送队列
+                "_tracker", "_tracker_cfg", "_pending_pushes"}
     assert expected <= set(vars(plugin))
     # 两个 dict 必须是**空 dict**，不是 None：调用方直接往里写
     assert plugin._source_error_at == {}         # noqa: SLF001

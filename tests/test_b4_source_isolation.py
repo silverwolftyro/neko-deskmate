@@ -35,6 +35,7 @@ from plugin.plugins.agent_deskmate.adapters.gateway import (
     current_watermark,
     read_new_gateway_events,
 )
+from plugin.plugins.agent_deskmate.tracker import ProgressTracker
 
 GATEWAY_SCHEMA = """
 CREATE TABLE proxy_request_logs (
@@ -93,6 +94,8 @@ class WatcherHost:
     _ensure_watchers = AgentDeskmatePlugin._ensure_watchers
     _poll_source = AgentDeskmatePlugin._poll_source
     _poll_once = AgentDeskmatePlugin._poll_once
+    _sync_tracker_config = AgentDeskmatePlugin._sync_tracker_config
+    _feed_tracker = AgentDeskmatePlugin._feed_tracker
     _adapter_status = AgentDeskmatePlugin._adapter_status
     _ADAPTER_SOURCES = AgentDeskmatePlugin._ADAPTER_SOURCES
 
@@ -102,6 +105,11 @@ class WatcherHost:
         self._gateway_adapter = None
         self._source_error_at: dict[str, float] = {}
         self._source_state: dict[str, str] = {}
+        # C 批 §三：真插件这两个字段由 _reset_watch_state 建，这里手搭一份，
+        # 否则 _poll_once 第一轮就 AttributeError。
+        self._tracker = ProgressTracker()
+        self._tracker_cfg = None
+        self._pending_pushes: list = []
         self.logger = ListLogger()
         self.push_message = RecordingPush()
 

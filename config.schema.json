@@ -164,6 +164,101 @@
             }
           }
         },
+        "progress": {
+          "type": "object",
+          "title": "Progress and failure alerts",
+          "description": "How long counts as \"something is wrong\" when the agent goes quiet, loops, or fails. These only change when and how often you are told; they never affect approvals or any safety decision.",
+          "x-title-i18n": {
+            "en": "Progress and failure alerts",
+            "zh-CN": "进度与出错提醒"
+          },
+          "x-description-i18n": {
+            "en": "How long counts as \"something is wrong\" when the agent goes quiet, loops, or fails. These only change when and how often you are told; they never affect approvals or any safety decision.",
+            "zh-CN": "它安静了、兜圈子了、失败了，多久算「不对劲」。这些值只改变你什么时候被告知、多常被告知，不影响审批，也不影响任何安全判断。"
+          },
+          "properties": {
+            "wait_escalate_seconds": {
+              "type": "integer",
+              "title": "Ask again after (seconds)",
+              "description": "When the agent stops and waits for you, the first reminder is immediate; this sets how long until it asks a second time.",
+              "x-title-i18n": {
+                "en": "Ask again after (seconds)",
+                "zh-CN": "再次提醒等待（秒）"
+              },
+              "x-description-i18n": {
+                "en": "When the agent stops and waits for you, the first reminder is immediate; this sets how long until it asks a second time.",
+                "zh-CN": "它停下来等你的时候，第一次会马上说；这里设定再过多久提醒第二次。"
+              },
+              "default": 180,
+              "minimum": 10,
+              "maximum": 3600
+            },
+            "unclosed_action_seconds": {
+              "type": "integer",
+              "title": "No reply for (seconds)",
+              "description": "An action that has not come back within this long counts as stuck, and is announced.",
+              "x-title-i18n": {
+                "en": "No reply for (seconds)",
+                "zh-CN": "多久没回包算卡住（秒）"
+              },
+              "x-description-i18n": {
+                "en": "An action that has not come back within this long counts as stuck, and is announced.",
+                "zh-CN": "一个动作发出去这么久还没结果，就算它卡住了，会播报。"
+              },
+              "default": 300,
+              "minimum": 30,
+              "maximum": 7200
+            },
+            "boundary_round_seconds": {
+              "type": "integer",
+              "title": "Quiet gap that ends a round (seconds)",
+              "description": "When two rounds are this far apart, the earlier round is considered finished, and actions still waiting there stop counting as stuck.",
+              "x-title-i18n": {
+                "en": "Quiet gap that ends a round (seconds)",
+                "zh-CN": "多长的安静算一轮结束（秒）"
+              },
+              "x-description-i18n": {
+                "en": "When two rounds are this far apart, the earlier round is considered finished, and actions still waiting there stop counting as stuck.",
+                "zh-CN": "两轮之间安静这么久就算上一轮结束了；那一轮里还没回包的动作不再算卡住。"
+              },
+              "default": 600,
+              "minimum": 60,
+              "maximum": 86400
+            },
+            "fail_coalesce_seconds": {
+              "type": "integer",
+              "title": "Same failure not repeated within (seconds)",
+              "description": "The same failure is not announced again inside this window.",
+              "x-title-i18n": {
+                "en": "Same failure not repeated within (seconds)",
+                "zh-CN": "同一个失败多久内不重复说（秒）"
+              },
+              "x-description-i18n": {
+                "en": "The same failure is not announced again inside this window.",
+                "zh-CN": "同一个失败在这个时间内不重复播报。"
+              },
+              "default": 120,
+              "minimum": 1,
+              "maximum": 3600
+            },
+            "failure_confirm_seconds": {
+              "type": "integer",
+              "title": "Wait before reporting a failure (seconds)",
+              "description": "After a failure, wait this long for it to recover on its own before saying anything. Measured: most failures recover within a quarter of a minute, so waiting here removes most false alarms. Set 0 to be told immediately.",
+              "x-title-i18n": {
+                "en": "Wait before reporting a failure (seconds)",
+                "zh-CN": "失败后等多久才说（秒）"
+              },
+              "x-description-i18n": {
+                "en": "After a failure, wait this long for it to recover on its own before saying anything. Measured: most failures recover within a quarter of a minute, so waiting here removes most false alarms. Set 0 to be told immediately.",
+                "zh-CN": "失败之后等这么久，它要是自己好了就不打扰你。实测九成以上的失败在一分钟内自己恢复，所以等这一下能挡掉绝大多数假警报。设 0 表示立刻说。"
+              },
+              "default": 120,
+              "minimum": 0,
+              "maximum": 3600
+            }
+          }
+        },
         "approval": {
           "type": "object",
           "title": "Approvals",

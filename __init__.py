@@ -27,8 +27,9 @@ import os
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
@@ -85,7 +86,7 @@ from .approval import (
     warning_mode_for_tier,
 )
 from .auto_review import AutoReviewer
-from .broadcast import Broadcaster, describe_actor, render_text
+from .broadcast import Broadcaster, broadcast_notice, describe_actor, render_text
 from .commands import (
     COMMAND_DISPLAY_MAX,
     CONCLUSION_UNSURE,
@@ -113,6 +114,7 @@ from .model_advice import (
     STATE_UNAUTHORIZED,
     ModelAdvisor,
 )
+from .progress import signal_from_event
 from .rules import (
     Coalescer,
     RuleHit,
@@ -121,6 +123,7 @@ from .rules import (
     evaluate_failure,
     evaluate_transcript_error,
 )
+from .tracker import DEFAULT_CONFIG, Notice, ProgressTracker, TrackerConfig
 from .warncount import COUNTS_FILENAME
 
 # 聊天里显示的来源标签。红线 1：source 必须显式传，不能用默认空串。
@@ -136,7 +139,13 @@ STAGE = "M0-lite-6"
 TRANSCRIPT_TAIL_BYTES = 65536
 
 # 单轮最多播几条，防止适配器积压后一次刷屏。
+# 超出的部分进 ``_pending_pushes`` 队列，**下一轮接着发，不是丢掉**。
 MAX_BROADCAST_PER_TICK = 5
+
+# 积压队列的硬顶。第一道防线是 Coalescer（把 100 条相似删除合成一两条），
+# 这个队列只是兜持续洪水的。超顶时丢**最旧**的——正在发生的动作比
+# 30 秒前发生过的更值得被看见，而两边都还在审计里可查。
+MAX_PENDING_PUSHES = 50
 
 # 单个观测源连续失败时，日志最短间隔多少秒（B4）。
 # 网关库锁是**持续状态**：不限制的话每 3 秒一条 warning，
@@ -317,6 +326,43 @@ def _model_section(config: dict[str, Any]) -> dict[str, Any]:
     """
     section = config.get("model")
     return section if isinstance(section, dict) else {}
+
+
+def _tracker_section(config: dict[str, Any]) -> dict[str, Any]:
+    """从 ``[agent_deskmate]`` 整节里取 ``progress`` 子表（C 批 §三）。
+
+    键名叫 ``progress`` 而不叫 ``tracker``：对用户说的是"进度播报"，
+    ``tracker`` 是实现里的类名。配置键不该泄露实现细节——今天叫 tracker，
+    明天换掉实现，用户的配置文件不该跟着一起失效。
+    """
+    section = config.get("progress")
+    return section if isinstance(section, dict) else {}
+
+
+def _tracker_config(section: dict[str, Any]) -> TrackerConfig:
+    """配置子表 → TrackerConfig。缺键取默认，坏值退回默认（不让观测循环崩）。
+
+    刻意**不做 clamp**：这些阈值是"多久没动静算异常"，用户填 0 或填 10^9
+    只影响他自己看到的播报密度，没有安全后果。真正决定"会不会误报"的是
+    真机 dry run 的实测（136 → 21 条），不是配置校验。
+
+    ``retry_escalate_at`` 是元组、**刻意不进配置**：它是"连续失败几次算兜圈子"
+    的阶梯，要从 TOML 数组来就得写数组解析 + 去重 + 排序 + 防空，
+    而这些校验做一半比不做更危险（写 ``[5, 3]`` 到底算几次？）。
+    真机数据（93 次响亮失败里绝大多数一次就过）不支持用户去调它。
+    """
+    return TrackerConfig(
+        wait_escalate_seconds=_to_number(
+            section.get("wait_escalate_seconds"), DEFAULT_CONFIG.wait_escalate_seconds),
+        unclosed_action_seconds=_to_number(
+            section.get("unclosed_action_seconds"), DEFAULT_CONFIG.unclosed_action_seconds),
+        boundary_round_seconds=_to_number(
+            section.get("boundary_round_seconds"), DEFAULT_CONFIG.boundary_round_seconds),
+        fail_coalesce_seconds=_to_number(
+            section.get("fail_coalesce_seconds"), DEFAULT_CONFIG.fail_coalesce_seconds),
+        failure_confirm_seconds=_to_number(
+            section.get("failure_confirm_seconds"), DEFAULT_CONFIG.failure_confirm_seconds),
+    )
 
 
 # 「调用结果码 → 卡片展示状态」的显式映射。
@@ -624,6 +670,16 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._source_error_at: dict[str, float] = {}
         # B6：各观测源的真实就绪状态（见 ``_adapter_status``）。
         self._source_state: dict[str, str] = {}
+        # C 批 §三：进度/出错状态机。**建在这里而不是 _ensure_watchers**：
+        # 后者开头有 `if self._broadcaster is not None: return` 的缓存早退，
+        # 塞在它后半段的初始化会被缓存路径整条绕过，第一次 poll 就 AttributeError。
+        self._tracker = ProgressTracker()
+        self._tracker_cfg: TrackerConfig | None = None
+        # 本轮没发完的推送。**这个字段修的是一个已发布 bug**：0.3.2 在
+        # 条数上限处直接 `return`，而适配器的 offset 在那之前已经推进过了，
+        # 于是日志写"余下留待下一轮"、实际那条通知永久消失。
+        # 规则层丢的就是一条删除播报——不可接受。
+        self._pending_pushes: list[Callable[[], str]] = []
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     # startup 用 async def、shutdown 用 def，刻意对齐官方 memo_reminder 的写法：
@@ -983,8 +1039,40 @@ class AgentDeskmatePlugin(NekoPluginBase):
                                     name, type(exc).__name__, exc)
             return []
 
+    def _sync_tracker_config(self, config: dict[str, Any]) -> None:
+        """配置变了就换一个新 tracker。
+
+        **换而不是改**：ProgressTracker 是纯函数层，没有 setter，也不该有——
+        阈值属于 TrackerConfig 这个冻结值。换实例会丢掉在途状态
+        （未回包、待确认失败），那是故意的：用户刚改的阈值不该被
+        上一轮的旧计时继续支配。
+        """
+        cfg = _tracker_config(_tracker_section(config))
+        if cfg == self._tracker_cfg:
+            return
+        self._tracker_cfg = cfg
+        self._tracker = ProgressTracker(cfg)
+        self.logger.info(
+            "进度状态机阈值就绪 等待升级={:g}s 未回包={:g}s 回合静默={:g}s "
+            "合并={:g}s 失败确认={:g}s",
+            cfg.wait_escalate_seconds, cfg.unclosed_action_seconds,
+            cfg.boundary_round_seconds, cfg.fail_coalesce_seconds,
+            cfg.failure_confirm_seconds)
+
+    def _feed_tracker(self, event: UnifiedEvent) -> list[Notice]:
+        """一个事件 → 零或一条 Signal → 零或多条 Notice。
+
+        ``signal_from_event`` 返回 None 是**正常分支**（占位消息、没有
+        action_id 的 tool_use、没有判决的 error），不是错误。所以这里不记
+        日志——按实测占比它才是多数，记一行就会把日志刷成噪音。
+        """
+        signal = signal_from_event(event)
+        if signal is None:
+            return []
+        return self._tracker.feed(signal)
+
     def _poll_once(self, config: dict[str, Any]) -> list[str]:
-        """扫一轮观测源 → 跑规则 → 播报。同步函数，由 timer 丢进线程执行。
+        """扫一轮观测源 → 跑规则 → 喂状态机 → 播报。同步函数，由 timer 丢进线程执行。
 
         返回本轮播报结果列表，便于测试与入口观察。
         """
@@ -1001,14 +1089,46 @@ class AgentDeskmatePlugin(NekoPluginBase):
         if self._gateway_adapter is not None:
             events.extend(self._poll_source("网关", self._gateway_adapter))
 
-        outcomes: list[str] = []
+        # C 批 §三：状态机的**状态推进先跑完**（喂事件 + tick 都是纯函数、
+        # 不碰宿主），推送才和规则层合流进 jobs、共用一个条数上限。
+        # 顺序反过来会出这种事：规则层撞上限提前 return，tick 一次没跑，
+        # "未回包"整整晚一个回合才发现。
+        self._sync_tracker_config(config)
+        notices: list[Notice] = []
+        for event in events:
+            notices.extend(self._feed_tracker(event))
+        notices.extend(self._tracker.tick(time.time()))
+
+        # 规则层排在通知层**前面**：删除/下派是安全信号，撞上条数上限时该被
+        # 推迟的是进度播报，不是"它刚删了文件"。tracker 的 Notice 本就按
+        # fingerprint 去过重、按窗口合并，天然稀疏，晚 3 秒无感。
+        jobs: list[Callable[[], str]] = list(self._pending_pushes)
+        self._pending_pushes = []
         for event in events:
             for hit in _hits_for_event(event, mine_roots):
-                outcomes.append(broadcaster.broadcast(hit))
-                if len(outcomes) >= MAX_BROADCAST_PER_TICK:
-                    self.logger.info("本轮播报已达上限 {} 条，余下留待下一轮",
-                                     MAX_BROADCAST_PER_TICK)
-                    return outcomes
+                jobs.append(partial(broadcaster.broadcast, hit))
+        for notice in notices:
+            jobs.append(partial(broadcast_notice, self.push_message, notice,
+                                source=SOURCE, logger=self.logger))
+
+        outcomes: list[str] = []
+        for job in jobs:
+            if len(outcomes) >= MAX_BROADCAST_PER_TICK:
+                break
+            outcomes.append(job())
+
+        # 超出的部分转到下一轮。**不是丢掉**——理由见 MAX_PENDING_PUSHES 注释。
+        overflow = jobs[len(outcomes):]
+        if overflow:
+            if len(overflow) > MAX_PENDING_PUSHES:
+                self.logger.warning(
+                    "积压推送 {} 条超过硬顶 {} 条，丢弃最旧的 {} 条",
+                    len(overflow), MAX_PENDING_PUSHES,
+                    len(overflow) - MAX_PENDING_PUSHES)
+                overflow = overflow[-MAX_PENDING_PUSHES:]
+            self._pending_pushes = overflow
+            self.logger.info("本轮推送已达上限 {} 条，余下 {} 条下一轮接着发",
+                             MAX_BROADCAST_PER_TICK, len(overflow))
         return outcomes
 
     @timer_interval(id="watch", seconds=3)

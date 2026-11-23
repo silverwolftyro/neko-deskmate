@@ -24,6 +24,12 @@ from .events import (
     EVIDENCE_USER_DECLARED,
     REQUESTER_USER,
 )
+from .progress import (
+    LIGHT_ERROR,
+    LIGHT_IDLE,
+    LIGHT_RUNNING,
+    LIGHT_WAITING,
+)
 from .rules import (
     RULE_DELEGATION,
     SEVERITY_CRITICAL,
@@ -32,6 +38,7 @@ from .rules import (
     SEVERITY_WARN,
     RuleHit,
 )
+from .tracker import Notice
 
 # 严重度 → N.E.K.O priority（0-10，越大越重要）
 SEVERITY_PRIORITY = {
@@ -171,6 +178,48 @@ UNKNOWN_EXECUTOR = "未知执行者"
 
 def priority_for(severity: str) -> int:
     return SEVERITY_PRIORITY.get(severity, 5)
+
+
+# ── 推送的唯一出口（红线 1） ─────────────────────────────────────────────────
+# 规则层（Broadcaster）与状态机层（broadcast_notice）都走 ``push_text``。
+# **刻意只有一处**：红线 1 的四条铁律——显式 source、ai_behavior="blind"、
+# 永不 await push_message、submitted=False 是正常分支——写成两份就一定会走岔，
+# 而走岔那天没有任何测试会红，只会是真机上一条用角色口气说出来的假警报。
+
+def push_text(push: Callable[..., dict], text: str, *, source: str, priority: int,
+              logger: Any, tag: str = "", log_commands: bool = False,
+              command_length: int | None = None) -> str:
+    """把一段文本推去聊天窗。返回 ``sent`` / 拒绝原因，**永不抛异常**。
+
+    ``tag`` 只进日志（``播报未被接受（backpressure）：[error] …``），不进正文。
+    """
+    try:
+        result = push(
+            source=source,
+            visibility=["chat"],
+            ai_behavior="blind",
+            parts=[{"type": "text", "text": text}],
+            priority=priority,
+        )
+    except Exception as exc:  # noqa: BLE001  播报失败绝不能炸掉观测循环
+        logger.warning("播报抛出异常（{}）：{}", type(exc).__name__,
+                       for_log(text, log_commands=log_commands,
+                               command_length=command_length))
+        return "exception"
+
+    logged = for_log(text, log_commands=log_commands, command_length=command_length)
+    if not isinstance(result, dict):
+        logger.warning("播报返回了非预期类型 {}：{}", type(result).__name__, logged)
+        return "unexpected"
+
+    if result.get("submitted") is True:
+        return "sent"
+
+    reason = str(result.get("reason") or "unknown")
+    # payload_too_large 是永久性问题，值得 warning；其余是瞬时拥塞，info 就够
+    level = logger.warning if reason not in _PUSH_REJECTION_INFO else logger.info
+    level("播报未被接受（{}）：[{}] {}", reason, tag, logged)
+    return reason
 
 
 # ── 归因文案（2026-11-21 决策记录 §1/§2） ──────────────────────────────────
@@ -346,41 +395,79 @@ class Broadcaster:
             hit = kept
 
         text = render_text(hit)
-        try:
-            result = self._push(
-                source=self._source,
-                visibility=["chat"],
-                ai_behavior="blind",
-                parts=[{"type": "text", "text": text}],
-                priority=priority_for(hit.severity),
-            )
-        except Exception as exc:  # noqa: BLE001  播报失败绝不能炸掉观测循环
-            self.rejected += 1
-            self._logger.warning("播报抛出异常（{}）：{}", type(exc).__name__,
-                                 for_log(text, log_commands=self._log_commands,
-                                         command_length=getattr(hit, "command_length",
-                                                               None)))
-            return "exception"
-
-        return self._handle_result(result, hit, text)
-
-    def _handle_result(self, result: object, hit: RuleHit, text: str) -> str:
-        # 聊天窗里给人看的是原文；落盘的一律过 for_log（脱敏 + 可选截断）
-        logged = for_log(text, log_commands=self._log_commands,
-                         command_length=getattr(hit, "command_length", None))
-        if not isinstance(result, dict):
-            self.rejected += 1
-            self._logger.warning("播报返回了非预期类型 {}：{}", type(result).__name__, logged)
-            return "unexpected"
-
-        if result.get("submitted") is True:
+        command_length = getattr(hit, "command_length", None)
+        outcome = push_text(
+            self._push, text,
+            source=self._source,
+            priority=priority_for(hit.severity),
+            logger=self._logger,
+            tag=hit.severity,
+            log_commands=self._log_commands,
+            command_length=command_length,
+        )
+        if outcome == "sent":
             self.sent += 1
-            self._logger.info("已播报 [{}] {}（累计 {} 条）", hit.severity, logged, self.sent)
-            return "sent"
+            # 聊天窗里给人看的是原文；落盘的一律过 for_log（脱敏 + 可选截断）
+            self._logger.info("已播报 [{}] {}（累计 {} 条）", hit.severity,
+                              for_log(text, log_commands=self._log_commands,
+                                      command_length=command_length), self.sent)
+        else:
+            self.rejected += 1
+        return outcome
 
-        reason = str(result.get("reason") or "unknown")
-        self.rejected += 1
-        # payload_too_large 是永久性问题，值得 warning；其余是瞬时拥塞，info 就够
-        level = self._logger.warning if reason not in _PUSH_REJECTION_INFO else self._logger.info
-        level("播报未被接受（{}）：[{}] {}", reason, hit.severity, logged)
-        return reason
+
+# ── 状态机播报（C 批 §三） ─────────────────────────────────────────────────
+
+# 灯 → 宿主 priority。**放在这里而不是 tracker.py**：priority 是宿主的刻度，
+# 而 tracker 是纯逻辑层，它连 SDK 都不导入。把宿主刻度塞进纯逻辑层，
+# 下次换宿主就要连状态机一起改——那正是 C 批 §一 把契约层独立出来的理由。
+NOTICE_PRIORITY = {
+    LIGHT_ERROR: 7,
+    LIGHT_WAITING: 6,
+    LIGHT_RUNNING: 4,
+    LIGHT_IDLE: 3,
+}
+
+
+def _light_key(light: object) -> str:
+    """灯的字符串形式。
+
+    ``Light`` 是 ``str`` 混血 Enum，``str(Light.ERROR)`` 在不同 Python 版本
+    可能给出 ``"error"`` 也可能给出 ``"Light.ERROR"``——``__str__`` 的 MRO
+    在 ``str`` 与 ``Enum`` 之间争位，3.11 前后行为不一致。所以**不赌
+    ``str()``**，直接取 ``.value``；不是 Enum 时退回 ``str()``。
+
+    这个坑在本项目已经付过一次学费：``notify_enabled`` 曾用 ``is`` 比较
+    ``str`` 混血 Enum，配置传来的裸字符串于是永远匹配不上。
+    """
+    value = getattr(light, "value", None)
+    return value if isinstance(value, str) else str(light)
+
+
+def broadcast_notice(push: Callable[..., dict], notice: Notice, *, source: str,
+                     logger: Any) -> str:
+    """播一条状态机 Notice。返回 ``sent`` / 拒绝原因，**永不抛异常**。
+
+    **刻意不与 Broadcaster 合体**：规则层播 RuleHit（要脱敏、要合并、要按
+    严重度定优先级），状态机播 Notice（tracker 已经按 fingerprint 去过重、
+    已经定好两行、优先级按灯定）。硬塞进一个类，两边都会改不动。
+
+    ``log_commands=True`` 不是"这是命令"，而是"这条要整条落盘"：通知不是命令，
+    走默认的 40 字截断会得到 ``命令 47 字：…`` 这种前言不搭后语的日志，
+    而 Notice 全文也就两行、每行有 120 字上限。脱敏仍然照跑。
+
+    **正文不脱敏**（既定策略：聊天窗给人看原文，for_log 管落盘那份）。
+    但 ``Notice.detail`` 将来会装 ``WAITING`` 的自由文本理由——等
+    ``PendingApproval → WAITING`` 桥接上之前，**必须先在桥接处过 redact()**，
+    否则 agent 的等待理由能把任何东西带出来。见任务书待办。
+    """
+    text = "\n".join(notice.lines())
+    key = _light_key(notice.light)
+    return push_text(
+        push, text,
+        source=source,
+        priority=NOTICE_PRIORITY.get(key, 5),
+        logger=logger,
+        tag=key,
+        log_commands=True,
+    )
