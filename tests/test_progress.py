@@ -15,6 +15,7 @@ import pytest
 
 from plugin.plugins.agent_deskmate.events import (
     EVENT_ERROR,
+    EVENT_TOOL_RESULT,
     EVENT_TOOL_USE,
     EVENT_TURN_END,
     UnifiedEvent,
@@ -265,12 +266,64 @@ def test_turn_end_becomes_a_boundary() -> None:
 
 
 def test_error_becomes_a_failed_outcome() -> None:
+    # is_error=True 是真实解析器对 error 记录的固定填法（events.py）。
+    # 不给它，这条信号会被正确丢弃——见下面那条"判不出就丢"。
     signal = signal_from_event(_event(event=EVENT_ERROR, tool="Bash",
-                                      tool_use_id="tu_9"))
+                                      tool_use_id="tu_9", is_error=True))
     assert signal is not None
     assert signal.role is Role.OUTCOME
     assert signal.ok is False
     assert signal.action_id == "tu_9"
+
+
+def test_an_error_event_without_a_verdict_is_dropped() -> None:
+    # 与 tool_result 同一条规则：判不出成败就不判。
+    assert signal_from_event(_event(event=EVENT_ERROR, tool="Bash",
+                                    tool_use_id="tu_9", is_error=None)) is None
+
+
+# ── 6b. tool_result：C 批新接的信号源 ─────────────────────────────────────
+
+def test_a_failed_tool_result_becomes_a_failed_outcome() -> None:
+    """「命令失败了但没报 error」——这种最常见的失败，之前一条都看不见。"""
+    signal = signal_from_event(_event(event=EVENT_TOOL_RESULT,
+                                      tool_use_id="tu_1", is_error=True))
+    assert signal is not None
+    assert signal.role is Role.OUTCOME
+    assert signal.ok is False
+    assert signal.action_id == "tu_1"
+
+
+def test_a_successful_tool_result_becomes_a_passed_outcome() -> None:
+    signal = signal_from_event(_event(event=EVENT_TOOL_RESULT,
+                                      tool_use_id="tu_1", is_error=False))
+    assert signal is not None
+    assert signal.ok is True
+
+
+def test_an_outcome_whose_verdict_is_unknown_is_dropped() -> None:
+    # 猜 True 会压掉一次真失败（最坏方向）；猜 False 会造一次假警报
+    # （精度原则禁止的方向）。两条都不如丢。
+    assert signal_from_event(_event(event=EVENT_TOOL_RESULT,
+                                    tool_use_id="tu_1", is_error=None)) is None
+
+
+def test_action_and_outcome_pair_on_the_same_id() -> None:
+    """端到端：一条 assistant 的 tool_use + 一条 user 的 tool_result 能配上。"""
+    action = signal_from_event(_event(
+        event=EVENT_TOOL_USE, tool="Bash", tool_use_id="toolu_42"))
+    outcome = signal_from_event(_event(
+        event=EVENT_TOOL_RESULT, tool_use_id="toolu_42", is_error=True))
+    assert action is not None and outcome is not None
+    assert action.role is Role.ACTION
+    assert outcome.role is Role.OUTCOME
+    # 配对靠 id，不靠时间也不靠顺序
+    assert action.action_id == outcome.action_id
+    assert action.key() == outcome.key()
+    # action 那侧的 kind 是工具名；outcome 那侧没有（tool_result 块不带），
+    # 由状态机从 open_action 里取——这就是 kind 留在 action 侧的原因。
+    assert action.kind == "Bash"
+    assert outcome.kind == ""
 
 
 def test_an_unknown_event_type_maps_to_nothing() -> None:
@@ -312,7 +365,11 @@ def test_a_secret_in_the_transcript_never_reaches_a_signal() -> None:
         _event(event=EVENT_TOOL_USE, tool="Bash", tool_use_id="tu_1",
                command=command, summary=command),
         _event(event=EVENT_ERROR, tool="Bash", tool_use_id="tu_1",
-               command=command, summary=command),
+               command=command, summary=command, is_error=True),
+        # tool_result 也走一遍：它的 content 才是真正的大输出，
+        # 而 events.py 那边根本不读那个字段。
+        _event(event=EVENT_TOOL_RESULT, tool_use_id="tu_1", is_error=True,
+               summary=command),
         _event(event=EVENT_TURN_END, summary=command),
     ]
     for event in events:

@@ -15,6 +15,7 @@ from plugin.plugins.agent_deskmate.events import (
     ATTRIBUTION_KNOWN,
     ATTRIBUTION_UNKNOWN,
     EVENT_ERROR,
+    EVENT_TOOL_RESULT,
     EVENT_TOOL_USE,
     EVENT_TURN_END,
     EVIDENCE_MCP_DELEGATION,
@@ -136,6 +137,169 @@ def test_api_error_record_yields_error_event() -> None:
     assert events[0].event == EVENT_ERROR
     assert "api_error" in events[0].summary
     assert events[0].source_type == "system"
+
+
+# ── C 批：tool_result（之前整条分支不存在，user 记录被直接丢掉）───────────
+
+TOOL_RESULT_OK_RECORD = {
+    "type": "user",
+    "sessionId": SESSION,
+    "isSidechain": False,
+    "timestamp": "2026-11-15T06:00:00.500Z",
+    "cwd": "D:\\proj",
+    "message": {
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1",
+             "is_error": False, "content": "done"},
+        ],
+    },
+}
+
+# is_error 缺失 = 成功。实测 47% 的块没有这个字段——默认值只能是 False，
+# 否则误报翻 12 倍（1735 个缺失块会全部变成"失败"）。
+TOOL_RESULT_NO_FLAG_RECORD = {
+    "type": "user",
+    "sessionId": SESSION,
+    "isSidechain": False,
+    "timestamp": "2026-11-15T06:00:00.500Z",
+    "message": {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "toolu_1"}],
+    },
+}
+
+TOOL_RESULT_FAIL_RECORD = {
+    "type": "user",
+    "sessionId": SESSION,
+    "isSidechain": False,
+    "timestamp": "2026-11-15T06:00:02.500Z",
+    "cwd": "D:\\proj",
+    "message": {
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1",
+             "is_error": True,
+             "content": "bash: line 1: rm: Permission denied"},
+        ],
+    },
+}
+
+# 并行工具调用：一条 user 记录里多个 tool_result。
+TOOL_RESULT_MULTI_RECORD = {
+    "type": "user",
+    "sessionId": SESSION,
+    "isSidechain": False,
+    "timestamp": "2026-11-15T06:00:03.000Z",
+    "message": {
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_a", "is_error": False},
+            {"type": "tool_result", "tool_use_id": "toolu_b", "is_error": True},
+        ],
+    },
+}
+
+
+def test_tool_result_yields_an_outcome_event() -> None:
+    events = parse_transcript_line(_json(TOOL_RESULT_OK_RECORD))
+    assert len(events) == 1
+    event = events[0]
+    assert event.event == EVENT_TOOL_RESULT
+    assert event.tool_use_id == "toolu_1"
+    assert event.is_error is False
+    assert event.source_type == "user"
+    assert event.session == SESSION
+    # 工具名不在 tool_result 块里，只能靠 id 让上层配
+    assert event.tool is None
+
+
+def test_a_missing_is_error_flag_means_success() -> None:
+    # 实测 47% 的块没有 is_error。把它当失败 = 误报翻 12 倍。
+    events = parse_transcript_line(_json(TOOL_RESULT_NO_FLAG_RECORD))
+    assert len(events) == 1
+    assert events[0].is_error is False
+
+
+def test_a_failed_tool_result_is_visible() -> None:
+    """「命令失败了但没报 error」——这种最常见的失败之前一条都看不见。"""
+    events = parse_transcript_line(_json(TOOL_RESULT_FAIL_RECORD))
+    assert len(events) == 1
+    assert events[0].event == EVENT_TOOL_RESULT
+    assert events[0].is_error is True
+
+
+def test_parallel_tool_results_each_become_their_own_event() -> None:
+    events = parse_transcript_line(_json(TOOL_RESULT_MULTI_RECORD))
+    assert len(events) == 2
+    assert [e.tool_use_id for e in events] == ["toolu_a", "toolu_b"]
+    assert [e.is_error for e in events] == [False, True]
+
+
+def test_tool_result_content_is_never_read() -> None:
+    """隐私红线：content 是命令输出，可能是一整个文件。
+
+    只读 tool_use_id / is_error / 时间戳三个字段。这条测试拿一个
+    含秘密的 content 跑完整解析，断言它不出现在事件的任何字段里。
+    """
+    secret = "SECRET_TOKEN_XYZ_9f3a"
+    record = {
+        "type": "user",
+        "sessionId": SESSION,
+        "timestamp": "2026-11-15T06:00:00.500Z",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "is_error": True, "content": f"export KEY={secret}"},
+            ],
+        },
+    }
+    events = parse_transcript_line(_json(record))
+    assert len(events) == 1
+    for field_name in UnifiedEvent.model_fields:
+        value = getattr(events[0], field_name)
+        if isinstance(value, str):
+            assert secret not in value, f"秘密漏进了 {field_name}"
+    assert secret not in repr(events[0])
+
+
+def test_a_user_record_whose_content_is_a_string_is_skipped() -> None:
+    # 实测 192 条：用户直接说话，content 是字符串不是列表。不许炸。
+    record = {"type": "user", "sessionId": SESSION,
+              "timestamp": "2026-11-15T06:00:00.500Z",
+              "message": {"role": "user", "content": "帮我看一下"}}
+    assert parse_transcript_line(_json(record)) == []
+
+
+def test_non_tool_result_blocks_in_user_content_are_skipped() -> None:
+    # 实测 12 条 image / text 块。只取 tool_result。
+    record = {"type": "user", "sessionId": SESSION,
+              "timestamp": "2026-11-15T06:00:00.500Z",
+              "message": {"role": "user", "content": [
+                  {"type": "text", "text": "看图"},
+                  {"type": "image", "source": {"type": "base64"}},
+                  {"type": "tool_result", "tool_use_id": "toolu_1"},
+              ]}}
+    events = parse_transcript_line(_json(record))
+    assert len(events) == 1
+    assert events[0].event == EVENT_TOOL_RESULT
+
+
+def test_a_tool_result_without_an_id_is_skipped() -> None:
+    # 认不出是哪个动作的结果，这条 outcome 就没有价值。
+    record = {"type": "user", "sessionId": SESSION,
+              "timestamp": "2026-11-15T06:00:00.500Z",
+              "message": {"role": "user", "content": [
+                  {"type": "tool_result", "is_error": True},
+              ]}}
+    assert parse_transcript_line(_json(record)) == []
+
+
+def test_an_error_record_carries_is_error_true() -> None:
+    # progress 层据此推 ok；没有这个标记它只能把信号丢掉。
+    events = parse_transcript_line(_json(API_ERROR_RECORD))
+    assert events[0].is_error is True
 
 
 def test_sidechain_flag_is_preserved() -> None:

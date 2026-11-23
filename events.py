@@ -28,11 +28,15 @@ from typing import Any, Iterable
 
 from pydantic import BaseModel, Field, model_validator
 
-# 统一事件的三种类型（任务书规定的枚举，不自创）
+# 统一事件的四种类型（任务书规定的枚举，不自创）
 EVENT_TOOL_USE = "tool_use"
 EVENT_TURN_END = "turn_end"
 EVENT_ERROR = "error"
-EVENT_TYPES = (EVENT_TOOL_USE, EVENT_TURN_END, EVENT_ERROR)
+# C 批新增：工具的结果。**今天之前它完全不解析**，而实测它是最大的未用信号源
+# ——30 个转录文件里 3724 个 tool_result 块，其中 is_error=true 有 161 个。
+# 「命令失败了但没报 error」这种最常见的失败，之前一条都看不见。
+EVENT_TOOL_RESULT = "tool_result"
+EVENT_TYPES = (EVENT_TOOL_USE, EVENT_TURN_END, EVENT_ERROR, EVENT_TOOL_RESULT)
 
 # summary 里工具输入摘要的最大长度。命令可能含敏感信息，一律截断。
 #
@@ -209,6 +213,11 @@ class UnifiedEvent(AttributionFields):
     command: str | None = Field(default=None, description="Bash 工具调用的完整命令，仅 tool_use 有")
     # status_code —— 失败类规则要按状态码定严重度，不能从 summary 文本反解析
     status_code: int | None = Field(default=None, description="网关请求的 HTTP 状态码")
+    # C 批：这一步成了没有。**只有 outcome 类事件有意义**，其余留 None。
+    # 判不出成败时必须留 None 而不是猜——猜 True 会压掉一次真失败（最坏方向），
+    # 猜 False 会造一次假警报（精度原则禁止的方向）。
+    # 由 progress.signal_from_event 执行"推不出就丢"。
+    is_error: bool | None = Field(default=None, description="该步是否失败；判不出留 None")
 
     # 归因用的原始线索（2026-11-21）。都是转录里真实存在的字段，不是推测：
     # parent_uuid / tool_use_id —— 与 tool_result 配对，确认动作真的执行了
@@ -328,7 +337,20 @@ def parse_transcript_line(line: str) -> list[UnifiedEvent]:
         summary = f"出错：{subtype or 'unknown'}"
         if reason:
             summary += f"（{reason}）"
-        return [UnifiedEvent(event=EVENT_ERROR, tool=None, summary=summary, **common)]
+        # is_error=True：error 记录本身就是失败。progress 层据此推 ok，
+        # 没有这个标记它就只能把这条信号丢掉（推不出成败就不判）。
+        return [UnifiedEvent(event=EVENT_ERROR, tool=None, summary=summary,
+                            is_error=True, **common)]
+
+    # C 批：user 记录里的 tool_result。**这条分支之前不存在**——
+    # 下面那句 `if record_type != "assistant": return []` 把 user 记录整条丢掉，
+    # 于是「命令失败了但没报 error」这种最常见的失败一条都看不见。
+    #
+    # 实测（2026-11-23，30 个转录文件）：3724 个 tool_result 块，
+    # 其中 is_error 缺失 1735（47%）、false 1828、true 161。
+    # **缺失必须当成功**——当成失败的话误报翻 12 倍。
+    if record_type == "user":
+        return _parse_tool_results(message, common)
 
     if record_type != "assistant":
         return []
@@ -357,6 +379,45 @@ def parse_transcript_line(line: str) -> list[UnifiedEvent]:
 
 
 # ── 网关元数据解析 ─────────────────────────────────────────────────────────
+
+def _parse_tool_results(message: dict[str, Any],
+                        common: dict[str, Any]) -> list[UnifiedEvent]:
+    """user 记录里的 tool_result 块 → 统一事件。纯函数。
+
+    **只读三个字段**：`tool_use_id`、`is_error`、记录自带的时间戳。
+    **`content` 一律不碰**——那是命令输出，可能是一整个文件的内容，
+    既是隐私红线也是性能陷阱（实测转录里单行能到几十 KB）。
+
+    实测过两种非工具结果的 user 内容，都不许炸：
+    `content` 是字符串（用户直接说话，192 条）、块里有 image / text（12 条）。
+
+    没有 `tool_use_id` 的块跳过：配对是 outcome 的全部意义，
+    而 tool_result 块本身不带工具名，认不出是哪个动作的结果就没有价值。
+    """
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+
+    events: list[UnifiedEvent] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tool_use_id = _clean(block.get("tool_use_id"))
+        if not tool_use_id:
+            continue
+        # 缺失 = 成功。实测 47% 的块没有这个字段，默认值只能是 False。
+        is_error = bool(block.get("is_error"))
+        events.append(UnifiedEvent(
+            event=EVENT_TOOL_RESULT,
+            # 工具名不在这个块里；靠 tool_use_id 让上层去配。
+            tool=None,
+            summary=f"工具执行{'失败' if is_error else '完成'}",
+            tool_use_id=tool_use_id,
+            is_error=is_error,
+            **common,
+        ))
+    return events
+
 
 def parse_gateway_row(row: dict[str, Any]) -> UnifiedEvent | None:
     """把 ``proxy_request_logs`` 的一行转成统一事件。纯函数。

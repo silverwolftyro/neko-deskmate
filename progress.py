@@ -254,10 +254,13 @@ def notify_enabled(role: Role | str) -> bool:
 # 放在契约层而不是适配器里，是因为"哪类事件算哪个角色"本身就是契约的
 # 一部分：换一家 Agent 时，变的只是"事件从哪来"，不是"这类事算哪个角色"。
 #
-# 现有三类事件 → 三个角色。**`tool_result` 今天不解析**（events.py 只产
-# tool_use / turn_end / error），所以 outcome 目前只有 error 一条来源，
-# "命令失败了但它没报 error" 这种最常见的失败还看不到——那是任务书 §1.2
-# 的单点改动，属下一 commit，不混进契约冻结。
+# 现有四类事件 → 三个角色。`tool_result` 是 C 批新接上的：
+# 在它之前，「命令失败了但没报 error」这种最常见的失败一条都看不见
+# （实测 30 个转录文件里 161 个 is_error=true 的 tool_result 全被丢弃）。
+#
+# 注意 **`ok` 只能从 `is_error` 推**，而且推不出就必须丢：
+# 无证据判 True 会压掉一次真失败（最坏方向），无证据判 False 会造一次
+# 假警报（精度原则禁止的方向）。两条都不如丢。
 
 def signal_from_event(event: Any) -> Signal | None:
     """把一条 `UnifiedEvent` 映射成 Signal。认不出的类型返回 None。
@@ -293,6 +296,10 @@ def signal_from_event(event: Any) -> Signal | None:
         )
 
     if role is Role.OUTCOME:
+        # 成败判不出就不判。见上面关于 ok 的说明。
+        is_error = getattr(event, "is_error", None)
+        if is_error is None:
+            return None
         return Signal(
             role=role,
             agent=_text(getattr(event, "agent", "")),
@@ -300,7 +307,7 @@ def signal_from_event(event: Any) -> Signal | None:
             workspace=_optional(getattr(event, "working_directory", None)),
             at=at,
             action_id=_optional(getattr(event, "tool_use_id", None)),
-            ok=False,
+            ok=not bool(is_error),
             kind=_clip(tool),
         )
 
@@ -320,6 +327,7 @@ _ROLE_FOR_EVENT = {
     "tool_use": Role.ACTION,
     "turn_end": Role.BOUNDARY,
     "error": Role.OUTCOME,
+    "tool_result": Role.OUTCOME,
 }
 
 
