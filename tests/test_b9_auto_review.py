@@ -817,3 +817,28 @@ def test_a_wired_judge_still_short_circuits_before_the_reviewer(
         assert pending.judge_model == "m2"
     finally:
         gateway.stop()
+
+
+def test_l2_decide_refuses_outright_when_no_backend_is_wired(
+        tmp_path: Path) -> None:
+    """单元层：`_judge` 没接时 `_l2_decide` 必须自己回 False，不拍板。
+
+    **这条是补覆盖，不是重复**。命题 3 修完之后，
+    `_maybe_auto_allow` 那一层已经分不出「L2 被问过然后拒绝」和
+    「L2 从来没被问」——因为没接后端的请求现在直接落到 B9 了。
+    而这两件事必须分得清，所以按正确的层级在这里钉一次：
+    哪怕将来有人绕过 `_maybe_auto_allow` 直接调 `_l2_decide`，
+    没有后端时它照样什么都不决定。
+    """
+    gateway = ApprovalGateway(
+        ListLogger(), port=_free_port(),
+        authorization_path=tmp_path / "authorization.json",
+    )
+    try:
+        pending = _record("git status", severity="notice")
+        assert gateway._l2_decide(pending, "L2 门控通过", None, ()) is False
+        assert pending.decided_by is None
+        assert pending.decision is None
+        assert not pending.auto
+    finally:
+        gateway.stop()
