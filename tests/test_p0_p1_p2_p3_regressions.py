@@ -19,10 +19,12 @@ return，按钮永远留着）。
 
 from __future__ import annotations
 
+import asyncio
 import ast
 import inspect
 import json
 import socket
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -470,3 +472,163 @@ def _gateway(reviewer, tmp_path: Path) -> ApprovalGateway:
     )
     gateway.grant_authorization((AUTH_SCOPE_REVIEW,))
     return gateway
+
+
+# ── 5. B12：渠道 hud→chat、删计数播报、首启死代码 ──────────────────────────
+#
+# 三个都是真机验收暴露的，共同点是"代码看着对、行为是反的"：
+# 通知发到了一条前端根本不渲染的通道；一次放行发出三条消息其中两条是假警报；
+# 首启那行说明写在了一个条件永假的分支里。
+
+def test_the_auto_allow_notice_goes_to_chat() -> None:
+    """B12 P0-1：自动放行通知必须走 ``["chat"]``。
+
+    真机实测：``["hud"]`` 后端确认 `agent_notification sent to frontend`，
+    但角色旁那行小字**始终不显示**，切页面更是彻底看不见。
+    所以"要让用户看见"的文案一律 chat，不再往 hud 发任何东西。
+    """
+    plugin = _plugin()
+    plugin.push_message = _RecordingPush()      # type: ignore[assignment]
+    record = _record("npm run build")
+    record.auto = True
+
+    asyncio.run(plugin._announce_auto_allow(record))  # noqa: SLF001
+
+    assert len(plugin.push_message.calls) == 1
+    call = plugin.push_message.calls[0]
+    assert call["visibility"] == ["chat"], "又发到 hud 去了"
+    assert call["ai_behavior"] == "blind"
+    assert call["source"] == module.SOURCE
+
+
+def test_nothing_in_the_source_tree_sends_to_hud() -> None:
+    """B12 P0-2 的渠道固化：源码里任何一处 ``visibility`` 字面量都不许含 hud。
+
+    把渠道决定钉死，防止以后有人"顺手加个 hud 提示"——
+    而 hud 正是真机上验证过不显示的那条。扫的是插件自己的 ``*.py``，
+    不含 tests（测试里可以正当引用 hud）。
+    """
+    root = Path(module.__file__).resolve().parent
+    offenders: list[str] = []
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "visibility":
+                    continue
+                for sub in ast.walk(keyword.value):
+                    if (isinstance(sub, ast.Constant)
+                            and sub.value == "hud"):
+                        offenders.append(f"{path.name}:{sub.lineno}")
+    assert not offenders, "还在往 hud 发东西：" + ", ".join(offenders)
+
+
+def test_one_auto_allow_pushes_exactly_one_notice(tmp_path: Path) -> None:
+    """B12 P0-2：一次"请求→自动放行"全程只推**一条**，且就是那三行。
+
+    修复前的真实行为是 3 条：三行通知 + 「有 1 条审批待判断」+
+    「没有待判断的审批了」。后两条来自一次自动放行会让未决计数在审查的
+    1–2 秒里 0→1→0——用户看到的是假警报，那比没提示更坏，
+    是训练用户无视提示的最快路径。
+
+    走完整 HTTP 路径：自动放行发生在 POST 里，通知由 approval_tick 发。
+    """
+    reviewer = _FakeReviewer(Review(OUTCOME_AUTO_ALLOW, risk=RISK_LOW,
+                                    decision=DECISION_ALLOW,
+                                    reason="只读命令，无副作用", model="m1"))
+    gateway = ApprovalGateway(
+        _ListLogger(), port=_free_port(), timeout_seconds=0.4,
+        authorization_path=tmp_path / "authorization.json",
+        reviewer=reviewer,
+    )
+    gateway.grant_authorization((AUTH_SCOPE_REVIEW,))
+    try:
+        assert gateway.start()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{gateway._port}/hook/permission",  # noqa: SLF001
+            data=json.dumps({"tool_name": "Bash", "session_id": "sess-1",
+                             "tool_input": {"command": "npm run build",
+                                            "cwd": WD}},
+                            ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 200
+
+        plugin = _plugin()
+        plugin.push_message = _RecordingPush()   # type: ignore[assignment]
+        plugin._approval = gateway              # noqa: SLF001
+
+        asyncio.run(plugin.approval_tick())
+
+        assert len(plugin.push_message.calls) == 1, plugin.push_message.calls
+        text = plugin.push_message.calls[0]["parts"][0]["text"]
+        lines = text.splitlines()
+        assert len(lines) == 3, f"不是三行：{text!r}"
+        assert lines[0].startswith("已自动放行")
+        assert "待判断" not in text, "计数播报又回来了"
+    finally:
+        gateway.stop()
+
+
+def test_the_setting_line_is_reached_through_the_real_startup(
+        tmp_path: Path) -> None:
+    """B12 P0-3：首启那行「怎么关」必须真被 ``on_startup`` 打到。
+
+    死代码之所以死，就是因为它没被跑到。所以这条走 ``on_startup`` 真路径，
+    只把"起 HTTP 服务"换成装一个 reviewer 已连接的 gateway——
+    单独调 ``_log_auto_allow_setting_line()`` 是抓不到原来那个 bug 的。
+
+    原 bug：``on_startup`` 的顺序是先 ``_log_first_run_hint`` 后
+    ``_start_approval_service``，而那行写在前者里、读 ``self._approval``，
+    于是条件永假，一次都没打印过。
+    """
+    plugin = _plugin()
+    logger = _ListLogger()
+    plugin.logger = logger
+    gateway = ApprovalGateway(
+        logger, port=_free_port(),
+        authorization_path=tmp_path / "authorization.json",
+        reviewer=_FakeReviewer(None),
+    )
+    gateway.grant_authorization((AUTH_SCOPE_REVIEW,))
+
+    def _fake_start(_config: dict) -> None:
+        plugin._approval = gateway             # noqa: SLF001
+
+    plugin._start_approval_service = _fake_start    # type: ignore[assignment]
+
+    async def _fake_config() -> dict:
+        return {"approval": {"port": _free_port()}}
+
+    plugin._plugin_config = _fake_config            # type: ignore[assignment]
+
+    try:
+        asyncio.run(plugin.on_startup())
+        assert any("自动放行：已开启" in message
+                   for _, message in logger.lines), (
+            "on_startup 没打到那行「怎么关」——又是死代码")
+    finally:
+        gateway.stop()
+
+
+def test_no_setting_line_without_a_reviewer(tmp_path: Path) -> None:
+    """没接审查器时根本没有自动放行，提示"可关闭"是让用户找一个不存在的开关。
+
+    B12 P0-3 的另一半：抽出来的方法不能变成"无论如何都打一行"。
+    """
+    plugin = _plugin()
+    logger = _ListLogger()
+    plugin.logger = logger
+    gateway = ApprovalGateway(
+        logger, port=_free_port(),
+        authorization_path=tmp_path / "authorization.json",
+    )
+    try:
+        plugin._approval = gateway              # noqa: SLF001
+        plugin._log_auto_allow_setting_line()   # noqa: SLF001
+        assert not any("自动放行" in message
+                       for _, message in logger.lines)
+    finally:
+        gateway.stop()

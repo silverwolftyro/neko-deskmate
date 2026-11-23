@@ -600,7 +600,6 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._broadcaster: Broadcaster | None = None
         self._approval: ApprovalGateway | None = None
         self._hint_logged = False
-        self._last_hud_count = -1
         # 5b：模型建议客户端 + 跑它的线程池。advisor 为 None 表示零 key 默认态。
         self._advisor: ModelAdvisor | None = None
         self._advice_pool: ThreadPoolExecutor | None = None
@@ -645,6 +644,9 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._last_config = config
         self._log_first_run_hint(config)
         self._start_approval_service(config)
+        # B12 P0-3：「怎么关」那一行必须等审批服务建起来之后才打——
+        # 它读 _approval.reviewer_connected()，早一步调就是死代码。
+        self._log_auto_allow_setting_line()
         return Ok({
             "status": "running",
             "plugin_id": self.plugin_id,
@@ -825,14 +827,30 @@ class AgentDeskmatePlugin(NekoPluginBase):
             "自己接手，插件不代你判断，也不把「一直没点」记成拒绝。"
             "卡片上点「这是什么」可以看到这段说明、会话与工作目录。"
         )
-        # P2：「怎么关」只在这里说一次。通知里再说一遍就是每件事都提醒一遍，
-        # 而那正是用户被训练成无视提示的路径。
-        if self._approval is not None and self._approval.reviewer_connected():
-            self.logger.info(
-                "{}；要关掉，把配置里的自动审查档改回关闭即可"
-                "（授权记录仍在，开关关着一样不动作）。",
-                auto_allow_setting_line(enabled=True),
-            )
+        # P2：「怎么关」**不在这里说**——搬到 _log_auto_allow_setting_line()，
+        # 由 on_startup 在 _start_approval_service() 之后调。
+        # 原来它就写在本方法里，而 on_startup 的顺序是"先 _log_first_run_hint、
+        # 后 _start_approval_service"，于是 self._approval 恒为 None，
+        # 那一行一次都没打印过（B12 P0-3）。死代码比没有代码更坏：
+        # 它让人以为"怎么关"已经告诉过用户了。
+
+    def _log_auto_allow_setting_line(self) -> None:
+        """设置页常驻那一行的日志版：自动放行开着没有、怎么关（P2）。
+
+        **必须由 on_startup 在 _start_approval_service() 之后调用**——
+        它读 ``self._approval.reviewer_connected()``，而审批服务到那才建出来。
+        单独拆一个方法，而不是调整那两句的相对顺序：顺序会被人无意改回去，
+        方法名不会。
+
+        **只打日志，不播报**（红线 1）：这是配置说明，不是观测结果。
+        """
+        if self._approval is None or not self._approval.reviewer_connected():
+            return
+        self.logger.info(
+            "{}；要关掉，把配置里的自动审查档改回关闭即可"
+            "（授权记录仍在，开关关着一样不动作）。",
+            auto_allow_setting_line(enabled=True),
+        )
 
     @lifecycle(id="shutdown")
     def on_shutdown(self, **_):
@@ -1014,13 +1032,18 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
     @timer_interval(id="approval", seconds=1)
     async def approval_tick(self, **_):
-        """把新来的审批请求变成卡片、把已了结的结果写回卡片、按需推 HUD。
+        """把新来的审批请求变成卡片、把已了结的结果写回卡片、播报自动放行。
 
         单独一个 1 秒 timer，不并进 3 秒的观测轮询：审批是"人在等"的交互，
         晚 3 秒才弹出卡片，体感就是插件坏了。
 
         建卡片必须在这里做：``create_card`` 是 async 的 SDK 调用，而 hook 的
         handler 跑在纯线程里，没有事件循环可 await。
+
+        **不在这里推任何"状态摘要"**（B12 P0-2）：未决条数改由 ``status``
+        入口按需返回。实测一次自动放行会在审查的 1–2 秒里让计数 0→1→0，
+        于是先播「有 1 条待判断」、两秒后又播「没有了」——用户看到的是假警报，
+        那比没提示更坏。要计数自己查，插件不推。
         """
         if self._approval is None:
             return
@@ -1031,7 +1054,6 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 await self._settle_approval_card(pending)
             for pending in self._approval.take_auto_allowed():
                 await self._announce_auto_allow(pending)
-            await self._push_hud_if_changed()
         except Exception as exc:  # noqa: BLE001  一轮失败不能杀死 timer
             self.logger.warning("审批卡片处理异常（{}）：{}", type(exc).__name__, exc)
 
@@ -1045,6 +1067,10 @@ class AgentDeskmatePlugin(NekoPluginBase):
         它要干什么 / 凭什么。授权溯源、模型名、机制说明、关闭方法
         **一律不进通知**——它们全在审计里（``audit_list`` 看得见），
         通知里多一行就是把最该被看见的那行往下推。
+
+        **渠道只走 ``["chat"]``**（B12 P0-1，真机实测）：``["hud"]`` 后端确认
+        送到前端，但角色旁那行小字始终不显示，切页面更是彻底看不见。
+        所有"要让用户看见"的文案一律 chat，不再往 hud 发任何东西。
         """
         request = pending.request
         self.logger.info(
@@ -1063,7 +1089,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
         try:
             self.push_message(
                 source=SOURCE,
-                visibility=["hud"],
+                visibility=["chat"],
                 ai_behavior="blind",
                 parts=[{"type": "text", "text": text}],
                 priority=4,
@@ -1071,32 +1097,6 @@ class AgentDeskmatePlugin(NekoPluginBase):
         except Exception as exc:  # noqa: BLE001  通知发不出去不影响已放行的调用
             self.logger.warning("自动放行通知发送失败（{}）：{}",
                                 type(exc).__name__, exc)
-
-    async def _push_hud_if_changed(self) -> None:
-        """未决数量进 HUD。**只在数量变化时发一次**——每轮都发就是刷屏。
-
-        走 push_message（红线 1）：source 显式、ai_behavior="blind"，
-        只报"有 N 条待判断"这一句，不带命令原文。
-        """
-        count = self._approval.undecided_count()
-        if count == self._last_hud_count:
-            return
-        self._last_hud_count = count
-        if count == 0:
-            # 归零也值得说一声：用户可能正等着"是不是清了"。
-            text = "同桌猫：没有待判断的审批了"
-        else:
-            text = f"同桌猫：有 {count} 条审批待判断"
-        try:
-            self.push_message(
-                source=SOURCE,
-                visibility=["hud"],
-                ai_behavior="blind",
-                parts=[{"type": "text", "text": text}],
-                priority=4,
-            )
-        except Exception as exc:  # noqa: BLE001  HUD 推不出去不影响审批
-            self.logger.warning("HUD 推送失败（{}）：{}", type(exc).__name__, exc)
 
     def _warning_policy(self, pending: Any) -> WarningPolicy:
         """这一次的警示该长成什么样（规格 Q3）。

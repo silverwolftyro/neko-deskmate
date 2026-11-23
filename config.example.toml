@@ -47,9 +47,9 @@ cc_switch_db = "~/.cc-switch/cc-switch.db"
 [agent_deskmate.mine]
 roots = []
 # 示例（TOML 里反斜杠要转义，写两个）：
-# roots = ["D:\\workspace", "C:\\Users\\alpha\\projects"]
+# roots = ["D:\\workspace", "C:\\Users\\<你的用户名>\\projects"]
 # 也可以直接用正斜杠，Windows 同样认：
-# roots = ["D:/workspace", "C:/Users/alpha/projects"]
+# roots = ["D:/workspace", "C:/Users/<你的用户名>/projects"]
 
 # ── 审批中继（三层门控 + 显式授权，规格《审批自动化-授权层级》§5） ───────────
 # L0 转发：无任何配置即可用——只转发审批、常驻提醒未决，不解释不判断。
