@@ -250,6 +250,44 @@ def notify_enabled(role: Role | str) -> bool:
         "否则它会静默变成不播——或者更坏，播")
 
 
+# ── 哪些失败值得开口 ───────────────────────────────────────────────────────
+# 精度 > 召回的直接落地：**不是每次失败都该响**。
+#
+# 实测依据（2026-11-23，30 个转录文件，161 个 is_error=true）：
+#   Bash 80 / Edit 42 / WebFetch 10 / Read 7 / Grep 6 / Write 4 / Glob 2 / 其余 10
+# 其中 Read + Grep + Glob 共 15 个是**预期内的失败**——`grep` 没匹配到
+# 退出码 1、文件本来就不存在，那是搜索的正常结果，不是 Agent 卡住。
+# 一律当 🔴 就是狼来了。
+#
+# **按语义分类，不按名字列清单**：分界线是"这个工具改不改世界"。
+# 读/找类失败多半是正常搜索结果；写/执行类失败才是真卡住。
+# 这样换一家 Agent 同样成立——新工具叫什么名字不影响它属于哪边。
+#
+# 未知工具默认算响：宁可多响一个可关的，不比一个看起来坏掉的。
+# （音量由 fail_coalesce_seconds 兜底，且整档可在配置里关掉。）
+
+BENIGN_FAILURE_KINDS = frozenset({
+    # 读 / 找：失败 = 没找到，是正常搜索结果
+    "grep", "egrep", "fgrep", "rg", "findstr", "select-string",
+    "glob", "read", "ls", "dir", "find", "where", "which",
+    "get-childitem", "get-content", "get-location",
+    "cat", "type", "more", "less", "head", "tail", "printenv", "env",
+    "whoami", "hostname", "date", "pwd",
+})
+
+
+def failure_is_loud(kind: str) -> bool:
+    """这次失败值得开口吗。纯函数。
+
+    空 `kind` 算响：那通常是会话级错误（如 api_error），
+    不是某个工具没找到东西——那种当然该响。
+    """
+    name = (kind or "").strip().lower()
+    if not name:
+        return True
+    return name not in BENIGN_FAILURE_KINDS
+
+
 # ── 事件 → 信号 映射（CC 适配器）──────────────────────────────────────────
 # 放在契约层而不是适配器里，是因为"哪类事件算哪个角色"本身就是契约的
 # 一部分：换一家 Agent 时，变的只是"事件从哪来"，不是"这类事算哪个角色"。
