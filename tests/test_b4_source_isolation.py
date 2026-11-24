@@ -100,6 +100,7 @@ class WatcherHost:
     _sync_merge_window = AgentDeskmatePlugin._sync_merge_window
     _feed_tracker = AgentDeskmatePlugin._feed_tracker
     _approval_blocked_sessions = AgentDeskmatePlugin._approval_blocked_sessions
+    _released_gate_sessions = AgentDeskmatePlugin._released_gate_sessions
     _record_gate_stopped = AgentDeskmatePlugin._record_gate_stopped
     _is_gate_caused = AgentDeskmatePlugin._is_gate_caused
     _adapter_status = AgentDeskmatePlugin._adapter_status
@@ -121,6 +122,8 @@ class WatcherHost:
         self._approval = None
         # P1c：自伤失败登记簿。真插件 _reset_watch_state 建，这里手搭一份。
         self._gated = GatedFailureLog()
+        # P1b：已经释放过的审批 request_id。同上，真插件建、这里手搭。
+        self._gate_released: dict[str, float] = {}
         # P1c(b)：同目录通知的跨批次合并器。关掉窗口——这里测的是观测源
         # 隔离，通知要当轮就看到，不该被合并窗口拖着。
         self._merger = NoticeMerger(window=0.0)

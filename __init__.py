@@ -176,6 +176,12 @@ SCAN_EVENT_COUNT = 50
 # scan_now 回显几条"将要播报"的原文，超过就截断。
 SCAN_SAMPLE_LIMIT = 3
 
+# 「审批挂起已解除」的记账保留多久。用来给同一张卡只释放一次——
+# approval.snapshot() 按 retention（默认一小时）留着已了结记录，
+# 不记账的话同一会话每分钟又被"释放"一次。取两小时是留足余量，
+# 超时的条目对释放早就没有意义了（动作要么已闭环、要么已作废）。
+GATE_RELEASE_MEMORY_SECONDS = 7200.0
+
 # 审批中继默认端口。装进 Claude Code settings 的那条 command hook 用它，
 # 改它之后必须重跑 hook_install，否则中继还在打旧端口（启动时会核对并报警）。
 HOOKS_DEFAULT_PORT = 48921
@@ -717,6 +723,10 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # 审批网关起不起来都不影响它（起不来时这本簿子永远是空的，
         # 等于"没有自伤失败"，正是没有审批时的正确表现）。
         self._gated = GatedFailureLog()
+        # P1b：已经"释放"过的审批 request_id → 首次见到它的时刻。
+        # 同一张卡只释放一次（snapshot 会留着已了结记录一小时）。
+        # 审批网关起不起来都不影响它（起不来时这本账永远是空的）。
+        self._gate_released: dict[str, float] = {}
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     # startup 用 async def、shutdown 用 def，刻意对齐官方 memo_reminder 的写法：
@@ -1187,6 +1197,53 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 event.session or "无", GATED_DEGRADED_WINDOW_SECONDS)
         return bool(mode)
 
+    def _released_gate_sessions(
+        self, still_blocked: set[tuple[str, str]]) -> set[tuple[str, str]]:
+        """本轮「审批挂起解除、且工具不会再有结果」的 (agent, session)。
+
+        P1b 收尾。判据就是 ``tool_did_not_run``——和 ``_record_gate_stopped``
+        同一条：到期没人点 / 回填被断开 / 用户点拒绝，三种情况下那个工具
+        调用都没跑。而到期按设计**不回填**（``approval.DECIDED_BY_EXPIRED``：
+        不拒绝、不回填、不记成"已拒绝"），所以那个 outcome 永远不会来。
+
+        于是每张没人点的卡到期后都会留下一个永远配不上 outcome 的
+        open_action，而挂起标记一解除它就早就过了 300 秒——下一轮必报一条
+        「有一步没有回包」，还把耗时写成一个夸大的数字（0.6.0 真机 §3：
+        12:33 的动作、12:42:53 到期、12:44:09 播报"执行了 10 分 46 秒"）。
+        ``tick(blocked=...)`` 挡得住挂着的期间，挡不住解除的那一秒，
+        所以要把这些会话交出去让 tracker 作废那些动作。
+
+        **幂等靠 request_id 记账**：snapshot() 按 retention 留着已了结记录，
+        不记账的话同一会话每分钟又被"释放"一次，每次都白扫一遍 open_actions。
+
+        ``still_blocked``：当前还挂着别的审批的会话要排除——它确实还有
+        一个正当被扣住的动作，等那张卡了结了再释放，别提前作废掉。
+        """
+        approval = self._approval
+        if approval is None:
+            return set()
+        now = time.time()
+        released: set[tuple[str, str]] = set()
+        for row in approval.snapshot():
+            if row.get("state") == "pending" or not row.get("tool_did_not_run"):
+                continue
+            request_id = str(row.get("request_id") or "")
+            if not request_id or request_id in self._gate_released:
+                continue
+            self._gate_released[request_id] = now
+            session = str(row.get("session_id") or "")
+            if not session:
+                # 后台/无会话场景：键匹配不上任何 tracker 桶，跳过。
+                # 猜一个 session 比不跳更糟（同 _approval_blocked_sessions）。
+                continue
+            agent = str(row.get("agent") or "") or AGENT_CLAUDE_CODE
+            released.add((agent, session))
+        # 记账跟着保留期走，别无限长。
+        for stale in [key for key, at in self._gate_released.items()
+                      if now - at > GATE_RELEASE_MEMORY_SECONDS]:
+            del self._gate_released[stale]
+        return released - still_blocked
+
     def _approval_blocked_sessions(self) -> set[tuple[str, str]]:
         """当前有审批挂在等人点的 (agent, session)。
 
@@ -1252,8 +1309,19 @@ class AgentDeskmatePlugin(NekoPluginBase):
         notices: list[Notice] = []
         for event in events:
             notices.extend(self._feed_tracker(event))
-        notices.extend(self._tracker.tick(time.time(),
-                                          self._approval_blocked_sessions()))
+        # P1b：审批挂起解除的那一刻，被扣住的那个 action 早就过了 300s。
+        # **必须先作废、再评估**——反了的话这一轮 tick 就把「有一步没有回包」
+        # 连同一个夸大的耗时发出去了，作废再来是马后炮。
+        blocked = self._approval_blocked_sessions()
+        dropped = self._tracker.release_gate(self._released_gate_sessions(blocked))
+        for (agent, session), count in sorted(dropped.items()):
+            # 这一行是"少播了一条"的唯一痕迹。静默的抑制等于没有抑制——
+            # 真机上出了一次"该报的没报"，排查时唯一能依靠的就是它。
+            self.logger.info(
+                "审批结束后作废 %d 个未闭环动作：%s 会话 %s"
+                "（工具没跑成，等不到结果，不报未回包）",
+                count, agent, session or "无")
+        notices.extend(self._tracker.tick(time.time(), blocked))
         # P1c(b)：同目录多会话一字不差的重复通知合成一条。
         # **跨批次**（真机验收 2026-11-24 测试 8 的根因：只合同一轮不够，
         # 6 个会话 3 秒内失败，通知时间各自 +120s，跨过轮询相位就分成 3 条）。

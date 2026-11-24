@@ -503,6 +503,31 @@ def _run_relay(args: list[str], stdin: bytes) -> tuple[int, str]:
     return proc.returncode, proc.stdout.decode("utf-8")
 
 
+# 子进程环境里必须剥掉的编码类变量。
+#
+# **这一条是 0.6.0 真机 P0' 的教训**：中继往 stdout 写中文时，
+# 那个流的编码是跟着 locale 走的（中文 Windows = cp936），Claude Code
+# 按 UTF-8 读就是乱码。而开发机 shell 里普遍有
+# ``PYTHONIOENCODING=utf-8``——它会把子进程的 stdout 强制成 UTF-8，
+# 于是**坏代码在本机输出和好代码逐字节相同**，测试永远绿。
+# 不剥掉它，这条回归测试就是一条永远绿的假测试。
+_ENCODING_ENV_KEYS = ("PYTHONIOENCODING", "PYTHONUTF8", "PYTHONLEGACYWINDOWSSTDIO")
+
+
+def _run_relay_in_a_clean_locale(args: list[str], stdin: bytes) -> tuple[int, bytes]:
+    """在「没有编码偏好事后」的环境里跑中继，返回**原始字节**。
+
+    刻意不 decode：要断言的就是字节本身，decode 一遍等于替被测对象
+    做了一个它没有的保证。
+    """
+    import os
+
+    env = {k: v for k, v in os.environ.items() if k not in _ENCODING_ENV_KEYS}
+    proc = subprocess.run([sys.executable, str(RELAY_SCRIPT), *args],
+                          input=stdin, capture_output=True, timeout=30, env=env)
+    return proc.returncode, proc.stdout
+
+
 def test_relay_and_gateway_agree_on_the_health_path() -> None:
     """中继探的路径必须是网关应答的那一个。
 
@@ -629,6 +654,109 @@ def test_relay_emits_empty_object_when_the_plugin_has_no_decision() -> None:
                 "cwd": "D:\\"}).encode())
         assert code == 0
         assert json.loads(out) == {}
+    finally:
+        gateway.stop()
+
+
+# ── P0'（2026-11-24 真机）：stdout 必须与编码无关 ─────────────────────────
+#
+# 现象：点「拒绝」后 Claude 收到的 tool_result 是
+#   ͬ��è���û��� N.E.K.O ����ȷ�ܾ���ε��á�
+# 原文应是「同桌猫：用户在 N.E.K.O 里明确拒绝了这次调用。不要换写法重试……」
+# 根因：json.dumps(..., ensure_ascii=False) + Windows 上跟着 locale 走的
+# stdout（中文系统 = cp936）+ Claude Code 按 UTF-8 读。
+#
+# **后果比"文案难看"严重**：模型看不懂"不要重试、停下来等用户"，
+# 转而自己排查——连发 6 次编码实验，然后去读 .claude/settings.json
+# 和插件 data 目录（含审计记录），其中 6 条被自动审查按低风险放行。
+# 采集方当场掐了会话。拒绝理由是"这次不让跑"的唯一载体，
+# 传成乱码等于这件事对方根本没听懂。
+
+
+def test_relay_output_is_pure_ascii_so_no_locale_can_mangle_it() -> None:
+    """纯 ASCII 是对编码不敏感的最强形状。
+
+    UTF-8 / GBK / latin-1 解同一串字节得到同一个字符串——
+    不依赖写方的 locale，也不依赖读方假设自己是哪种编码。
+
+    走一个 **gbk 编码的假 stdout**：那正是中文 Windows 上中继看到的流。
+    如果写出去的是非 ASCII，这里产出的就是 GBK 字节，而 Claude Code
+    按 UTF-8 读 → 0.6.0 真机上那串 ``ͬ��è���û���``。
+    """
+    import io
+
+    from plugin.plugins.agent_deskmate import hook_relay
+
+    buffer = io.BytesIO()
+    fake_stdout = io.TextIOWrapper(buffer, encoding="gbk", newline="")
+    original = hook_relay.sys.stdout
+    hook_relay.sys.stdout = fake_stdout
+    try:
+        hook_relay._emit({"decision": {"message": "同桌猫：用户明确拒绝了这次调用"}})
+    finally:
+        fake_stdout.flush()
+        hook_relay.sys.stdout = original
+
+    raw = buffer.getvalue()
+    assert raw, "stdout 是空的，这条断言就没有意义了"
+    assert raw.isascii(), (
+        f"stdout 含非 ASCII 字节，换台机器（locale 不是 UTF-8）就是乱码：{raw!r}")
+
+
+def test_a_chinese_deny_reason_survives_the_real_hook_round_trip() -> None:
+    """真链路：插件回一条中文拒绝理由 → 中继 → 原始字节 → 按 UTF-8 解。
+
+    **走的是真 ApprovalGateway + 真中继子进程**，不是直接调 ``_emit``：
+    要钉的是"从 approval 到 Claude Code  stdin"这整段，任何一段自己编一个
+    编码假设都能让测试绿下去。子进程环境刻意剥掉 ``PYTHONIOENCODING``——
+    那是 Claude Code 起 hook 时的真实环境，也是本机测试从来没抓到它的原因。
+    """
+    from plugin.plugins.agent_deskmate.approval import ApprovalGateway
+
+    class _Log:
+        def info(self, *_a):
+            return
+
+        def warning(self, *_a):
+            return
+
+        def error(self, *_a):
+            return
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = int(sock.getsockname()[1])
+    gateway = ApprovalGateway(_Log(), port=port, timeout_seconds=30.0)
+    assert gateway.start()
+    try:
+        import threading
+
+        result: dict[str, tuple[int, bytes]] = {}
+
+        def _post() -> None:
+            result["response"] = _run_relay_in_a_clean_locale(
+                [str(port)], json.dumps({
+                    "hook_event_name": "PermissionRequest", "session_id": "s",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "rm -f 桌.txt"},
+                    "cwd": "D:\\"}, ensure_ascii=False).encode("utf-8"))
+
+        thread = threading.Thread(target=_post, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and gateway.undecided_count() == 0:
+            time.sleep(0.01)
+        pending = gateway.take_new()[0]
+        gateway.resolve(pending.request.request_id, "deny", decided_by="user")
+        thread.join(timeout=20)
+
+        code, raw = result["response"]
+        assert code == 0
+        # Claude Code 那一侧：拿到字节，按 UTF-8 解，再当 JSON 解析。
+        body = json.loads(raw.decode("utf-8"))
+        reason = body["hookSpecificOutput"]["decision"]["message"]
+        assert "同桌猫" in reason, f"拒绝理由没活过来：{reason!r}"
+        assert "ͬ" not in reason, "这就是真机上那串乱码的开头"
     finally:
         gateway.stop()
 

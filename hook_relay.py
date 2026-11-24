@@ -222,8 +222,25 @@ MAX_HEALTH_BYTES = 64 * 1024
 
 
 def _emit(payload: dict) -> None:
-    """往 stdout 写一行 JSON。写不出去就只能当没有决定。"""
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    """往 stdout 写一行 JSON。写不出去就只能当没有决定。
+
+    **输出必须保持纯 ASCII**（``ensure_ascii=True``，中文变 ``\\uXXXX``）。
+    2026-11-24 真机 P0'：这里原来写 ``ensure_ascii=False``，而这个 stdout
+    的编码是跟着 locale 走的（中文 Windows = cp936/GBK），中文被写成 GBK
+    字节；Claude Code 按 UTF-8 读，拒绝理由就变成
+    ``ͬ��è���û���`` 这种乱码。后果不是"难看"：模型看不懂
+    "不要换写法重试、停下来等用户"，转而自己排查宿主和插件内部
+    （真机实录见 0.6.0 验收反馈 §2.4）。
+
+    **本地测试为什么一次都没抓到**：开发机 shell 里有
+    ``PYTHONIOENCODING=utf-8``，子进程的 stdout 就是 UTF-8，两种写法
+    输出逐字节相同。剥掉那个变量才复现——所以回归测试也必须剥掉它，
+    否则是一条永远绿的假测试（见 tests/test_hooksetup.py 的编码用例）。
+
+    纯 ASCII 是对编码不敏感的最强形状：UTF-8 / GBK / latin-1 解同一串
+    字节得到同一个字符串，不依赖写方 locale、也不依赖读方假设。
+    """
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True))
     sys.stdout.flush()
 
 
@@ -365,7 +382,12 @@ def _forward(port: str, body: bytes) -> None:
         # 已经打过 warning 了。**不把原始应答交出去**——那正是要防的那件事。
         _emit({})
         return
-    sys.stdout.write(json.dumps(decision, ensure_ascii=False))
+    # 同 ``_emit``：**纯 ASCII**。拒绝理由整段走这一行出去，
+    # 写成 locale 编码（中文 Windows = GBK）的话，Claude Code 按 UTF-8
+    # 读出来就是乱码，而拒绝理由是"这次不让跑"的唯一载体——
+    # 对方看不懂它就会自己瞎猜（0.6.0 真机：连发 6 次编码实验 +
+    # 去读宿主和插件内部目录）。写 ASCII 与 locale 彻底无关。
+    sys.stdout.write(json.dumps(decision, ensure_ascii=True))
     sys.stdout.flush()
 
 

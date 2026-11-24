@@ -1398,7 +1398,7 @@ def explain_request(*, tool_name: str, tool_summary: str,
         f"允许后 Claude Code 继续执行；拒绝则中止这次调用"
         f"（不会掐掉整个回合）。{_minutes(timeout_seconds)}后仍无人决定，"
         "这条视为未决定，会交还给 Claude Code 原本的确认流程——插件不代你判断，"
-        "也不把「一直没点」记成拒绝。无头会话（``-p``）不会弹确认框，"
+        "也不把「一直没点」记成拒绝。无头会话（-p）不会弹确认框，"
         "那种情况下等于不执行。")
 
     short_session = (session_id or "")[:8]

@@ -492,6 +492,106 @@ def test_the_block_key_matches_the_tracker_bucket_key() -> None:
     assert tracker.tick(T0 + 301, [("some-agent", "s1")]) == []
 
 
+# ── 5d. 闸门解除：作废被扣住的动作，别把旧账翻出来 ────────────────────────
+#
+# 2026-11-24 真机（0.6.0 验收 §3）：卡片 12:33 弹出、12:42:53 到期，
+# 12:44:09 宿主张口就是一条「有一步没有回包 / Bash 执行了 10 分 46 秒」。
+# 那个动作 12:33 就发出去了，没有结果是因为**插件扣着它等审批**。
+# 而到期按设计不回填，所以那个 outcome 永远不会来——
+# 每一张没人点的卡，到期后都必然产出这么一条假警报。
+
+
+def test_a_released_gate_does_not_report_the_action_it_held() -> None:
+    """挂起解除的那一刻，被扣住的动作不许变成「有一步没有回包」。
+
+    ``tick(blocked=...)`` 只挡得住挂着的期间：挂起标记一消失，
+    早就过了 300s 的旧动作立刻被判成"它可能卡住了"，还把耗时写成
+    一个夸大的数字。所以解除时要作废它。
+    """
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0))
+    key = _blocked_key(tracker)
+    assert tracker.tick(T0 + 300, [key]) == []          # 挂着，静音
+    tracker.release_gate([key])
+    assert tracker.tick(T0 + 700, [key]) == [], "旧账被翻出来了"
+
+
+def test_releasing_before_ticking_is_what_makes_it_work() -> None:
+    """顺序钉死：先作废再评估。
+
+    反了的话这一轮 tick 先把假警报连同一个夸大的耗时发出去，
+    作废再来已经是马后炮——调用方看一眼这条就该知道怎么排。
+    """
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0))
+    # 故意不调 release_gate——"忘了先释放"就是这个结果。
+    notices = tracker.tick(T0 + 700, [])
+    assert len(notices) == 1 and "没有回包" in notices[0].headline
+
+
+def test_releasing_one_session_leaves_the_others_alone() -> None:
+    """同目录多会话同时挂着卡是常态，只作废解除的那几个。"""
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0, session="s1"))
+    tracker.feed(_action(at=T0, session="s2"))
+    tracker.release_gate([_blocked_key(tracker, session="s1")])
+    notices = tracker.tick(T0 + 700, [])
+    assert [n.session for n in notices] == ["s2"]
+
+
+def test_releasing_keeps_the_session_usable_for_what_comes_next() -> None:
+    """作废不是把会话扔掉：之后新来的动作照旧计时、照旧能报。
+
+    否则"审批跑过一次的会话从此不再报未回包"是用漏报换精度。
+    """
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0))
+    key = _blocked_key(tracker)
+    tracker.release_gate([key])
+    tracker.feed(_action(at=T0 + 800, action_id="tu_2"))
+    notices = tracker.tick(T0 + 1100, [])
+    assert len(notices) == 1
+    assert notices[0].session == "s1"
+
+
+def test_an_outcome_arriving_after_the_release_is_still_processed() -> None:
+    """释放之后结果才落盘（回填慢了一拍）——不许当成没发生过。
+
+    这是"整会话作废"唯一的风险点，所以单独钉一条：配不上 action 时
+    ``_on_outcome`` 走另一条分支，成功照样清零、失败照样进确认窗口。
+    """
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0))
+    key = _blocked_key(tracker)
+    tracker.release_gate([key])
+    tracker.feed(_fail(at=T0 + 400))
+    notices = tracker.tick(T0 + 520, [])
+    assert len(notices) == 1 and "出事了" in notices[0].headline
+
+
+def test_releasing_a_session_with_nothing_open_is_a_no_op() -> None:
+    """没动作可作废就安静返回，别为这件事发声或报错。"""
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0))
+    tracker.feed(_ok(at=T0 + 10))
+    key = _blocked_key(tracker)
+    assert tracker.release_gate([key]) == {}
+    assert tracker.tick(T0 + 700, []) == []
+
+
+def test_release_reports_what_it_dropped() -> None:
+    """返回值是各会话作废数——桥要靠它记日志。
+
+    静默的抑制等于没有抑制：真机上出了一次"该报的没报"，
+    排查时唯一能依靠的就是那一行。
+    """
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0, action_id="tu_1"))
+    tracker.feed(_action(at=T0 + 1, action_id="tu_2"))
+    key = _blocked_key(tracker)
+    assert tracker.release_gate([key]) == {key: 2}
+
+
 # ── 5c. 自伤失败：闸门造成的失败不记到 Agent 头上 ────────────────────────
 #
 # 2026-11-24 真机：审批 570s 到期 → Claude 收到 tool_result is_error=true

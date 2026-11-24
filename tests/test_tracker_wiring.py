@@ -156,6 +156,7 @@ class _Host:
     _sync_merge_window = AgentDeskmatePlugin._sync_merge_window
     _feed_tracker = AgentDeskmatePlugin._feed_tracker
     _approval_blocked_sessions = AgentDeskmatePlugin._approval_blocked_sessions
+    _released_gate_sessions = AgentDeskmatePlugin._released_gate_sessions
     _record_gate_stopped = AgentDeskmatePlugin._record_gate_stopped
     _is_gate_caused = AgentDeskmatePlugin._is_gate_caused
 
@@ -178,6 +179,8 @@ class _Host:
         self._approval = None
         # P1c：自伤失败登记簿。真插件 _reset_watch_state 建，这里手搭一份。
         self._gated = GatedFailureLog()
+        # P1b：已经释放过的审批 request_id。同上，真插件建、这里手搭。
+        self._gate_released: dict[str, float] = {}
         # P1c(b)：同目录通知的跨批次合并器。默认窗口 20s 会把通知压到下一轮，
         # 所以**除 §H 之外的所有测试都通过 config() 关掉它**——那些测试要断言
         # 的是别的东西（状态机、闸门、静音），不该被合并窗口拖着。
@@ -499,9 +502,10 @@ def _settled(session: str, agent: str = AGENT) -> dict:
 
 
 def _gate_stopped(session: str, *, tool_use_id: str = "tu_1",
-                  tool_name: str = "Bash") -> dict:
+                  tool_name: str = "Bash", request_id: str = "") -> dict:
     """一条「工具没跑成」的已了结审批（到期 / 拒绝 / 回填断开）。"""
-    return {"session_id": session, "agent": AGENT, "state": "settled",
+    return {"request_id": request_id or f"req-{session}",
+            "session_id": session, "agent": AGENT, "state": "settled",
             "tool_use_id": tool_use_id, "tool_did_not_run": True,
             "tool_name": tool_name}
 
@@ -581,6 +585,91 @@ def test_the_action_survives_the_block_and_reports_afterwards() -> None:
     host.poll()
     assert len(host.pushed) == 1
     assert "没有回包" in host.pushed[0]["parts"][0]["text"]
+
+
+# ── E2. P1b 收尾：挂起解除时作废被扣住的动作 ─────────────────────────────
+#
+# 2026-11-24 真机（0.6.0 验收 §3）：卡片 12:33 弹出、12:42:53 到期，
+# 12:44:09 宿主张口就是一条「有一步没有回包 / Bash 执行了 10 分 46 秒」。
+# 那个动作 12:33 就发出去了，没有结果是因为**插件扣着它等审批**。
+# 而到期按设计不回填（approval.DECIDED_BY_EXPIRED），那个 outcome
+# 永远不会来——**每一张没人点的卡，到期后都必然产出这么一条假警报**。
+#
+# 上面 E 组钉的是"挂着的时候别评估"；这一组钉的是"解除的那一秒"——
+# 挂起标记一消失，早就过了 300s 的旧动作立刻被判成"它可能卡住了"，
+# 还把耗时写成一个夸大的数字。用户越忙没点，通知越多、越像 Agent 坏了。
+
+
+def test_an_expired_card_does_not_become_a_stuck_action_report() -> None:
+    """到期不回填 → 那个动作作废，不翻旧账。
+
+    这条同时钉住**顺序**：如果 ``release_gate`` 排在 ``tick`` 后面，
+    假警报这一轮就已经进 jobs 了，作废再来是马后炮。
+    """
+    at = _now() - 700
+    host = _Host([_action_step(at, session="s1", action_id="tu_1")])
+    host._approval = _FakeApproval([_gate_stopped("s1")])             # noqa: SLF001
+    host.poll()
+    assert host.pushed == [], "到期把旧动作翻成「未回包」了"
+
+
+def test_an_allowed_gate_releases_nothing() -> None:
+    """工具真的跑了 → 它的结果在路上，不许作废。
+
+    判据就是 ``tool_did_not_run``，和 ``_record_gate_stopped`` 同一条：
+    允许之后工具跑了，它的失败是**真实**失败。
+    """
+    host = _Host()
+    host._approval = _FakeApproval([_gate_allowed("s1")])             # noqa: SLF001
+    assert host._released_gate_sessions(set()) == set()               # noqa: SLF001
+
+
+def test_a_session_still_holding_another_card_is_not_released() -> None:
+    """它还挂着另一张卡 → 那个动作确实正当被扣着，等那张了结再释放。
+
+    提前作废会把第二张卡放行的工具结果也一起作废掉。
+    """
+    host = _Host()
+    host._approval = _FakeApproval([_gate_stopped("s1"), _pending("s1")])  # noqa: SLF001
+    still = host._approval_blocked_sessions()                         # noqa: SLF001
+    assert still == {(AGENT, "s1")}
+    assert host._released_gate_sessions(still) == set()               # noqa: SLF001
+
+
+def test_the_same_card_is_only_released_once() -> None:
+    """幂等靠 request_id：snapshot 会留着已了结记录一小时。
+
+    不记账的话同一会话每分钟又被"释放"一次，每次都白扫一遍
+    open_actions——功能上没错，但日志会吵，而且那是没设计的重复。
+    """
+    host = _Host()
+    rows = [_gate_stopped("s1", request_id="req-1")]
+    host._approval = _FakeApproval(rows)                              # noqa: SLF001
+    assert host._released_gate_sessions(set()) == {(AGENT, "s1")}     # noqa: SLF001
+    assert host._released_gate_sessions(set()) == set()               # noqa: SLF001
+    assert list(host._gate_released) == ["req-1"]                     # noqa: SLF001
+
+
+def test_a_row_without_a_request_id_is_not_released() -> None:
+    """没有 request_id 就无法判重，宁可不释放也不每分钟释放一次。"""
+    host = _Host()
+    row = _gate_stopped("s1")
+    del row["request_id"]
+    host._approval = _FakeApproval([row])                             # noqa: SLF001
+    assert host._released_gate_sessions(set()) == set()               # noqa: SLF001
+
+
+def test_the_release_leaves_a_log_line() -> None:
+    """"少播了一条"必须有痕迹。
+
+    静默的抑制等于没有抑制：真机上出了一次"该报的没报"，
+    排查时唯一能依靠的就是这一行。
+    """
+    at = _now() - 700
+    host = _Host([_action_step(at, session="s1", action_id="tu_1")])
+    host._approval = _FakeApproval([_gate_stopped("s1")])             # noqa: SLF001
+    host.poll()
+    assert any("作废" in line for line in host.logger.lines), host.logger.lines
 
 
 # ── F. P1c：闸门造成的失败不点亮 🔴 ─────────────────────────────────────

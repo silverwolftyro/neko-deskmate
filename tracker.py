@@ -200,6 +200,54 @@ class ProgressTracker:
             notices.extend(self._tick_one(state, now, blocked))
         return notices
 
+    def release_gate(self, keys: Container[tuple[str, str]]) -> dict[tuple[str, str], int]:
+        """闸门挂起解除：作废这些会话里仍未闭环的动作。返回各会话作废数。
+
+        2026-11-24 真机（0.6.0 验收 §3）：卡片 12:33 弹出、12:42:53 到期，
+        12:44:09 宿主张口就是一条「有一步没有回包 / Bash 执行了 10 分 46 秒」。
+        那个动作 12:33 就发出去了，**没有结果是因为我们扣着它等审批**，
+        不是 Agent 卡住。
+
+        而到期按设计**不回填**（``approval.DECIDED_BY_EXPIRED``：不拒绝、
+        不回填、不记成"已拒绝"），所以那个 outcome 永远不会来。
+        也就是说：**每一张没人点的卡，到期后都必然产出这么一条假警报**，
+        还把耗时写成一个夸大的数字。用户越忙没点，通知越多、越像 Agent
+        坏了——正是这个插件最怕的警报疲劳。
+
+        ``tick(blocked=...)`` 只挡得住"挂着的时候"，挡不住解除的那一秒：
+        挂起标记一消失，早就过了 ``unclosed_action_seconds`` 的旧动作
+        立刻被判成"它可能卡住了"。所以解除时要**作废**这些动作——
+        工具没跑成就没有结果可等，继续挂在 ``open_actions`` 里只会变成
+        一条指错方向的播报。
+
+        **作废而不是把时钟推到当下**：推时钟能让这一轮不报，但 300 秒后
+        照样报一条，文案依旧是"它可能卡住了"，只是晚了一点的假警报；
+        而无头会话（``-p``）永远等不到原生确认框，那个 outcome 不会来。
+
+        **为什么可以整会话作废**：Agent 被 hook 挡住时发不出新的工具调用，
+        所以这一刻会话里开着的行为只有三种——被扣住的那个、同一批并行
+        的兄弟、以及结果已经在路上的那个。前两种没有合法结果可等，
+        第三种即便被作废，它的 outcome 到达时 ``_on_outcome`` 走
+        "配不上"分支照旧处理（成功清零、失败进确认窗口），不会漏。
+
+        **必须在 ``tick`` 之前调**：反了的话这一轮 tick 先把假警报发出去，
+        作废再来已经是马后炮。
+        """
+        dropped: dict[tuple[str, str], int] = {}
+        for state in self._sessions.values():
+            if state.key() not in keys:
+                continue
+            count = 0
+            for action_id in list(state.open_actions):
+                del state.open_actions[action_id]
+                # 和 _on_outcome 配对成功时保持一致：两个结构一起收，
+                # 别留下一个再也配不上的孤儿记号。
+                state.unclosed_reported.discard(action_id)
+                count += 1
+            if count:
+                dropped[state.key()] = count
+        return dropped
+
     # ── 内部 ─────────────────────────────────────────────────────────────
 
     def _tick_one(self, state: SessionState, now: float,
