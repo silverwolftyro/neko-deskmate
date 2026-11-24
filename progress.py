@@ -360,7 +360,7 @@ def signal_from_event(event: Any, *, self_inflicted: bool = False) -> Signal | N
             at=at,
             action_id=_optional(getattr(event, "tool_use_id", None)),
             ok=not bool(is_error),
-            kind=_clip(tool),
+            kind=_outcome_kind(event),
             self_inflicted=bool(self_inflicted),
         )
 
@@ -382,6 +382,39 @@ _ROLE_FOR_EVENT = {
     "error": Role.OUTCOME,
     "tool_result": Role.OUTCOME,
 }
+
+# ``kind`` 为空时按来源给的类别壳。
+#
+# 为什么需要它（2026-11-24 真机验收 §4.4）：屏幕原文是
+# 「merge6 出事了 / **有一步** 执行失败，它没自己恢复」和
+# 「appr 在兜圈子 / **同一步** 连续失败 3 次」——而真实原因是网关 502。
+# 文案没错，但用户读不出"是什么在执行"。
+#
+# 空 kind 的 outcome 只有两种来源，**两种都不是"某一步"**：
+#   * ``proxy_request_logs`` —— 网关账本的一行 = 一次模型/上游请求；
+#   * ``system`` —— 转录里的 system/level=error 记录 = 会话级 API 报错。
+#
+# **按来源给，不按内容猜**：``summary`` 里就有 "api_error（502）" 这句文本，
+# 但契约层不装内容（隐私红线），而且那句文本的形状随时会变——按它分类，
+# 上游一改文案分类就静默失效。
+KIND_BY_SOURCE_TYPE = {
+    "proxy_request_logs": "模型请求",
+    "system": "模型请求",
+}
+
+
+def _outcome_kind(event: Any) -> str:
+    """outcome 的类别名。工具名优先，空了按来源给壳（见 KIND_BY_SOURCE_TYPE）。
+
+    认不出来的来源**留空**，让 tracker 用「有一步」兜底——那是最后的诚实：
+    我们确实不知道是哪一类。填个猜的名字比空着更坏。
+    """
+    tool = getattr(event, "tool", None) or ""
+    clipped = _clip(tool)
+    if clipped:
+        return clipped
+    source = str(getattr(event, "source_type", "") or "").strip().lower()
+    return KIND_BY_SOURCE_TYPE.get(source, "")
 
 
 def _epoch(iso: str) -> float | None:

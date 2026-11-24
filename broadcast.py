@@ -459,19 +459,40 @@ def _light_key(light: object) -> str:
 # 合并符合「精度 > 召回」。
 MERGE_SUFFIX = "（同目录另有 {count} 个会话）"
 
+# 跨批次合并的窗口（秒）。**取值依据写在这里，不许拍脑袋**：
+# 三类 OUTCOME 通知本来就已经晚于设计——「出事了」≥ failure_confirm_seconds(120s)、
+# 「未回包」≥ unclosed_action_seconds(300s)、「兜圈子」虽即时但只在同一类别
+# 连续失败 3 次后触发。所以再压 20s 的相对代价是 7%~17%，
+# 换来的是"同目录多个会话同时失败只响一次"。
+# 填 0 = 不延迟（通知当轮就发），但**同一轮内的合并仍然生效**——
+# 那是 0.5.0 真机验收确认过的行为（同一个 3 秒轮询批次里落地的通知
+# 本来就是同时的，合掉它们没有代价）。
+NOTICE_MERGE_SECONDS = 20.0
+
+
+def merge_key(notice: Notice) -> tuple[str, str] | None:
+    """这条通知该进哪个合并桶。**None = 不参与合并。**
+
+    两个条件，少一个都不行：
+      * **只合 OUTCOME**（出事了 / 没有回包 / 在兜圈子）——四角色里唯一会在
+        多会话间一字不差重复的一类。WAITING 指名的是"哪个会话在等你"，
+        合起来就答不了这个问题了；
+      * **只合真有工作目录的**。``Notice.who`` 在拿不到目录时会退回 agent 名，
+        而 ``claude-code`` 是**所有**无目录会话的共同退回值——按它合并等于把
+        一堆互不相干的会话揉成一条，那是用漏报换简洁，而且「同目录另有 N 个
+        会话」在没有目录时是一句假话。所以判据是 ``notice.workspace``，
+        不是 ``notice.who``。
+    """
+    if notice.role != Role.OUTCOME or not notice.workspace:
+        return None
+    return (notice.workspace, notice.kind)
+
 
 def coalesce_same_workspace(notices: list[Notice]) -> list[Notice]:
     """同一工作目录、同一工具类别的通知合成一条，其余折进第二行的尾巴。
 
-    **只合 OUTCOME**（出事了 / 没有回包 / 在兜圈子）：它们是唯一会
-    在多会话间一字不差重复的一类。WAITING 指名的是"哪个会话在等你"，
-    合起来就答不了这个问题了。
-
-    **只合真有工作目录的**。``Notice.who`` 在拿不到目录时会退回 agent 名，
-    而 ``claude-code`` 是**所有**无目录会话的共同退回值——按它合并等于把
-    一堆互不相干的会话揉成一条，那是用漏报换简洁，而且「同目录另有 N 个
-    会话」在没有目录时是一句假话。所以判据是 ``notice.workspace``，
-    不是 ``notice.who``。
+    合并规则只有这一份真相（``merge_key`` + ``_merge_detail``），
+    ``NoticeMerger`` 复用它，只额外加"时间"这一个维度。
 
     返回新列表，不改入参（tracker 那边每轮都会重建 notices，但函数签名
     不该暗示"我会动你的数据"）。
@@ -482,10 +503,10 @@ def coalesce_same_workspace(notices: list[Notice]) -> list[Notice]:
     # 于是"合并"静默地什么都没做——通知照旧三条，一条不少。
     index: dict[tuple[str, str], int] = {}
     for notice in notices:
-        if notice.role != Role.OUTCOME or not notice.workspace:
+        bucket = merge_key(notice)
+        if bucket is None:
             order.append(notice)
             continue
-        bucket = (notice.workspace, notice.kind)
         position = index.get(bucket)
         if position is None:
             index[bucket] = len(order)
@@ -518,6 +539,90 @@ def _merged_count(detail: str) -> int:
 
 
 _MERGE_TAIL = re.compile(r"（同目录另有 (?P<count>\d+) 个会话）\s*$")
+
+
+class NoticeMerger:
+    """同目录通知的**跨批次**合并器。
+
+    第一版只有 ``coalesce_same_workspace``，它在 ``_poll_once`` 里对**本轮**
+    notices 合并。真机验收（2026-11-24 测试 8）证明这不够：6 个会话 3 秒内
+    全部失败，而「出事了」的播出时间是各自首次失败 +120s，只要跨过 3 秒轮询
+    相位就落进不同批次 → 屏幕收到 **3 条**而不是 1 条（7 条失败按 4/2/1 分组）。
+
+    **为什么必须延迟，而不能"把后来那条折进先前那条"**：已经发出去的聊天
+    消息没有编辑入口——``push_message`` 不返回可改的消息 id。所以计数在物理上
+    无处可去，只能等窗口关闭一起发。真机验收（2026-11-24）在"延迟带数量"和
+    "立即不带数量"之间选了前者，代价是最晚一条晚一个窗口。
+
+    **实现上刻意复用 ``coalesce_same_workspace``**：合并规则只有一份真相，
+    这个类只负责"时间"这一个维度。规则写在两处的后果，就是下次改文案时
+    只改到一处——而另一处静默地留着旧文案。
+    """
+
+    def __init__(self, window: float = NOTICE_MERGE_SECONDS) -> None:
+        self._window = max(0.0, float(window))
+        # 桶 → (首次收入时刻, 该桶累计的通知)。存"首次收入时刻"而不是到期时刻，
+        # 这样 set_window 改窗口时能重算所有到期时间——否则用户把窗口调成 0，
+        # 也救不回已经压在手里的那几条（它们会按旧窗口再等一轮）。
+        self._groups: dict[tuple[str, str], tuple[float, list[Notice]]] = {}
+
+    def __len__(self) -> int:
+        return sum(len(group) for _, group in self._groups.values())
+
+    def set_window(self, window: float) -> None:
+        """改窗口。**已经压在手里的条目按新窗口重算到期时间**——
+        调成 0 应该立刻恢复"当轮就发"，而不是让那几条再等一个旧窗口。
+
+        注意 0 **不等于"不合并"**：同一轮批次内的合并照旧（见
+        ``NOTICE_MERGE_SECONDS`` 的注释）。要的是"不延迟"，不是"不合"。
+        """
+        self._window = max(0.0, float(window))
+
+    def offer(self, notices: list[Notice], now: float) -> list[Notice]:
+        """收入一批通知，返回**此刻该发出去**的那些。
+
+        **先把过期组放出去，再收新通知**。顺序反了会出这种事：轮询卡了
+        一会（某个观测源抛异常被兜住、宿主忙），一个早就过了窗口的组还压在
+        手里，新来的通知挤进它 → 那条新通知被旧窗口拖着一起晚发。
+        生产里轮询是 3 秒，最多晚 3 秒；但这个顺序不该靠"轮询够勤"来保证。
+
+        不参与合并的（``merge_key`` 为 None）当轮直接返回，不进桶——
+        「在等你」指名的是哪个会话，压它一个窗口没有任何好处。
+        """
+        ready = self._release(now)
+        for notice in notices:
+            bucket = merge_key(notice)
+            if bucket is None:
+                ready.append(notice)
+                continue
+            held = self._groups.get(bucket)
+            if held is None:
+                self._groups[bucket] = (now, [notice])
+            else:
+                held[1].append(notice)
+        # 再放一次：刚收入的也可能立刻就到期（窗口 = 0 时全部如此）。
+        ready.extend(self._release(now))
+        return ready
+
+    def _release(self, now: float) -> list[Notice]:
+        """把到期组合成一条发出去。按首次收入时间排序，先攒的先发。"""
+        ready: list[Notice] = []
+        for bucket in sorted(self._groups, key=lambda b: self._groups[b][0]):
+            first_at, group = self._groups[bucket]
+            if first_at + self._window > now:
+                continue
+            ready.extend(coalesce_same_workspace(group))
+            del self._groups[bucket]
+        return ready
+
+    def flush(self, now: float) -> list[Notice]:
+        """不等窗口了，全部发出。**停机/重载时调**——把用户的通知吞在手里
+        比晚发严重得多（这个项目的一条硬规矩：一条都不许丢）。"""
+        ready: list[Notice] = []
+        for bucket in sorted(self._groups, key=lambda b: self._groups[b][0]):
+            ready.extend(coalesce_same_workspace(self._groups[bucket][1]))
+        self._groups = {}
+        return ready
 
 
 def broadcast_notice(push: Callable[..., dict], notice: Notice, *, source: str,

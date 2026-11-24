@@ -11,7 +11,9 @@ from __future__ import annotations
 import pytest
 
 from plugin.plugins.agent_deskmate.broadcast import (
+    NOTICE_MERGE_SECONDS,
     Broadcaster,
+    NoticeMerger,
     coalesce_same_workspace,
     for_log,
     priority_for,
@@ -724,3 +726,159 @@ def test_the_input_list_is_not_mutated() -> None:
 def test_a_single_notice_is_returned_untouched() -> None:
     only = _notice(session="s1")
     assert coalesce_same_workspace([only]) == [only]
+
+
+# ── NoticeMerger：跨批次合并（P1c(b)，真机验收 2026-11-24 测试 8 的根因）──
+#
+# 第一版只合同一轮。真机实测：6 个会话 3 秒内全部失败，而出事了的播出时间是
+# 各自首次失败 +120s，跨过 3 秒轮询相位就落进不同批次 → 屏幕收到 3 条。
+# 这里钉住"跨批次"这一个维度。
+
+class _Clock:
+    """假时钟。``offer`` 的 now 是判断的唯一依据，不可注入就等于没法测窗口。"""
+
+    def __init__(self, start: float = 1_700_000_000.0) -> None:
+        self.now = start
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_notices_in_the_same_batch_still_merge() -> None:
+    """同一轮里的行为不能因为加了时间维度就退化。"""
+    merger = NoticeMerger(window=20.0)
+    clock = _Clock()
+    ready = merger.offer([_notice(session="s1"), _notice(session="s2")], clock.now)
+    assert ready == []                       # 窗口没到，压着
+    clock.advance(20.0)
+    assert len(merger.offer([], clock.now)) == 1
+
+
+def test_notices_in_different_batches_merge_too() -> None:
+    """**这一条是测试 8 的根因。** 两个会话的失败落在不同轮询批次，
+    间隔只有 3 秒（轮询周期），也必须合成一条。"""
+    merger = NoticeMerger(window=20.0)
+    clock = _Clock()
+    assert merger.offer([_notice(session="s1")], clock.now) == []
+    clock.advance(3.0)                        # 下一轮轮询
+    assert merger.offer([_notice(session="s2")], clock.now) == []
+    clock.advance(17.0)                       # 窗口到期
+    ready = merger.offer([], clock.now)
+    assert len(ready) == 1
+    assert ready[0].detail.endswith("（同目录另有 1 个会话）")
+
+
+def test_the_count_accumulates_across_batches() -> None:
+    """跨批次也要续号，不是每个批次各起一个计数器。"""
+    merger = NoticeMerger(window=20.0)
+    clock = _Clock()
+    merger.offer([_notice(session="s1")], clock.now)
+    for step in range(2, 5):
+        clock.advance(3.0)
+        merger.offer([_notice(session=f"s{step}")], clock.now)
+    clock.advance(20.0)
+    ready = merger.offer([], clock.now)
+    assert len(ready) == 1
+    assert ready[0].detail.endswith("（同目录另有 3 个会话）")
+
+
+def test_the_window_is_measured_from_the_first_notice() -> None:
+    """窗口从**首次收入**算，不是每条各算一次——否则第 5 条会把到期时间
+    无限往后推，这批通知永远发不出去。"""
+    merger = NoticeMerger(window=20.0)
+    clock = _Clock()
+    merger.offer([_notice(session="s1")], clock.now)
+    for _ in range(10):
+        clock.advance(3.0)
+        merger.offer([_notice(session="sx")], clock.now)
+        assert merger.offer([], clock.now) == []      # 一直压着
+    clock.advance(20.0)
+    assert len(merger.offer([], clock.now)) == 1
+
+
+def test_a_notice_outside_the_window_starts_a_new_group() -> None:
+    """超过窗口的第二次失败是**新的一批**，该单独播一条——
+    合成一条等于把两次独立事故说成一次。"""
+    merger = NoticeMerger(window=20.0)
+    clock = _Clock()
+    merger.offer([_notice(session="s1")], clock.now)
+    clock.advance(21.0)
+    assert len(merger.offer([_notice(session="s2")], clock.now)) == 1   # 第一批到期
+    clock.advance(20.0)
+    assert len(merger.offer([], clock.now)) == 1                        # 第二批到期
+
+
+def test_a_zero_window_means_no_delay_but_same_batch_merging_survives() -> None:
+    """``notice_merge_seconds=0`` = 不延迟，**不是不合并**。
+
+    同一轮批次内的合并照旧——那是 0.5.0 真机验收确认过的行为（同一个 3 秒
+    轮询批次里落地的通知本来就是同时的，合掉它们没有代价）。
+    测试里大量用 0：要的是"当轮就看到通知"，不是"关掉合并"。
+    """
+    merger = NoticeMerger(window=0.0)
+    clock = _Clock()
+    ready = merger.offer([_notice(session="s1"), _notice(session="s2")],
+                         clock.now)
+    assert len(ready) == 1
+    assert ready[0].detail.endswith("（同目录另有 1 个会话）")
+    assert len(merger) == 0                       # 没有压在手里的
+
+
+def test_setting_the_window_to_zero_releases_what_is_held() -> None:
+    """调成 0 要立刻恢复"当轮就发"，而不是让压着的几条再等一个旧窗口。"""
+    merger = NoticeMerger(window=20.0)
+    clock = _Clock()
+    merger.offer([_notice(session="s1")], clock.now)
+    merger.set_window(0.0)
+    ready = merger.offer([], clock.now)
+    assert len(ready) == 1
+    assert "另有" not in ready[0].detail
+
+
+def test_unmergeable_notices_are_never_held() -> None:
+    """WAITING 指名的是哪个会话，压它一个窗口没有任何好处；
+    没有工作目录的也当轮直接过（``who`` 会退回 agent 名）。"""
+    merger = NoticeMerger(window=20.0)
+    clock = _Clock()
+    ready = merger.offer([
+        _notice(session="s1", role=Role.WAITING, detail="等「允许」"),
+        _notice(session="s2", workspace=None),
+    ], clock.now)
+    assert len(ready) == 2
+    assert len(merger) == 0
+
+
+def test_flush_releases_everything_without_waiting() -> None:
+    """停机/重载时不许把用户的通知吞在手里——这个项目的硬规矩是
+    "一条都不许丢"，而这里是唯一一个会丢的地方。"""
+    merger = NoticeMerger(window=20.0)
+    clock = _Clock()
+    merger.offer([_notice(session="s1"), _notice(session="s2")], clock.now)
+    assert len(merger.flush(clock.now)) == 1
+    assert len(merger) == 0
+    assert merger.offer([], clock.now) == []
+
+
+def test_different_directories_are_never_merged() -> None:
+    """合并不是为了少说话，是为了不说重复的话。"""
+    merger = NoticeMerger(window=20.0)
+    clock = _Clock()
+    merger.offer([_notice(session="s1", workspace=r"D:\proj"),
+                  _notice(session="s2", workspace=r"D:\other")], clock.now)
+    clock.advance(20.0)
+    assert len(merger.offer([], clock.now)) == 2
+
+
+def test_different_kinds_are_never_merged() -> None:
+    """同目录里 Bash 挂了、WebFetch 也挂了——那是两件事，
+    合成一条就丢了"两种东西同时坏"这个信息。"""
+    merger = NoticeMerger(window=20.0)
+    clock = _Clock()
+    merger.offer([_notice(session="s1", kind="Bash"),
+                  _notice(session="s2", kind="WebFetch")], clock.now)
+    clock.advance(20.0)
+    assert len(merger.offer([], clock.now)) == 2
+
+
+def test_the_default_window_is_the_documented_one() -> None:
+    assert NOTICE_MERGE_SECONDS == 20.0

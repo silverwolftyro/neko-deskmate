@@ -444,3 +444,43 @@ def test_the_roles_and_lights_are_the_documented_four_and_three() -> None:
     assert [r.value for r in Role] == ["action", "outcome", "boundary", "waiting"]
     assert [light.value for light in Light] == [
         "idle", "running", "waiting", "error"]
+
+
+# ── 6c. kind 为空时按来源给类别壳（2026-11-24 真机验收 §4.4）────────────
+#
+# 屏幕原文是「merge6 出事了 / 有一步 执行失败，它没自己恢复」——真实原因是
+# 网关 502。文案没错，但用户读不出"是什么在执行"。
+
+def test_a_gateway_failure_is_labelled_as_a_model_request() -> None:
+    """网关账本的一行 = 一次模型/上游请求，不是"某一步"。"""
+    signal = signal_from_event(_event(
+        event=EVENT_ERROR, is_error=True, source_type="proxy_request_logs"))
+    assert signal is not None
+    assert signal.kind == "模型请求"
+
+
+def test_a_transcript_session_error_is_labelled_as_a_model_request() -> None:
+    """转录里的 system/level=error 记录 = 会话级 API 报错（实测 api_error 502）。
+    它同样不是"某一步"。"""
+    signal = signal_from_event(_event(
+        event=EVENT_ERROR, is_error=True, source_type="system"))
+    assert signal is not None
+    assert signal.kind == "模型请求"
+
+
+def test_an_unknown_source_keeps_kind_empty() -> None:
+    """认不出的来源**留空**，让 tracker 用「有一步」兜底。
+    填个猜的名字比空着更坏——空着至少是诚实的。"""
+    signal = signal_from_event(_event(
+        event=EVENT_ERROR, is_error=True, source_type="某种新来源"))
+    assert signal is not None
+    assert signal.kind == ""
+
+
+def test_a_real_tool_name_still_wins() -> None:
+    """工具名优先，别被来源壳盖掉。"""
+    signal = signal_from_event(_event(
+        event=EVENT_TOOL_RESULT, tool="Bash", is_error=True,
+        tool_use_id="tu_1", source_type="proxy_request_logs"))
+    assert signal is not None
+    assert signal.kind == "Bash"

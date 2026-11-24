@@ -31,8 +31,10 @@ from plugin.plugins.agent_deskmate import (
     _tracker_section,
 )
 from plugin.plugins.agent_deskmate.broadcast import (
+    NOTICE_MERGE_SECONDS,
     NOTICE_PRIORITY,
     Broadcaster,
+    NoticeMerger,
     _light_key,
     broadcast_notice,
     push_text,
@@ -151,6 +153,7 @@ class _Host:
     _poll_source = AgentDeskmatePlugin._poll_source
     _poll_once = AgentDeskmatePlugin._poll_once
     _sync_tracker_config = AgentDeskmatePlugin._sync_tracker_config
+    _sync_merge_window = AgentDeskmatePlugin._sync_merge_window
     _feed_tracker = AgentDeskmatePlugin._feed_tracker
     _approval_blocked_sessions = AgentDeskmatePlugin._approval_blocked_sessions
     _record_gate_stopped = AgentDeskmatePlugin._record_gate_stopped
@@ -175,13 +178,22 @@ class _Host:
         self._approval = None
         # P1c：自伤失败登记簿。真插件 _reset_watch_state 建，这里手搭一份。
         self._gated = GatedFailureLog()
+        # P1c(b)：同目录通知的跨批次合并器。默认窗口 20s 会把通知压到下一轮，
+        # 所以**除 §H 之外的所有测试都通过 config() 关掉它**——那些测试要断言
+        # 的是别的东西（状态机、闸门、静音），不该被合并窗口拖着。
+        self._merger = NoticeMerger()
+        self._merge_window = NOTICE_MERGE_SECONDS
 
     def _push(self, **kwargs):
         self.pushed.append(kwargs)
         return {"submitted": True}
 
     def config(self) -> dict:
-        return {} if self._progress is None else {"progress": self._progress}
+        section = {} if self._progress is None else dict(self._progress)
+        # 不显式关掉跨批合并的话，通知会被压一个窗口（默认 20s），
+        # 当轮就看不到它了。想测合并窗口自己的，传 progress 时覆盖这个键。
+        section.setdefault("notice_merge_seconds", 0)
+        return {"progress": section}
 
     def poll(self, times: int = 1) -> list[str]:
         outcomes: list[str] = []
@@ -729,3 +741,119 @@ def test_sessions_without_a_directory_are_not_merged() -> None:
     host = _Host(events)
     host.poll()
     assert len(host.pushed) == 3
+
+
+# ── H. P1c(b)：跨批次合并的接线 ─────────────────────────────────────────
+#
+# §G 证明"同一轮里合得好"。真机验收（2026-11-24 测试 8）证明这不够：
+# 6 个会话 3 秒内失败，通知时间各自 +120s，跨过 3 秒轮询相位就分成 3 条。
+# 这里证明合并器真的接在了 _poll_once 上、而且跨轮询仍然合。
+
+class _FakeClock:
+    """假时钟，替换 ``plugin_module.time``。
+
+    ``offer`` 的 ``now`` 是判断的唯一依据，不可注入就等于没法测"窗口过了"。
+    除了 ``time()`` 还要给 ``monotonic()``——``_poll_source`` 的限频用它。
+    """
+
+    def __init__(self, start: float) -> None:
+        self.now = start
+        self._mono = start
+
+    def time(self) -> float:
+        return self.now
+
+    def monotonic(self) -> float:
+        return self._mono
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        self._mono += seconds
+
+
+def _wired(events, *, window: float) -> tuple[_Host, _FakeClock]:
+    """一个跑真 ``_poll_once`` 的宿主 + 假时钟。"""
+    host = _Host(events, progress={"notice_merge_seconds": window})
+    clock = _FakeClock(_now())
+    host._merger = NoticeMerger(window=window)
+    host._merge_window = window
+    return host, clock
+
+
+def test_two_sessions_failing_in_different_polls_send_one_notice(monkeypatch) -> None:
+    """**真机测试 8 的直接复现。** 两个会话的失败落在不同轮询批次
+    （间隔 3 秒 = 轮询周期），也必须合成一条。"""
+    at = _now() - 300
+    events = [_failed_step(at, session="s1", action_id="tu_1",
+                           working_directory=r"D:\proj")]
+    host, clock = _wired(events, window=20.0)
+    monkeypatch.setattr(plugin_module, "time", clock)
+
+    host._poll_once(host.config())                    # 第一轮：s1 失败
+    assert host.pushed == []                          # 压着，窗口没到
+    clock.advance(3.0)                                # 下一轮轮询
+
+    # 第二个会话此时才失败（源吐新事件）
+    host._transcript_adapter = _StubSource(
+        [_failed_step(at, session="s2", action_id="tu_2",
+                      working_directory=r"D:\proj")])
+    host._poll_once(host.config())
+    assert host.pushed == []                          # 还在同一个窗口里，继续压
+
+    clock.advance(17.0)                               # 窗口到期
+    host._poll_once(host.config())
+    assert len(host.pushed) == 1, "跨批次没有合并——这正是真机测试 8 的根因"
+    text = host.pushed[0]["parts"][0]["text"]
+    assert text.startswith(r"D:\proj")
+    assert "（同目录另有 1 个会话）" in text
+
+
+def test_the_merger_survives_across_polls(monkeypatch) -> None:
+    """合并器不能每轮重建——重建了就退回"只合同一轮"，也就是真机测试 8
+    不过的那个状态。这是接线最容易被"优化"坏的一处：把
+    ``NoticeMerger()`` 挪进 ``_poll_once`` 里看着更干净，功能却没了，
+    而且没有任何测试会因此红（除了这一条）。"""
+    host, clock = _wired([], window=20.0)
+    monkeypatch.setattr(plugin_module, "time", clock)
+    before = host._merger                                 # noqa: SLF001
+    host._poll_once(host.config())
+    clock.advance(3.0)
+    host._poll_once(host.config())
+    assert host._merger is before                         # noqa: SLF001
+
+
+def test_the_window_comes_from_the_config(monkeypatch) -> None:
+    """notice_merge_seconds 真的被读、真的能改。"""
+    host = _Host()
+    host._sync_merge_window({"notice_merge_seconds": 45})
+    assert host._merge_window == 45                    # noqa: SLF001
+    assert any("跨批合并窗口就绪" in line for line in host.logger.lines)
+    # 坏值退回默认，不让观测循环崩
+    host._sync_merge_window({"notice_merge_seconds": "半小时"})
+    assert host._merge_window == NOTICE_MERGE_SECONDS   # noqa: SLF001
+
+
+def test_the_merge_window_is_logged_separately() -> None:
+    """**刻意不并进「进度状态机阈值就绪」那一行**：那一行是真机验收的
+    主通过信号，任务包要求它一字不差。"""
+    host = _Host()
+    host._sync_merge_window({"notice_merge_seconds": 30})
+    signal_lines = [line for line in host.logger.lines if "进度状态机阈值就绪" in line]
+    assert signal_lines == []                          # 没被污染
+    assert any("窗口=30s" in line for line in host.logger.lines)
+
+
+def test_closing_the_window_releases_what_is_held(monkeypatch) -> None:
+    """用户把窗口调成 0，压在手里的通知要立刻发出去——
+    不然改个配置反而让几条通知永远消失。"""
+    at = _now() - 300
+    host, clock = _wired([_failed_step(at, session="s1", action_id="tu_1",
+                                       working_directory=r"D:\proj")],
+                         window=20.0)
+    monkeypatch.setattr(plugin_module, "time", clock)
+    host._poll_once(host.config())
+    assert host.pushed == []
+
+    host._sync_merge_window({"notice_merge_seconds": 0})
+    host._poll_once(host.config())
+    assert len(host.pushed) == 1

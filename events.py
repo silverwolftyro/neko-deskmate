@@ -50,6 +50,26 @@ SUMMARY_INPUT_MAX = 80
 
 AGENT_CLAUDE_CODE = "claude-code"
 
+# 网关账本 ``proxy_request_logs.app_type`` → 规范 agent id。
+#
+# **为什么需要这张表**（2026-11-24 真机验收发现）：转录源的事件
+# ``agent = "claude-code"``，而网关账本写的是 ``app_type = "claude"``——
+# 同一个 session（docstring 自己都写着"session_id 与转录的 sessionId 是同一个
+# UUID，可关联"）于是被 ``ProgressTracker`` 的 ``(agent, session)`` 桶键
+# **劈成两个 SessionState**：轮次/动作计数被劈开、失败链被劈开、
+# 「兜圈子」的"连续 3 次"可能跨桶永远凑不齐，播报主语也跟着抖
+# （「claude-code 会话」vs「claude 会话」）。
+#
+# **认不出的原样放过，不猜**：cc-switch 会代理别家（codex 等），
+# 把不认识的 app_type 硬映射成 claude-code 比不映射更坏——那会把两个
+# 真的不同的 Agent 合成一个桶。
+GATEWAY_APP_TYPE_ALIASES = {
+    "claude": AGENT_CLAUDE_CODE,
+    "claude_code": AGENT_CLAUDE_CODE,
+    "claude-code": AGENT_CLAUDE_CODE,
+    "claude code": AGENT_CLAUDE_CODE,
+}
+
 # ── 归因（2026-11-21 决策记录 §1/§5） ───────────────────────────────────────
 # 核心原则：主语位只放「可证的请求源」；执行者降级到括号里；拿不准就写未知。
 # 用户会把播报的主语读成「发起者」，所以主语位一旦放执行者，就等于把锅扣给手。
@@ -438,7 +458,10 @@ def parse_gateway_row(row: dict[str, Any]) -> UnifiedEvent | None:
     event = EVENT_ERROR if is_error else EVENT_TURN_END
 
     app_type = str(row.get("app_type") or "").strip()
-    agent = app_type or "gateway"
+    # 归一成规范 agent id。同一个会话在转录侧叫 claude-code、在网关侧叫
+    # claude，不归一的话 tracker 的 (agent, session) 桶键会把一个会话
+    # 劈成两半（见 GATEWAY_APP_TYPE_ALIASES 的注释）。
+    agent = GATEWAY_APP_TYPE_ALIASES.get(app_type.lower(), app_type or "gateway")
     model = str(row.get("model") or "").strip()
 
     total_cost = _to_float(row.get("total_cost_usd"))

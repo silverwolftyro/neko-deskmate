@@ -35,6 +35,7 @@ from plugin.plugins.agent_deskmate.adapters.gateway import (
     current_watermark,
     read_new_gateway_events,
 )
+from plugin.plugins.agent_deskmate.broadcast import NoticeMerger
 from plugin.plugins.agent_deskmate.gated import GatedFailureLog
 from plugin.plugins.agent_deskmate.tracker import ProgressTracker
 
@@ -96,13 +97,13 @@ class WatcherHost:
     _poll_source = AgentDeskmatePlugin._poll_source
     _poll_once = AgentDeskmatePlugin._poll_once
     _sync_tracker_config = AgentDeskmatePlugin._sync_tracker_config
+    _sync_merge_window = AgentDeskmatePlugin._sync_merge_window
     _feed_tracker = AgentDeskmatePlugin._feed_tracker
     _approval_blocked_sessions = AgentDeskmatePlugin._approval_blocked_sessions
     _record_gate_stopped = AgentDeskmatePlugin._record_gate_stopped
     _is_gate_caused = AgentDeskmatePlugin._is_gate_caused
     _adapter_status = AgentDeskmatePlugin._adapter_status
     _ADAPTER_SOURCES = AgentDeskmatePlugin._ADAPTER_SOURCES
-
     def __init__(self) -> None:
         self._broadcaster = None
         self._transcript_adapter = None
@@ -120,6 +121,10 @@ class WatcherHost:
         self._approval = None
         # P1c：自伤失败登记簿。真插件 _reset_watch_state 建，这里手搭一份。
         self._gated = GatedFailureLog()
+        # P1c(b)：同目录通知的跨批次合并器。关掉窗口——这里测的是观测源
+        # 隔离，通知要当轮就看到，不该被合并窗口拖着。
+        self._merger = NoticeMerger(window=0.0)
+        self._merge_window = 0.0
 
 
 def _tool_line(command: str, session: str = "sess-1") -> str:

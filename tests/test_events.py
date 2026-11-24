@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from plugin.plugins.agent_deskmate.events import (
+    AGENT_CLAUDE_CODE,
     ATTRIBUTION_KNOWN,
     ATTRIBUTION_UNKNOWN,
     EVENT_ERROR,
@@ -352,12 +353,43 @@ def test_gateway_ok_row_is_turn_end() -> None:
     event = parse_gateway_row(dict(GATEWAY_OK_ROW))
     assert event is not None
     assert event.event == EVENT_TURN_END
-    assert event.agent == "claude"
+    # **规范成 claude-code，不是账本里的 claude**：转录侧同一个会话叫
+    # claude-code，不归一的话 tracker 的 (agent, session) 桶键会把一个会话
+    # 劈成两半（2026-11-24 真机验收 §4.3）。
+    assert event.agent == AGENT_CLAUDE_CODE
     assert event.session == "547ea690-abd2-47e3-a7f5-c8ddd0e96ccc"
     assert "step-5-preview" in event.summary
     assert "200" in event.summary
     assert "$0.0174" in event.summary
     assert event.ts.endswith("+00:00")
+
+
+def test_gateway_app_type_is_normalised_to_the_canonical_agent() -> None:
+    """cc-switch 账本写 ``claude``，转录写 ``claude-code``。同一个 session
+    在两条源里 agent 名不同 → tracker 桶键 ``(agent, session)`` 把会话劈成两个
+    SessionState → 计数/失败链/「兜圈子」全被劈开，播报主语也跟着抖。
+
+    这条钉住归一表；拼写变体也要认（实测账本里见过 ``claude_code``）。
+    """
+    for raw in ("claude", "Claude", " claude ", "claude_code", "claude-code"):
+        event = parse_gateway_row(dict(GATEWAY_OK_ROW, app_type=raw))
+        assert event is not None
+        assert event.agent == AGENT_CLAUDE_CODE, raw
+
+
+def test_an_unknown_app_type_is_left_alone() -> None:
+    """认不出的原样放过，**不猜**：把 codex 硬映射成 claude-code 比不映射更坏，
+    那会把两个真的不同的 Agent 合成一个桶。"""
+    event = parse_gateway_row(dict(GATEWAY_OK_ROW, app_type="codex"))
+    assert event is not None
+    assert event.agent == "codex"
+
+
+def test_a_missing_app_type_falls_back_to_gateway() -> None:
+    """空 app_type 不许变成空 agent——``Signal`` 会拒收空 agent。"""
+    event = parse_gateway_row(dict(GATEWAY_OK_ROW, app_type=""))
+    assert event is not None
+    assert event.agent == "gateway"
 
 
 def test_gateway_failure_row_is_error() -> None:

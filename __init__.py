@@ -87,9 +87,10 @@ from .approval import (
 )
 from .auto_review import AutoReviewer
 from .broadcast import (
+    NOTICE_MERGE_SECONDS,
     Broadcaster,
+    NoticeMerger,
     broadcast_notice,
-    coalesce_same_workspace,
     describe_actor,
     render_text,
 )
@@ -675,6 +676,14 @@ class AgentDeskmatePlugin(NekoPluginBase):
         "某个功能没有"，而是那一轮整个抛异常、播报全停——
         而这种故障在日志里只是一行 AttributeError，极容易被忽略。
         """
+        # 压在合并器手里的通知：重载/改配置时会被丢掉。**必须留一行**——
+        # 这个项目的硬规矩是"一条都不许丢"，而这里是唯一一个会丢的地方
+        # （跨批次合并的代价）。不记这一行，用户少了通知却查不到原因。
+        held = getattr(self, "_merger", None)
+        if held is not None and len(held):
+            self.logger.warning(
+                "重载时丢弃 %d 条压在合并窗口里的通知（最晚晚 %gs，"
+                "跨批次合并的代价）", len(held), self._merge_window)
         self._watch_paths = None
         self._transcript_adapter = None
         self._gateway_adapter = None
@@ -693,6 +702,12 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # 于是日志写"余下留待下一轮"、实际那条通知永久消失。
         # 规则层丢的就是一条删除播报——不可接受。
         self._pending_pushes: list[Callable[[], str]] = []
+        # P1c(b)：同目录通知的跨批次合并器。**建在这里**而不是 _ensure_watchers，
+        # 理由同 _tracker——那条路有缓存早退，会被整条绕过。
+        # 压在它手里的通知最晚晚一个窗口（默认 20s）发出；重载时会丢掉，
+        # 见 _reset_watch_state 里那条 warning。
+        self._merger = NoticeMerger()
+        self._merge_window = NOTICE_MERGE_SECONDS
         # P1c：闸门自己造成的失败登记簿。**建在这里**而不是 _ensure_watchers，
         # 理由同 _tracker——那条路有缓存早退，会被整条绕过。
         # 审批网关起不起来都不影响它（起不来时这本簿子永远是空的，
@@ -1076,6 +1091,28 @@ class AgentDeskmatePlugin(NekoPluginBase):
             cfg.wait_escalate_seconds, cfg.unclosed_action_seconds,
             cfg.boundary_round_seconds, cfg.fail_coalesce_seconds,
             cfg.failure_confirm_seconds)
+        self._sync_merge_window(_tracker_section(config))
+
+    def _sync_merge_window(self, section: dict[str, Any]) -> None:
+        """同目录通知的跨批次合并窗口（P1c(b)）。
+
+        **刻意不并进上面那行日志**：那一行是真机验收的"主通过信号"，
+        任务包要求它一字不差。合并窗口单独一行，改配置时能看到用了哪套值。
+
+        键和 ``fail_coalesce_seconds`` 是兄弟——一个是状态机内部的按会话去重，
+        一个是播出层的按工作目录合并。放在同一节里，用户找得到。
+        """
+        window = _to_number(section.get("notice_merge_seconds"),
+                            NOTICE_MERGE_SECONDS)
+        if window == self._merge_window:
+            return
+        self._merge_window = window
+        self._merger.set_window(window)
+        if window <= 0:
+            self.logger.info("同目录通知跨批合并已关闭（notice_merge_seconds=0）："
+                             "通知当轮就发，不带「另有 N 个会话」")
+        else:
+            self.logger.info("同目录通知跨批合并窗口就绪 窗口={:g}s", window)
 
     def _feed_tracker(self, event: UnifiedEvent) -> list[Notice]:
         """一个事件 → 零或一条 Signal → 零或多条 Notice。
@@ -1213,9 +1250,12 @@ class AgentDeskmatePlugin(NekoPluginBase):
         notices.extend(self._tracker.tick(time.time(),
                                           self._approval_blocked_sessions()))
         # P1c(b)：同目录多会话一字不差的重复通知合成一条。
+        # **跨批次**（真机验收 2026-11-24 测试 8 的根因：只合同一轮不够，
+        # 6 个会话 3 秒内失败，通知时间各自 +120s，跨过轮询相位就分成 3 条）。
         # 放在这里而不是 tracker 里：tracker 的指纹去重按会话记账是对的
         # （每个会话自己的状态没被污染），要合并的是"用户看到几条"。
-        notices = coalesce_same_workspace(notices)
+        # 代价是最晚一条晚一个窗口，见 broadcast.NoticeMerger 的文档。
+        notices = self._merger.offer(notices, time.time())
 
         # 规则层排在通知层**前面**：删除/下派是安全信号，撞上条数上限时该被
         # 推迟的是进度播报，不是"它刚删了文件"。tracker 的 Notice 本就按
