@@ -703,6 +703,11 @@ class PendingApproval:
         return {
             "request_id": self.request.request_id,
             "session_id": self.request.session_id,
+            # agent 一并给出：轮询循环要拿 (agent, session) 去匹配进度状态机的
+            # 会话桶（桶键必须带 agent，否则两个 Agent 撞同一个 session id 会互相
+            # 污染）。放在这里而不是让调用方硬编 "claude-code"——那是一条看不见的
+            # 耦合，中继哪天按来源分流就断了。
+            "agent": self.request.agent,
             "tool_name": self.request.tool_name,
             "tool_summary": self.request.tool_summary,
             "working_directory": self.request.working_directory,

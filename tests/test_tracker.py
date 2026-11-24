@@ -405,6 +405,93 @@ def test_no_new_events_is_not_the_same_as_stuck() -> None:
     assert tracker.tick(T0 + 36 * 3600) == []
 
 
+# ── 5b. 审批挂起的会话：跳过评估，不是过滤通知 ────────────────────────────
+#
+# 2026-11-24 真机：三张审批卡挂着等人，300 秒后连发三条
+# 「有一步没有回包 / 它可能卡住了」。真实原因是**权限请求在等审批**
+# （hook 阻塞），Agent 根本没卡——三条全是假警报。
+#
+# 修法的关键在"跳过评估"而不是"过滤通知"：评估一旦跑过，action_id 就进
+# ``unclosed_reported``，**从此永远不再报**。等人那几分钟恰好被这一口吞掉，
+# 等用户点完卡、Agent 真的卡死了，该报的那一次已经不报了。
+# 精度变成了漏报，而漏报正是这个插件存在的理由。
+
+def _blocked_key(tracker: ProgressTracker, agent: str = "some-agent",
+                 session: str = "s1") -> tuple[str, str]:
+    return (agent, session)
+
+
+def test_a_session_waiting_on_an_approval_is_not_evaluated() -> None:
+    """审批挂着 → 那一轮不评估未回包。假警报当场消失。"""
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0))
+    assert tracker.tick(T0 + 300, [_blocked_key(tracker)]) == []
+
+
+def test_the_block_does_not_burn_the_action_permanently() -> None:
+    """**这一条是 P1b 的核心。** 跳过评估 ≠ 把通知吞掉。
+
+    审批挂着的那几分钟里 ``unclosed_reported`` 不许被写进去；否则用户点完卡、
+    Agent 真的卡死了，该报的那一次已经不报了——精度变成了漏报。
+    """
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0))
+    blocked = [_blocked_key(tracker)]
+
+    # 审批挂着，连转 100 圈：一次都不该响
+    for step in range(100):
+        assert tracker.tick(T0 + 300 + step * 3, blocked) == []
+
+    # 用户点完卡、审批了结 → 阻塞解除，Agent 却真的再也没回来
+    notices = tracker.tick(T0 + 300 + 100 * 3)
+    assert len(notices) == 1, "阻塞解除后该报的那一次被提前吞掉了"
+    assert "没有回包" in notices[0].headline
+
+
+def test_a_blocked_session_still_gets_its_other_transitions() -> None:
+    """边界要写明：阻塞只免掉「未回包」一种评估。
+
+    失败确认、重试链、在等你 照旧——那些不是 hook 阻塞造成的，
+    拿审批当理由把它们一起静音才是漏报。（审批过期造成的自伤连锁
+    由 tool_use_id 关联在桥上层处理，不在这里加宽。）
+    """
+    tracker = ProgressTracker()
+    tracker.feed(_fail(at=T0))                       # 一次响亮失败
+    blocked = [_blocked_key(tracker)]
+    assert tracker.tick(T0 + 119, blocked) == []      # 确认窗口内，与阻塞无关
+    notices = tracker.tick(T0 + 120, blocked)
+    assert len(notices) == 1
+    assert "出事了" in notices[0].headline
+
+
+def test_blocking_one_session_does_not_silence_another() -> None:
+    """三个会话同时挂着卡，只静音挂着的那几个。
+
+    同目录多会话是真机常态；按 session 精确屏蔽，不能按 workspace 一刀切。
+    """
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0, session="s1"))
+    tracker.feed(_action(at=T0, session="s2"))
+    blocked = [_blocked_key(tracker, session="s1")]
+    notices = tracker.tick(T0 + 300, blocked)
+    assert len(notices) == 1
+    assert notices[0].session == "s2"
+
+
+def test_the_block_key_matches_the_tracker_bucket_key() -> None:
+    """桶键是 ``(agent, session)`` 二元组，不是裸 session id。
+
+    两个 Agent 撞同一个 session id 是实测存在的（`test_two_agents_sharing_a_
+    session_id_do_not_collide`）。只按 session 屏蔽会连带静音另一个 Agent
+    的真卡死——所以这一条把形状钉死：塞裸字符串进来必须匹配不上任何桶。
+    """
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0))
+    notices = tracker.tick(T0 + 300, ["s1"])           # 裸字符串，形状不对
+    assert len(notices) == 1, "裸 session id 把另一个 Agent 的桶也屏蔽了"
+    assert tracker.tick(T0 + 301, [("some-agent", "s1")]) == []
+
+
 # ── 6. 指名与身份 ────────────────────────────────────────────────────────
 
 def test_notices_name_the_workspace_not_the_session_id() -> None:

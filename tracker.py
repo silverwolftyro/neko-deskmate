@@ -22,7 +22,7 @@ tick 只负责**评估**是否超时，不自行产生播报；发射仍是边�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Container, Iterable
 
 from .progress import (
     Light,
@@ -178,41 +178,62 @@ class ProgressTracker:
             return []
         return handler(self, state, signal)
 
-    def tick(self, now: float) -> list[Notice]:
-        """轮询评估。**只评估超时，不自行产生播报**（见模块 docstring 的例外说明）。"""
+    def tick(
+        self,
+        now: float,
+        blocked: Container[tuple[str, str]] = (),
+    ) -> list[Notice]:
+        """轮询评估。**只评估超时，不自行产生播报**（见模块 docstring 的例外说明）。
+
+        ``blocked``：**暂不评估「未回包」的 (agent, session) 集合**——当前有审批
+        挂在等人点的会话。见 ``_tick_one`` 里那条注释，重点是"跳过评估"而不是
+        "过滤通知"，两者差一个漏报。
+        """
         notices: list[Notice] = []
         for state in sorted(self._sessions.values(),
                             key=lambda s: (s.agent, s.session)):
-            notices.extend(self._tick_one(state, now))
+            notices.extend(self._tick_one(state, now, blocked))
         return notices
 
     # ── 内部 ─────────────────────────────────────────────────────────────
 
-    def _tick_one(self, state: SessionState, now: float) -> list[Notice]:
+    def _tick_one(self, state: SessionState, now: float,
+                  blocked: Container[tuple[str, str]] = ()) -> list[Notice]:
         notices: list[Notice] = []
         cfg = self._config
 
         # 未回包：有 action 一直没配对 outcome。**逐个查**，不是只看一个——
         # 并行发起的多个调用各自有自己的超时。
-        for action_id in sorted(state.open_actions):
-            if action_id in state.unclosed_reported:
-                continue
-            kind, since = state.open_actions[action_id]
-            if now - since < cfg.unclosed_action_seconds:
-                continue
-            state.unclosed_reported.add(action_id)
-            state.light = Light.ERROR
-            notice = self._emit(
-                state, now,
-                role=Role.OUTCOME, light=Light.ERROR,
-                fingerprint=f"unclosed|{state.agent}|{state.session}|{action_id}",
-                headline=f"{self._who(state)} 有一步没有回包",
-                detail=(f"{kind or '某一步'} 执行了 {_elapsed(now - since)}"
-                        "，没有结果——它可能卡住了"),
-                kind=kind,
-            )
-            if notice is not None:
-                notices.append(notice)
+        #
+        # ⚠️ 审批挂起时整段跳过，不是把发出的通知过滤掉。区别是致命的：
+        # 评估一旦跑过，action_id 就进 ``unclosed_reported``，那个 action
+        # **从此永远不再报**。审批挂着的那几分钟恰好会被这一口吞掉——
+        # 等用户点完卡、Agent 真的卡死了，该报的那一次已经不报了。
+        # 精度变成了漏报，而漏报正是这个插件存在的理由。
+        #
+        # 顺带一说这不是理论问题：2026-11-24 真机，三张卡等人时 300 秒后
+        # 连发三条「有一步没有回包 / 它可能卡住了」，而真实原因是
+        # **权限请求在等审批**（hook 阻塞），Agent 根本没卡。
+        if state.key() not in blocked:
+            for action_id in sorted(state.open_actions):
+                if action_id in state.unclosed_reported:
+                    continue
+                kind, since = state.open_actions[action_id]
+                if now - since < cfg.unclosed_action_seconds:
+                    continue
+                state.unclosed_reported.add(action_id)
+                state.light = Light.ERROR
+                notice = self._emit(
+                    state, now,
+                    role=Role.OUTCOME, light=Light.ERROR,
+                    fingerprint=f"unclosed|{state.agent}|{state.session}|{action_id}",
+                    headline=f"{self._who(state)} 有一步没有回包",
+                    detail=(f"{kind or '某一步'} 执行了 {_elapsed(now - since)}"
+                            "，没有结果——它可能卡住了"),
+                    kind=kind,
+                )
+                if notice is not None:
+                    notices.append(notice)
 
         # 🟡 升级：等了太久还在等。每个 episode 只升一次。
         if (state.light is Light.WAITING

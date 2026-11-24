@@ -92,7 +92,7 @@ from .commands import (
     CONCLUSION_UNSURE,
     command_length,
 )
-from .events import UnifiedEvent, attribute, delegated_server
+from .events import AGENT_CLAUDE_CODE, UnifiedEvent, attribute, delegated_server
 from .hooksetup import (
     install_hook,
     installed_hook,
@@ -1071,6 +1071,41 @@ class AgentDeskmatePlugin(NekoPluginBase):
             return []
         return self._tracker.feed(signal)
 
+    def _approval_blocked_sessions(self) -> set[tuple[str, str]]:
+        """当前有审批挂在等人点的 (agent, session)。
+
+        给 ``ProgressTracker.tick()`` 当 ``blocked`` 用：这些会话的
+        **「未回包」判定整段跳过**。
+
+        为什么需要它（2026-11-24 真机）：审批挂着时，那条工具调用没有
+        ``tool_result`` 是因为 PermissionRequest hook 在阻塞等回填，
+        **不是 Agent 卡住**。而 tracker 只看得见"有 action 无配对 outcome"，
+        300 秒后必然判成「它可能卡住了」。用户屏幕上同时挂着审批卡和
+        "它可能卡住了"，自相矛盾。
+
+        治本要建 ``PendingApproval → WAITING`` 桥（让播报说"它在等你审批"），
+        那是单独一批；这一条是桥建好之前的正确中间态——**宁可少说一句，
+        不要指错方向**。
+
+        刻意**不**用"调大 unclosed_action_seconds"：那会让真卡住也跟着晚发现，
+        直接违背"出错发现晚"这条原始痛点。
+        """
+        approval = self._approval
+        if approval is None:
+            return set()
+        blocked: set[tuple[str, str]] = set()
+        for row in approval.snapshot():
+            if row.get("state") != "pending":
+                continue
+            session = str(row.get("session_id") or "")
+            if not session:
+                # 后台/无会话场景：键会是 ("", request_id)。没有 session 就
+                # 匹配不上任何 tracker 桶，跳过——猜一个 session 比不跳更糟。
+                continue
+            agent = str(row.get("agent") or "") or AGENT_CLAUDE_CODE
+            blocked.add((agent, session))
+        return blocked
+
     def _poll_once(self, config: dict[str, Any]) -> list[str]:
         """扫一轮观测源 → 跑规则 → 喂状态机 → 播报。同步函数，由 timer 丢进线程执行。
 
@@ -1097,7 +1132,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
         notices: list[Notice] = []
         for event in events:
             notices.extend(self._feed_tracker(event))
-        notices.extend(self._tracker.tick(time.time()))
+        notices.extend(self._tracker.tick(time.time(),
+                                          self._approval_blocked_sessions()))
 
         # 规则层排在通知层**前面**：删除/下派是安全信号，撞上条数上限时该被
         # 推迟的是进度播报，不是"它刚删了文件"。tracker 的 Notice 本就按

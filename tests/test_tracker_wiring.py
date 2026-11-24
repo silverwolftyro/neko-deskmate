@@ -149,6 +149,7 @@ class _Host:
     _poll_once = AgentDeskmatePlugin._poll_once
     _sync_tracker_config = AgentDeskmatePlugin._sync_tracker_config
     _feed_tracker = AgentDeskmatePlugin._feed_tracker
+    _approval_blocked_sessions = AgentDeskmatePlugin._approval_blocked_sessions
 
     def __init__(self, events=(), progress=None) -> None:
         self.logger = _ListLogger()
@@ -164,6 +165,9 @@ class _Host:
         self._tracker_cfg: TrackerConfig | None = None
         self._pending_pushes: list = []
         self._progress = progress
+        # 审批在等人的会话。None = 审批网关没起来（真插件 _approval 的初值），
+        # 走 "没有阻塞" 分支——这条路径本身也要被测到。
+        self._approval = None
 
     def _push(self, **kwargs):
         self.pushed.append(kwargs)
@@ -443,3 +447,102 @@ def test_rule_hits_go_out_before_progress_notices(monkeypatch) -> None:
     assert host.pushed == []                                      # 通知整批推迟
     host.poll()
     assert len(host.pushed) == 1                                  # 下一轮补上，没丢
+
+
+# ── E. P1b：审批挂起的会话不进「未回包」评估 ─────────────────────────────
+#
+# 2026-11-24 真机：三张审批卡挂着等人，300 秒后连发三条
+# 「有一步没有回包 / 它可能卡住了」。Agent 是被 hook 阻塞，不是卡死。
+#
+# 关键在"跳过评估"而不是"过滤通知"——评估跑过一次，
+# action_id 就进 ``unclosed_reported``，从此永远不再报。
+# 这一组同时钉住接线两头的形状：``_approval_blocked_sessions`` 的产出
+# 必须正好是 tracker 认的 ``(agent, session)`` 桶键。
+
+
+class _FakeApproval:
+    """只实现 ``snapshot()``——``_approval_blocked_sessions`` 只调它。"""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+
+    def snapshot(self) -> list[dict]:
+        return self._rows
+
+
+def _pending(session: str, agent: str = AGENT) -> dict:
+    return {"session_id": session, "agent": agent, "state": "pending"}
+
+
+def _settled(session: str, agent: str = AGENT) -> dict:
+    return {"session_id": session, "agent": agent, "state": "settled"}
+
+
+def test_no_approval_gateway_blocks_nothing() -> None:
+    """插件刚起来、审批中继还没建 → 空集合。不是异常，是正常路径。"""
+    host = _Host()
+    assert host._approval is None                    # noqa: SLF001
+    assert host._approval_blocked_sessions() == set()   # noqa: SLF001
+
+
+def test_only_pending_approvals_block() -> None:
+    """已了结的（允许/拒绝/过期）不阻塞——它已经不再拦着 Agent 了。"""
+    host = _Host()
+    host._approval = _FakeApproval([_pending("s1"), _settled("s2")])  # noqa: SLF001
+    assert host._approval_blocked_sessions() == {(AGENT, "s1")}       # noqa: SLF001
+
+
+def test_a_row_without_a_session_id_is_skipped() -> None:
+    """没有 session_id 就对不上桶。硬塞一个空串进去会屏蔽掉一个假会话，
+    更糟的是形状漂移之后没人发现。"""
+    host = _Host()
+    host._approval = _FakeApproval([_pending("")])                    # noqa: SLF001
+    assert host._approval_blocked_sessions() == set()                 # noqa: SLF001
+
+
+def test_an_empty_agent_falls_back_to_claude_code() -> None:
+    """hook 负载没带 agent 时的兜底。与 ``ApprovalRequest.agent`` 的默认值
+    同源，不是两处各写一个字符串。"""
+    host = _Host()
+    host._approval = _FakeApproval([_pending("s1", agent="")])        # noqa: SLF001
+    assert host._approval_blocked_sessions() == {("claude-code", "s1")}  # noqa: SLF001
+
+
+def test_the_blocked_set_reaches_the_tracker_as_bucket_keys() -> None:
+    """端到端：挂着审批的会话不播「没有回包」，另一个会话照播。
+
+    ``SessionState.key()`` 是 ``(agent, session)`` 二元组；接线断了
+    （比如传了裸 session id）表现是"什么都没发生"——没有任何异常，
+    只是假警报照旧。所以这条必须存在。
+    """
+    at = _now() - 400
+    host = _Host([_action_step(at, session="s1", action_id="tu_1"),
+                  _action_step(at, session="s2", action_id="tu_2")])
+    host._approval = _FakeApproval([_pending("s1")])                  # noqa: SLF001
+    host.poll()
+    assert len(host.pushed) == 1
+    assert "没有回包" in host.pushed[0]["parts"][0]["text"]
+    # 指名落到没被屏蔽的那个会话上
+    assert host.pushed[0]["parts"][0]["text"].startswith(AGENT)
+
+
+def test_the_action_survives_the_block_and_reports_afterwards() -> None:
+    """**P1b 的核心不变量。** 审批挂着的那几分钟不许把 action 烧掉。
+
+    用户点完卡、Agent 真的卡死了 → 该报的那一次必须还能报。
+    否则"等审批"被误判成"卡死"之后，真卡死反而不报了。
+    """
+    at = _now() - 400
+    host = _Host([_action_step(at, session="s1", action_id="tu_1")])
+    host._approval = _FakeApproval([_pending("s1")])                  # noqa: SLF001
+
+    host.poll()                                   # 屏蔽中：什么都不该播
+    assert host.pushed == []
+    for _ in range(3):                            # 再转几圈，模拟等了 15 秒
+        assert host.poll() == []
+        assert host.pushed == []
+
+    host._approval = None                          # noqa: SLF001  用户点完卡
+    host.poll()
+    assert len(host.pushed) == 1
+    assert "没有回包" in host.pushed[0]["parts"][0]["text"]

@@ -96,6 +96,7 @@ class WatcherHost:
     _poll_once = AgentDeskmatePlugin._poll_once
     _sync_tracker_config = AgentDeskmatePlugin._sync_tracker_config
     _feed_tracker = AgentDeskmatePlugin._feed_tracker
+    _approval_blocked_sessions = AgentDeskmatePlugin._approval_blocked_sessions
     _adapter_status = AgentDeskmatePlugin._adapter_status
     _ADAPTER_SOURCES = AgentDeskmatePlugin._ADAPTER_SOURCES
 
@@ -112,6 +113,8 @@ class WatcherHost:
         self._pending_pushes: list = []
         self.logger = ListLogger()
         self.push_message = RecordingPush()
+        # 审批网关没起来 → 没有会话被阻塞（真插件 _approval 的初值是 None）。
+        self._approval = None
 
 
 def _tool_line(command: str, session: str = "sess-1") -> str:
