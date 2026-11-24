@@ -492,6 +492,77 @@ def test_the_block_key_matches_the_tracker_bucket_key() -> None:
     assert tracker.tick(T0 + 301, [("some-agent", "s1")]) == []
 
 
+# ── 5c. 自伤失败：闸门造成的失败不记到 Agent 头上 ────────────────────────
+#
+# 2026-11-24 真机：审批 570s 到期 → Claude 收到 tool_result is_error=true
+# → 120 秒后连发三条「出事了 / 它没自己恢复」（三个会话，文案一字不差）。
+# 失败是插件的闸门造成的，却被报成 Agent 故障。
+
+def test_a_gate_caused_failure_says_nothing_and_closes_the_action() -> None:
+    """只闭环、不记账。action 必须被清掉——否则它 300 秒后变成
+    「有一步没有回包」，用一个假警报换掉另一个假警报。"""
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0))
+    tracker.feed(_sig(Role.OUTCOME, at=T0 + 1, action_id="tu_1", ok=False,
+                      self_inflicted=True))
+    assert tracker.state_of("some-agent", "s1").open_actions == {}
+    for step in range(200):
+        assert tracker.tick(T0 + 600 + step * 3) == []
+
+
+def test_a_gate_caused_failure_is_not_confirmed_later() -> None:
+    """不进 pending_failures——120 秒后就没有「出事了」可播。"""
+    tracker = ProgressTracker()
+    tracker.feed(_sig(Role.OUTCOME, at=T0, action_id="tu_1", ok=False,
+                      self_inflicted=True))
+    assert tracker.tick(T0 + 600) == []
+
+
+def test_a_gate_caused_failure_does_not_feed_the_retry_chain() -> None:
+    """不动 fail_streak——否则连挂三次审批就是「在兜圈子」。"""
+    tracker = ProgressTracker()
+    for step in range(4):
+        tracker.feed(_sig(Role.OUTCOME, at=T0 + step, action_id=f"tu_{step}",
+                          ok=False, self_inflicted=True))
+    assert tracker.tick(T0 + 600) == []
+
+
+def test_a_gate_caused_failure_does_not_erase_a_real_pending_failure() -> None:
+    """**不能用漏报换漏报。** 同会话里一次真实的未恢复失败不能被
+    自伤失败一起抹掉——那只是把假警报换成了漏报。"""
+    tracker = ProgressTracker()
+    tracker.feed(_fail(at=T0, action_id="tu_1"))              # 真实失败
+    tracker.feed(_sig(Role.OUTCOME, at=T0 + 1, action_id="tu_2",
+                      ok=False, self_inflicted=True))        # 闸门造成的
+    notices = tracker.tick(T0 + 121)
+    assert [n.headline for n in notices] == [f"{WD} 出事了"]
+
+
+def test_a_gate_caused_failure_leaves_the_light_alone() -> None:
+    """灯也不该被它拉回 🟢——上一次真实的失败还红着。"""
+    tracker = ProgressTracker()
+    tracker.feed(_fail(at=T0, action_id="tu_1"))
+    assert tracker.state_of("some-agent", "s1").light.value == "error"
+    tracker.feed(_sig(Role.OUTCOME, at=T0 + 1, action_id="tu_2",
+                      ok=False, self_inflicted=True))
+    assert tracker.state_of("some-agent", "s1").light.value == "error"
+
+
+def test_a_gate_caused_flag_on_a_non_outcome_is_rejected() -> None:
+    """同 ok：形状错了当场炸，不要留成一个解释不了的幽灵状态。"""
+    with pytest.raises(ValueError, match="self_inflicted"):
+        _sig(Role.ACTION, at=T0, action_id="tu_1", self_inflicted=True)
+
+
+def test_a_real_failure_is_not_silenced_by_the_flag() -> None:
+    """反方向也要钉：不带这个字段的失败照旧播。"""
+    tracker = ProgressTracker()
+    tracker.feed(_fail(at=T0))
+    notices = tracker.tick(T0 + 121)
+    assert len(notices) == 1
+    assert "出事了" in notices[0].headline
+
+
 # ── 6. 指名与身份 ────────────────────────────────────────────────────────
 
 def test_notices_name_the_workspace_not_the_session_id() -> None:

@@ -40,9 +40,15 @@ from plugin.plugins.agent_deskmate.progress import (
 # 契约层的字段集合。**改这个集合就是破坏性变更**：契约跨适配器，
 # 多一个字段意味着每家适配器都要回答"填什么"，填不出来时的默认值
 # 会悄悄变成语义。测试钉死，让人必须先改这里、先想清楚。
+#
+# 2026-11-24 加 ``self_inflicted``（P1c）：审批到期/拒绝后 Claude 收到的
+# 那条 tool_result is_error 是插件自己的闸门造成的，不该记成 Agent 故障。
+# 它是**唯一**一个"适配器填不出来"的字段——默认 False，只有桥那一层
+# 拿着审批记录才能指认。这也正是它该长在契约里的理由：不指认，tracker
+# 就只能把它当成一次普通失败，然后 120 秒后播一条「出事了」。
 EXPECTED_FIELDS = (
     "role", "agent", "session", "workspace", "at",
-    "action_id", "ok", "reason", "kind",
+    "action_id", "ok", "reason", "kind", "self_inflicted",
 )
 
 # 名字里带这些的字段，本质都是"装内容的口子"。
@@ -82,7 +88,6 @@ def _signal(**kwargs) -> Signal:
 
 def test_signal_field_set_is_exactly_these_nine() -> None:
     assert signal_fields() == EXPECTED_FIELDS
-
 
 def test_no_field_name_is_a_content_hatch() -> None:
     offenders = [f for f in signal_fields() if f.lower() in CONTENTISH]

@@ -12,12 +12,14 @@ import pytest
 
 from plugin.plugins.agent_deskmate.broadcast import (
     Broadcaster,
+    coalesce_same_workspace,
     for_log,
     priority_for,
     redact,
     render_text,
 )
 from plugin.plugins.agent_deskmate.events import UnifiedEvent, attribute
+from plugin.plugins.agent_deskmate.progress import Light, Role
 from plugin.plugins.agent_deskmate.rules import (
     SEVERITY_CRITICAL,
     SEVERITY_NOTICE,
@@ -29,6 +31,7 @@ from plugin.plugins.agent_deskmate.rules import (
     evaluate_delete,
     evaluate_failure,
 )
+from plugin.plugins.agent_deskmate.tracker import Notice
 
 SOURCE = "agent_deskmate"
 
@@ -637,3 +640,87 @@ def test_describe_actor_is_reusable_for_cards() -> None:
     # 下派观测例外：正文已说明下派，主语不重复
     assert describe_actor(executor="claude-code", delegated_to="deepseek-worker",
                           rule="delegation") == "claude-code"
+
+
+# ── 同工作目录合并（P1c(b)）───────────────────────────────────────────────
+#
+# 2026-11-24 真机：同一目录下三个会话同时出事，连发三条一字不差的
+# 「X 出事了 / Bash 执行失败，它没自己恢复」。三条相同的通知不是三倍
+# 的信息，是三分之一的信息——用户读到第 2 条就开始无视，第 3 条一定无视，
+# 然后连第 1 条也一起无视。
+
+def _notice(*, session: str = "s1", kind: str = "Bash",
+            workspace: str | None = r"D:\proj",
+            role=Role.OUTCOME, detail: str = "Bash 执行失败，它没自己恢复"
+            ) -> Notice:
+    return Notice(role=role, light=Light.ERROR, agent="claude-code",
+                  session=session, who=workspace or "claude-code",
+                  headline=f"{workspace or 'claude-code'} 出事了",
+                  detail=detail, at=1_700_000_000.0, fingerprint=f"fp|{session}",
+                  kind=kind, workspace=workspace)
+
+
+def test_three_sessions_in_one_directory_become_one_notice() -> None:
+    notices = coalesce_same_workspace([_notice(session=f"s{index}")
+                                       for index in range(3)])
+    assert len(notices) == 1
+    assert notices[0].detail == "Bash 执行失败，它没自己恢复（同目录另有 2 个会话）"
+
+
+def test_two_sessions_merge_with_the_right_count() -> None:
+    notices = coalesce_same_workspace([_notice(session="s1"),
+                                       _notice(session="s2")])
+    assert len(notices) == 1
+    assert notices[0].detail.endswith("（同目录另有 1 个会话）")
+
+
+def test_a_different_tool_kind_is_not_merged() -> None:
+    """同目录里 Bash 挂了、WebFetch 也挂了——那是两件事，合成一条就丢了
+    "两种东西同时坏"这个信息。"""
+    notices = coalesce_same_workspace([_notice(session="s1", kind="Bash"),
+                                       _notice(session="s2", kind="WebFetch")])
+    assert len(notices) == 2
+
+
+def test_a_different_directory_is_not_merged() -> None:
+    notices = coalesce_same_workspace([
+        _notice(session="s1", workspace=r"D:\proj"),
+        _notice(session="s2", workspace=r"D:\other"),
+    ])
+    assert len(notices) == 2
+
+
+def test_sessions_without_a_directory_are_not_merged() -> None:
+    """**这条是精度的心脏。** ``who`` 拿不到目录时会退回 agent 名，而
+    ``claude-code`` 是所有无目录会话的共同退回值。按它合并等于把一堆
+    互不相干的会话揉成一条，而且「同目录另有 N 个会话」在没目录时是句假话。
+    """
+    notices = coalesce_same_workspace([
+        _notice(session="s1", workspace=None),
+        _notice(session="s2", workspace=None),
+        _notice(session="s3", workspace=None),
+    ])
+    assert len(notices) == 3
+
+
+def test_waiting_notices_are_not_merged() -> None:
+    """WAITING 指名的是"哪个会话在等你"，合起来就答不了这个问题了。"""
+    notices = coalesce_same_workspace([
+        _notice(session="s1", role=Role.WAITING, detail="等「允许」"),
+        _notice(session="s2", role=Role.WAITING, detail="等「允许」"),
+    ])
+    assert len(notices) == 2
+
+
+def test_the_input_list_is_not_mutated() -> None:
+    """tracker 每轮都重建 notices，但"我会动你的数据"不该是函数签名
+    暗示出来的事——Notice 还是 frozen 的。"""
+    original = [_notice(session="s1"), _notice(session="s2")]
+    before = [n.detail for n in original]
+    coalesce_same_workspace(original)
+    assert [n.detail for n in original] == before
+
+
+def test_a_single_notice_is_returned_untouched() -> None:
+    only = _notice(session="s1")
+    assert coalesce_same_workspace([only]) == [only]

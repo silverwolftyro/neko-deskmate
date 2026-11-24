@@ -605,6 +605,11 @@ class ApprovalRequest(BaseModel):
     session_id: str = Field(default="", description="Claude Code 的 session_id")
     request_id: str = Field(description="我们生成的请求 id")
     tool_name: str = Field(default="", description="要执行的工具名")
+    # Claude Code 那次调用的 tool_use_id。**只用来和转录里的 tool_result 配对**，
+    # 不当请求 id（见类 docstring：那个 id 在父子代理间会重复，而我们可能同时
+    # 挂多个请求）。P1c 靠它把"审批没放行 → 紧随其后的 is_error"认成自伤失败。
+    # hook 负载没带就留空——留空有降级路径，猜一个会把无关的失败一起静音。
+    tool_use_id: str = Field(default="", description="Claude Code 的 tool_use_id，仅用于配对")
     tool_summary: str = Field(default="", description="工具调用的一行摘要（给人看）")
     # 完整命令/目标原文，**不截断**。存在的理由（2026-11-22 A 批）：
     # 风险判定用的是完整命令，而卡片与模型原来都只有截到 120 字的
@@ -708,6 +713,16 @@ class PendingApproval:
             # 污染）。放在这里而不是让调用方硬编 "claude-code"——那是一条看不见的
             # 耦合，中继哪天按来源分流就断了。
             "agent": self.request.agent,
+            "tool_use_id": self.request.tool_use_id,
+            # P1c：这一条最终**工具没有跑**吗。到期没人点、回填被断开 =
+            # 我们没把"允许"送出去，宿主回退到它自己的原生权限流程；
+            # 用户点拒绝 = 明确不让跑。两种情况工具都没跑，紧随其后那条
+            # tool_result is_error 是**我们自己造成的**，不该记成 Agent 故障
+            # （2026-11-24 真机：三条「出事了」全是这么来的）。
+            # 允许（用户点 / L2 自动放行）之后工具真的跑了，它的失败是真实失败。
+            "tool_did_not_run": (
+                self.decided_by in (DECIDED_BY_EXPIRED, DECIDED_BY_HOST_TIMEOUT)
+                or self.decision == APPROVE_DENY),
             "tool_name": self.request.tool_name,
             "tool_summary": self.request.tool_summary,
             "working_directory": self.request.working_directory,
@@ -785,6 +800,9 @@ def build_request(payload: Any) -> ApprovalRequest:
         session_id=str(data.get("session_id") or ""),
         request_id=uuid.uuid4().hex[:12],
         tool_name=tool_name,
+        # 中继原样转发整个 hook 体（只加一个 upstream 字段），所以
+        # tool_use_id 能从负载里直接拿到。拿不到就留空，走降级路径。
+        tool_use_id=str(data.get("tool_use_id") or ""),
         tool_summary=_tool_summary(tool_name, tool_input),
         # 全文单独存一份：卡片、解释卡、模型 prompt 都用它，
         # 不再有人从截断的 summary 里反推命令。

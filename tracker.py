@@ -88,6 +88,11 @@ class Notice:
     at: float
     fingerprint: str
     kind: str = ""
+    # 指名用的工作目录原文（没有就是 None）。**``who`` 分不出这两者**：
+    # 拿不到目录时 ``who`` 会退回 agent 名，而 ``claude-code`` 是**所有**
+    # 无目录会话的共同退回值。P1c 的同目录合并必须只认真有目录的，
+    # 否则会把一堆互不相干的会话揉成一条。
+    workspace: str | None = None
 
     def lines(self) -> tuple[str, ...]:
         """固定三行，不加第四行（B12 P0-2 定稿）。"""
@@ -280,6 +285,19 @@ class ProgressTracker:
         else:
             kind = signal.kind
 
+        # ── 自伤失败：只闭环，不当成 Agent 的失败 ──
+        # P1c。审批到期/拒绝后 Claude 收到的那条 tool_result is_error 是
+        # **插件自己的闸门造成的**：工具根本没跑，Agent 没坏。
+        # 2026-11-24 真机：三条「出事了 / 它没自己恢复」全是这么来的，
+        # 而用户越忙没点卡，通知越多、越像 Agent 坏了。
+        #
+        # 三件事都必须不做：不进 pending_failures（否则 120 秒后播"出事了"）、
+        # 不动 fail_streak（否则攒够 3 次播"在兜圈子"）、不染红灯。
+        # **也刻意不清 pending_failures / 不改灯**——那会把同会话里一次
+        # 真实的未恢复失败一起抹掉，用漏报换漏报不叫修。
+        if signal.self_inflicted:
+            return []
+
         ok = bool(signal.ok)
         streak = state.ok_streak if ok else state.fail_streak
         streak[kind] = streak.get(kind, 0) + 1
@@ -442,6 +460,7 @@ class ProgressTracker:
             role=role, light=light,
             agent=state.agent, session=state.session,
             who=self._who(state),
+            workspace=state.workspace,
             headline=headline, detail=detail,
             at=at, fingerprint=fingerprint, kind=kind,
         )

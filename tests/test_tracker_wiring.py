@@ -43,6 +43,7 @@ from plugin.plugins.agent_deskmate.events import (
     EVENT_TURN_END,
     UnifiedEvent,
 )
+from plugin.plugins.agent_deskmate.gated import GatedFailureLog
 from plugin.plugins.agent_deskmate.progress import Light, Role
 from plugin.plugins.agent_deskmate.tracker import Notice, ProgressTracker, TrackerConfig
 
@@ -60,12 +61,14 @@ def _iso(at: float) -> str:
 
 
 def _step(at: float, *, event: str, ok: bool | None, session: str = "sess-1",
-          action_id: str = "tu_1", kind: str = "Bash") -> UnifiedEvent:
+          action_id: str = "tu_1", kind: str = "Bash",
+          working_directory: str | None = None) -> UnifiedEvent:
     """一步的统一事件。``ok=None`` 表示推不出成败（会被契约层丢掉）。"""
     return UnifiedEvent(
         agent=AGENT, session=session, event=event, tool=kind,
         summary="工具执行失败" if ok else "工具执行完成",
         ts=_iso(at), tool_use_id=action_id, is_error=ok, command=f"{kind} x",
+        working_directory=working_directory,
     )
 
 
@@ -150,6 +153,8 @@ class _Host:
     _sync_tracker_config = AgentDeskmatePlugin._sync_tracker_config
     _feed_tracker = AgentDeskmatePlugin._feed_tracker
     _approval_blocked_sessions = AgentDeskmatePlugin._approval_blocked_sessions
+    _record_gate_stopped = AgentDeskmatePlugin._record_gate_stopped
+    _is_gate_caused = AgentDeskmatePlugin._is_gate_caused
 
     def __init__(self, events=(), progress=None) -> None:
         self.logger = _ListLogger()
@@ -168,6 +173,8 @@ class _Host:
         # 审批在等人的会话。None = 审批网关没起来（真插件 _approval 的初值），
         # 走 "没有阻塞" 分支——这条路径本身也要被测到。
         self._approval = None
+        # P1c：自伤失败登记簿。真插件 _reset_watch_state 建，这里手搭一份。
+        self._gated = GatedFailureLog()
 
     def _push(self, **kwargs):
         self.pushed.append(kwargs)
@@ -461,7 +468,8 @@ def test_rule_hits_go_out_before_progress_notices(monkeypatch) -> None:
 
 
 class _FakeApproval:
-    """只实现 ``snapshot()``——``_approval_blocked_sessions`` 只调它。"""
+    """只实现 ``snapshot()``——``_approval_blocked_sessions`` 与
+    ``_record_gate_stopped`` 都只调它。"""
 
     def __init__(self, rows: list[dict]) -> None:
         self._rows = rows
@@ -476,6 +484,21 @@ def _pending(session: str, agent: str = AGENT) -> dict:
 
 def _settled(session: str, agent: str = AGENT) -> dict:
     return {"session_id": session, "agent": agent, "state": "settled"}
+
+
+def _gate_stopped(session: str, *, tool_use_id: str = "tu_1",
+                  tool_name: str = "Bash") -> dict:
+    """一条「工具没跑成」的已了结审批（到期 / 拒绝 / 回填断开）。"""
+    return {"session_id": session, "agent": AGENT, "state": "settled",
+            "tool_use_id": tool_use_id, "tool_did_not_run": True,
+            "tool_name": tool_name}
+
+
+def _gate_allowed(session: str, *, tool_use_id: str = "tu_1") -> dict:
+    """一条放行了、工具真的跑了的审批。它的失败是真实失败。"""
+    return {"session_id": session, "agent": AGENT, "state": "settled",
+            "tool_use_id": tool_use_id, "tool_did_not_run": False,
+            "tool_name": "Bash"}
 
 
 def test_no_approval_gateway_blocks_nothing() -> None:
@@ -546,3 +569,163 @@ def test_the_action_survives_the_block_and_reports_afterwards() -> None:
     host.poll()
     assert len(host.pushed) == 1
     assert "没有回包" in host.pushed[0]["parts"][0]["text"]
+
+
+# ── F. P1c：闸门造成的失败不点亮 🔴 ─────────────────────────────────────
+#
+# 2026-11-24 真机：审批 570s 到期 → tool_result is_error=true → 120 秒后
+# 连发三条「出事了 / 它没自己恢复」。失败是插件的闸门造成的，
+# 却被报成 Agent 故障。用户越忙没点卡，通知越多、越像 Agent 坏了。
+
+def test_no_approval_gateway_records_nothing() -> None:
+    """审批中继没起来 → 簿子空着。"没有自伤失败"正是没有审批时的正确表现。"""
+    host = _Host()
+    host._record_gate_stopped()                       # noqa: SLF001
+    assert len(host._gated) == 0                       # noqa: SLF001
+
+
+def test_a_pending_approval_records_nothing() -> None:
+    """还挂着等的记录着么子——工具还没被拒，谈不上一自伤。"""
+    host = _Host()
+    host._approval = _FakeApproval([_pending("s1")])   # noqa: SLF001
+    host._record_gate_stopped()                        # noqa: SLF001
+    assert len(host._gated) == 0                       # noqa: SLF001
+
+
+def test_an_allowed_approval_records_nothing() -> None:
+    """放行了、工具真的跑了 → 它的失败是真实失败，不许被静音。"""
+    host = _Host()
+    host._approval = _FakeApproval([_gate_allowed("s1")])  # noqa: SLF001
+    host._record_gate_stopped()                        # noqa: SLF001
+    assert len(host._gated) == 0                       # noqa: SLF001
+
+
+def test_an_expired_approval_is_recorded() -> None:
+    host = _Host()
+    host._approval = _FakeApproval([_gate_stopped("s1")])  # noqa: SLF001
+    host._record_gate_stopped()                        # noqa: SLF001
+    assert len(host._gated) == 1                       # noqa: SLF001
+
+
+def test_recording_twice_keeps_one_entry() -> None:
+    """轮询每 3 秒全扫一遍，不幂等的话 ``at`` 会被不断刷新、窗口永不过期。"""
+    host = _Host()
+    host._approval = _FakeApproval([_gate_stopped("s1")])  # noqa: SLF001
+    for _ in range(5):
+        host._record_gate_stopped()                    # noqa: SLF001
+    assert len(host._gated) == 1                       # noqa: SLF001
+
+
+def test_the_gate_caused_tool_result_never_reaches_the_chat() -> None:
+    """**P1c 的核心。** 到期后那条 is_error 只闭环、不记账：
+    既不进 pending_failures（没有「出事了」），也不留成孤儿 action
+    （没有「有一步没有回包」）。"""
+    at = _now() - 400
+    host = _Host([_action_step(at, session="s1", action_id="tu_1"),
+                  _failed_step(at + 1, session="s1", action_id="tu_1")])
+    host._approval = _FakeApproval([_gate_stopped("s1")])  # noqa: SLF001
+    host.poll()
+    assert host.pushed == []
+    # action 真的闭环了：留成孤儿的话 300 秒后会变成"未回包"
+    assert host._tracker.state_of(AGENT, "s1").open_actions == {}  # noqa: SLF001
+    for _ in range(3):
+        assert host.poll() == []
+
+
+def test_a_real_failure_in_the_same_session_still_speaks() -> None:
+    """同会话里另一次调用失败了，不能因为"刚过期过一条审批"就一起静音。"""
+    at = _now() - 400
+    host = _Host([_action_step(at, session="s1", action_id="tu_1"),
+                  _failed_step(at + 1, session="s1", action_id="tu_1"),
+                  _failed_step(at + 2, session="s1", action_id="tu_2")])
+    host._approval = _FakeApproval([_gate_stopped("s1")])  # noqa: SLF001
+    host.poll()
+    assert len(host.pushed) == 1
+    assert "出事了" in host.pushed[0]["parts"][0]["text"]
+
+
+def test_a_failure_in_another_session_still_speaks() -> None:
+    at = _now() - 400
+    host = _Host([_failed_step(at, session="s2", action_id="tu_9")])
+    host._approval = _FakeApproval([_gate_stopped("s1")])  # noqa: SLF001
+    host.poll()
+    assert len(host.pushed) == 1
+
+
+def test_an_allowed_tool_that_fails_is_a_real_failure() -> None:
+    """反向钉死：审批放行了、工具跑了、它失败了——那必须报。"""
+    at = _now() - 400
+    host = _Host([_action_step(at, session="s1", action_id="tu_1"),
+                  _failed_step(at + 1, session="s1", action_id="tu_1")])
+    host._approval = _FakeApproval([_gate_allowed("s1")])  # noqa: SLF001
+    host.poll()
+    assert len(host.pushed) == 1
+    assert "出事了" in host.pushed[0]["parts"][0]["text"]
+
+
+def test_a_successful_tool_result_is_never_gate_caused() -> None:
+    """只对 is_error 问这个问题。成功的 outcome 走 ok=True 分支，
+    压根不进失败记账。"""
+    host = _Host()
+    assert host._is_gate_caused(                        # noqa: SLF001
+        _ok_step(_now(), session="s1", action_id="tu_1")) is False
+
+
+def test_the_degraded_path_is_logged_every_time() -> None:
+    """拿不到 tool_use_id 时的降级必须留痕——静默的降级等于没有降级，
+    真机上出了一次"该报的没报"，排查时唯一能依靠的就是这一行。"""
+    at = _now() - 400
+    host = _Host([_failed_step(at, session="s1", action_id="tu_1")])
+    host._approval = _FakeApproval([_gate_stopped("s1", tool_use_id="")])  # noqa: SLF001
+    host.poll()
+    assert host.pushed == []
+    assert any("降级规则静音" in line for line in host.logger.lines)
+
+
+def test_the_degraded_path_only_saves_one_failure() -> None:
+    """降级是"两边都没有 id"时的办法，一次审批只免一次。"""
+    at = _now() - 400
+    host = _Host([_failed_step(at, session="s1", action_id="tu_1"),
+                  _failed_step(at + 1, session="s1", action_id="tu_2")])
+    host._approval = _FakeApproval([_gate_stopped("s1", tool_use_id="")])  # noqa: SLF001
+    host.poll()
+    assert len(host.pushed) == 1, "降级路径把第二次失败也静音了"
+
+
+# ── G. P1c(b)：同工作目录的重复通知合成一条 ─────────────────────────────
+
+def test_three_sessions_in_one_directory_send_one_notice() -> None:
+    """2026-11-24 真机：同目录三会话一字不差的三条 → 一条带数量的。"""
+    at = _now() - 300
+    events = [_failed_step(at, session=f"s{index}", action_id=f"tu_{index}",
+                           working_directory=r"D:\proj")
+              for index in range(3)]
+    host = _Host(events)
+    host.poll()
+    assert len(host.pushed) == 1
+    text = host.pushed[0]["parts"][0]["text"]
+    assert "同目录另有 2 个会话" in text
+    assert text.startswith(r"D:\proj")
+
+
+def test_two_directories_stay_two_notices() -> None:
+    """合并不是为了少说话，是为了不说重复的话。"""
+    at = _now() - 300
+    events = [_failed_step(at, session="s1", action_id="tu_1",
+                           working_directory=r"D:\proj"),
+              _failed_step(at, session="s2", action_id="tu_2",
+                           working_directory=r"D:\other")]
+    host = _Host(events)
+    host.poll()
+    assert len(host.pushed) == 2
+
+
+def test_sessions_without_a_directory_are_not_merged() -> None:
+    """``who`` 会退回 agent 名，而那是所有无目录会话的共同值。
+    按它合并等于把互不相干的会话揉成一条。"""
+    at = _now() - 300
+    events = [_failed_step(at, session=f"s{index}", action_id=f"tu_{index}")
+              for index in range(3)]
+    host = _Host(events)
+    host.poll()
+    assert len(host.pushed) == 3

@@ -86,13 +86,26 @@ from .approval import (
     warning_mode_for_tier,
 )
 from .auto_review import AutoReviewer
-from .broadcast import Broadcaster, broadcast_notice, describe_actor, render_text
+from .broadcast import (
+    Broadcaster,
+    broadcast_notice,
+    coalesce_same_workspace,
+    describe_actor,
+    render_text,
+)
 from .commands import (
     COMMAND_DISPLAY_MAX,
     CONCLUSION_UNSURE,
     command_length,
 )
-from .events import AGENT_CLAUDE_CODE, UnifiedEvent, attribute, delegated_server
+from .events import (
+    AGENT_CLAUDE_CODE,
+    EVENT_TOOL_RESULT,
+    UnifiedEvent,
+    attribute,
+    delegated_server,
+)
+from .gated import MODE_DEGRADED, GatedFailureLog
 from .hooksetup import (
     install_hook,
     installed_hook,
@@ -680,6 +693,11 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # 于是日志写"余下留待下一轮"、实际那条通知永久消失。
         # 规则层丢的就是一条删除播报——不可接受。
         self._pending_pushes: list[Callable[[], str]] = []
+        # P1c：闸门自己造成的失败登记簿。**建在这里**而不是 _ensure_watchers，
+        # 理由同 _tracker——那条路有缓存早退，会被整条绕过。
+        # 审批网关起不起来都不影响它（起不来时这本簿子永远是空的，
+        # 等于"没有自伤失败"，正是没有审批时的正确表现）。
+        self._gated = GatedFailureLog()
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     # startup 用 async def、shutdown 用 def，刻意对齐官方 memo_reminder 的写法：
@@ -1065,11 +1083,67 @@ class AgentDeskmatePlugin(NekoPluginBase):
         ``signal_from_event`` 返回 None 是**正常分支**（占位消息、没有
         action_id 的 tool_use、没有判决的 error），不是错误。所以这里不记
         日志——按实测占比它才是多数，记一行就会把日志刷成噪音。
+
+        P1c：闸门自己造成的失败照旧进 tracker（要闭环那个 action），
+        但带上 ``self_inflicted``——tracker 会只闭环、不当成 Agent 的失败。
+        **不在这里把事件整个丢掉**：那样 ``open_actions`` 里那个 action
+        永远配不上 outcome，570 秒后变成一条「有一步没有回包」，
+        用一个假警报换掉另一个假警报。
         """
-        signal = signal_from_event(event)
+        signal = signal_from_event(
+            event, self_inflicted=self._is_gate_caused(event))
         if signal is None:
             return []
         return self._tracker.feed(signal)
+
+    # ── P1c：闸门自己造成的失败 ───────────────────────────────────────────
+
+    def _record_gate_stopped(self) -> None:
+        """把「工具没跑成」的已了结审批记进自伤簿。
+
+        数据源就是 ``approval.snapshot()``——和 ``_approval_blocked_sessions``
+        同一份。刻意**不**在审批的各个了结点上打补丁：那里有五六处
+        （用户点、L2 放行、到期、回填断开、关服务），漏一处的表现是
+        "自伤抑制静默失效"，而这种失效在日志里什么都没有。
+        轮询全扫 + ``record`` 幂等，是唯一不会漏的形状。
+
+        代价是每 3 秒扫一遍已了结记录。记录数受 ``retention_seconds``
+        限制（默认一小时），实测量级在几十条，扫一遍的成本可以忽略。
+        """
+        approval = self._approval
+        if approval is None:
+            return
+        for row in approval.snapshot():
+            if row.get("state") == "pending" or not row.get("tool_did_not_run"):
+                continue
+            self._gated.record(
+                session=str(row.get("session_id") or ""),
+                tool_use_id=str(row.get("tool_use_id") or ""),
+                kind=str(row.get("tool_name") or ""),
+            )
+
+    def _is_gate_caused(self, event: UnifiedEvent) -> bool:
+        """这个失败事件是插件自己的闸门造成的吗。
+
+        只对 ``tool_result`` 且 ``is_error`` 问这个问题——其它事件问了
+        也会被 ``Signal.__post_init__`` 拒收，不如一开始就不问。
+        """
+        if event.event != EVENT_TOOL_RESULT or event.is_error is not True:
+            return False
+        cfg = self._tracker_cfg
+        window = (cfg.failure_confirm_seconds if cfg is not None
+                  else DEFAULT_CONFIG.failure_confirm_seconds)
+        mode = self._gated.claim(session=event.session,
+                                 tool_use_id=event.tool_use_id or "",
+                                 degraded_window=window)
+        if mode == MODE_DEGRADED:
+            # 降级路径每次都要留痕。静默的降级等于没有降级——真机上
+            # 出了一次"该报的没报"，排查时唯一能依靠的就是这一行。
+            self.logger.info(
+                "审批造成的失败按降级规则静音：会话 {} 拿不到 tool_use_id，"
+                "只能按「会话 + {}s 窗口内首次」判，未做精确配对",
+                event.session or "无", f"{window:g}")
+        return bool(mode)
 
     def _approval_blocked_sessions(self) -> set[tuple[str, str]]:
         """当前有审批挂在等人点的 (agent, session)。
@@ -1129,11 +1203,19 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # 顺序反过来会出这种事：规则层撞上限提前 return，tick 一次没跑，
         # "未回包"整整晚一个回合才发现。
         self._sync_tracker_config(config)
+        # P1c：先登记、后喂事件。顺序反了的话，「到期」和「tool_result 落进
+        # 转录」出现在同一轮时，那条 tool_result 就来不及被认成自伤——
+        # 而它 120 秒后照样播一条「出事了」。
+        self._record_gate_stopped()
         notices: list[Notice] = []
         for event in events:
             notices.extend(self._feed_tracker(event))
         notices.extend(self._tracker.tick(time.time(),
                                           self._approval_blocked_sessions()))
+        # P1c(b)：同目录多会话一字不差的重复通知合成一条。
+        # 放在这里而不是 tracker 里：tracker 的指纹去重按会话记账是对的
+        # （每个会话自己的状态没被污染），要合并的是"用户看到几条"。
+        notices = coalesce_same_workspace(notices)
 
         # 规则层排在通知层**前面**：删除/下派是安全信号，撞上条数上限时该被
         # 推迟的是进度播报，不是"它刚删了文件"。tracker 的 Notice 本就按

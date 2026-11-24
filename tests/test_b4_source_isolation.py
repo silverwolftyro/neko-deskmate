@@ -35,6 +35,7 @@ from plugin.plugins.agent_deskmate.adapters.gateway import (
     current_watermark,
     read_new_gateway_events,
 )
+from plugin.plugins.agent_deskmate.gated import GatedFailureLog
 from plugin.plugins.agent_deskmate.tracker import ProgressTracker
 
 GATEWAY_SCHEMA = """
@@ -97,6 +98,8 @@ class WatcherHost:
     _sync_tracker_config = AgentDeskmatePlugin._sync_tracker_config
     _feed_tracker = AgentDeskmatePlugin._feed_tracker
     _approval_blocked_sessions = AgentDeskmatePlugin._approval_blocked_sessions
+    _record_gate_stopped = AgentDeskmatePlugin._record_gate_stopped
+    _is_gate_caused = AgentDeskmatePlugin._is_gate_caused
     _adapter_status = AgentDeskmatePlugin._adapter_status
     _ADAPTER_SOURCES = AgentDeskmatePlugin._ADAPTER_SOURCES
 
@@ -115,6 +118,8 @@ class WatcherHost:
         self.push_message = RecordingPush()
         # 审批网关没起来 → 没有会话被阻塞（真插件 _approval 的初值是 None）。
         self._approval = None
+        # P1c：自伤失败登记簿。真插件 _reset_watch_state 建，这里手搭一份。
+        self._gated = GatedFailureLog()
 
 
 def _tool_line(command: str, session: str = "sess-1") -> str:

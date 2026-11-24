@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import Any, Callable
 
 from .events import (
@@ -29,6 +30,7 @@ from .progress import (
     LIGHT_IDLE,
     LIGHT_RUNNING,
     LIGHT_WAITING,
+    Role,
 )
 from .rules import (
     RULE_DELEGATION,
@@ -442,6 +444,80 @@ def _light_key(light: object) -> str:
     """
     value = getattr(light, "value", None)
     return value if isinstance(value, str) else str(light)
+
+
+# ── 同工作目录合并（P1c(b)）───────────────────────────────────────────────
+#
+# 2026-11-24 真机：同一目录下三个会话同时出事，连发三条
+# 「X 出事了 / Bash 执行失败，它没自己恢复」——**文案一字不差**。
+# 三条相同的通知不是三倍的信息，是三分之一的信息：用户读到第 2 条就开始无视，
+# 第 3 条一定无视，然后连第 1 条也一起无视。
+#
+# ⚠️ 与 B12 P0-2 删掉的东西**不是一回事**，不要因为怕回到老路就不做：
+# 当年删的是「有 N 条待判断」那种会 0→1→0 抖动的抽象计数；
+# 这里是一次性真实批量（n 个会话确实同时因同一原因失败），
+# 合并符合「精度 > 召回」。
+MERGE_SUFFIX = "（同目录另有 {count} 个会话）"
+
+
+def coalesce_same_workspace(notices: list[Notice]) -> list[Notice]:
+    """同一工作目录、同一工具类别的通知合成一条，其余折进第二行的尾巴。
+
+    **只合 OUTCOME**（出事了 / 没有回包 / 在兜圈子）：它们是唯一会
+    在多会话间一字不差重复的一类。WAITING 指名的是"哪个会话在等你"，
+    合起来就答不了这个问题了。
+
+    **只合真有工作目录的**。``Notice.who`` 在拿不到目录时会退回 agent 名，
+    而 ``claude-code`` 是**所有**无目录会话的共同退回值——按它合并等于把
+    一堆互不相干的会话揉成一条，那是用漏报换简洁，而且「同目录另有 N 个
+    会话」在没有目录时是一句假话。所以判据是 ``notice.workspace``，
+    不是 ``notice.who``。
+
+    返回新列表，不改入参（tracker 那边每轮都会重建 notices，但函数签名
+    不该暗示"我会动你的数据"）。
+    """
+    order: list[Notice] = []
+    # 桶 → 它在 ``order`` 里的位置。**必须记位置而不是只记 Notice**：
+    # 早先的写法把合并结果塞回 dict、却让 ``kept`` 留着原对象，
+    # 于是"合并"静默地什么都没做——通知照旧三条，一条不少。
+    index: dict[tuple[str, str], int] = {}
+    for notice in notices:
+        if notice.role != Role.OUTCOME or not notice.workspace:
+            order.append(notice)
+            continue
+        bucket = (notice.workspace, notice.kind)
+        position = index.get(bucket)
+        if position is None:
+            index[bucket] = len(order)
+            order.append(notice)
+            continue
+        # 同目录同类别：把这条折进第一条的尾巴。用 dataclasses.replace
+        # 而不是改字段——Notice 是 frozen 的，而且"改调用方的对象"
+        # 正是这类合并最容易出的 bug。
+        first = order[position]
+        order[position] = replace(first, detail=_merge_detail(first, notice))
+    return order
+
+
+def _merge_detail(first: Notice, extra: Notice) -> str:
+    """把 ``extra`` 折进 ``first`` 的第二行。
+
+    从 ``first.detail`` 里已有的尾巴续号，而不是另起一个计数器——
+    三个会话时第一条先变成「…（同目录另有 1 个会话）」，再来第三条要变成
+    「…（同目录另有 2 个会话）」，不是「…（同目录另有 1 个会话）（同目录另有 1 个会话）」。
+    """
+    count = _merged_count(first.detail) + 1
+    detail = _MERGE_TAIL.sub("", first.detail).rstrip()
+    return f"{detail}{MERGE_SUFFIX.format(count=count)}"
+
+
+def _merged_count(detail: str) -> int:
+    """第二行尾巴上已经合并了几条。没有尾巴就是 0。"""
+    match = _MERGE_TAIL.search(detail)
+    return int(match.group("count")) if match else 0
+
+
+_MERGE_TAIL = re.compile(r"（同目录另有 (?P<count>\d+) 个会话）\s*$")
 
 
 def broadcast_notice(push: Callable[..., dict], notice: Notice, *, source: str,

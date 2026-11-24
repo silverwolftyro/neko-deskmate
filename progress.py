@@ -121,6 +121,10 @@ class Signal:
     ok: bool | None = None
     reason: str | None = None
     kind: str = ""
+    # P1c：这次失败是**插件自己的闸门造成的**（审批到期/拒绝后 Claude 收到的
+    # 那条 tool_result is_error）。 tracker 只闭环、不当成 Agent 的失败记账。
+    # 默认 False——绝大多数失败都是真实的，需要调用方显式指认。
+    self_inflicted: bool = False
 
     def __post_init__(self) -> None:
         role = self.role
@@ -160,6 +164,11 @@ class Signal:
                 f"action_id 只有 action / outcome 有意义，{role.value} 上不许填")
         if role is not Role.WAITING and self.reason is not None:
             raise ValueError(f"reason 只有 waiting 有意义，{role.value} 上不许填")
+        # 同 ok：自伤只在"失败了"这件事上有意义。一条 action 上挂 self_inflicted
+        # 是适配器写错了，让它当场炸，而不是留成一个解释不了的幽灵状态。
+        if self.self_inflicted and role is not Role.OUTCOME:
+            raise ValueError(
+                f"self_inflicted 只有 outcome 有意义，{role.value} 上不许填")
 
     # ── 两个派生量 ────────────────────────────────────────────────────────
 
@@ -300,8 +309,13 @@ def failure_is_loud(kind: str) -> bool:
 # 无证据判 True 会压掉一次真失败（最坏方向），无证据判 False 会造一次
 # 假警报（精度原则禁止的方向）。两条都不如丢。
 
-def signal_from_event(event: Any) -> Signal | None:
+def signal_from_event(event: Any, *, self_inflicted: bool = False) -> Signal | None:
     """把一条 `UnifiedEvent` 映射成 Signal。认不出的类型返回 None。
+
+    ``self_inflicted`` 由调用方指认（见 ``gated.GatedFailureLog``）：
+    这次失败是插件自己的闸门造成的。**只有 outcome 分支会用它**——
+    其它角色上传了会被 ``Signal.__post_init__`` 拒收，所以这里刻意
+    不替调用方"兜着"，形状错了就该当场炸。
 
     时间不可信时**返回 None，不造一个时间**：`at` 是超时判断的唯一依据，
     编一个值会让"未回包"和"停滞"两类检测同时静默失效。
@@ -347,6 +361,7 @@ def signal_from_event(event: Any) -> Signal | None:
             action_id=_optional(getattr(event, "tool_use_id", None)),
             ok=not bool(is_error),
             kind=_clip(tool),
+            self_inflicted=bool(self_inflicted),
         )
 
     # boundary：不带 action_id、不带 ok。它标记的是"这一轮交接了"，
