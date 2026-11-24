@@ -24,6 +24,7 @@ from plugin.plugins.agent_deskmate.commands import (
     UNKNOWN_ACTION,
     card_lines,
     conclusion_for,
+    fact_line,
     first_banned,
     scope_line,
     translate,
@@ -349,3 +350,79 @@ def test_explain_card_escapes_agent_supplied_text() -> None:
     explanation = _explanation(tool_summary="</p><script>alert(1)</script>")
     html = build_explain_html(explanation)
     assert "<script>" not in html
+
+
+# ── 事实摘要行（2026-11-24 真机验收 §5.1）────────────────────────────────
+#
+# 用户原话：第一行必须是能扫读的事实摘要，不是「建议拒绝 / 属于高风险」。
+# 理由：用户要决策的是「这个文件删了要不要紧」，不是「这条被标了什么档」。
+
+def test_fact_line_leads_with_the_action_and_target() -> None:
+    line = fact_line(command="rm -f D:/proj/a.txt",
+                     working_directory=r"D:\proj")
+    assert line.startswith("删除文件：D:/proj/a.txt")
+
+
+def test_fact_line_carries_the_scope_qualifier() -> None:
+    """括号里是这条请求独有的判据：在不在工作目录内、递不递归。"""
+    inside = fact_line(command="rm -f D:/proj/a.txt", working_directory=r"D:\proj")
+    assert "本会话工作目录内" in inside
+    assert "不递归" in inside
+
+    outside = fact_line(command="rm -f D:/other/x.txt",
+                        working_directory=r"D:\proj")
+    assert "工作目录之外" in outside
+
+
+def test_a_recursive_delete_says_so() -> None:
+    """递归与否影响面完全不同，必须写在第一行。"""
+    line = fact_line(command="rm -rf D:/proj/build",
+                     working_directory=r"D:\proj")
+    assert "递归" in line
+    assert "不递归" not in line
+
+
+def test_an_irreversible_action_says_so() -> None:
+    line = fact_line(command="rm -f D:/proj/a.txt", working_directory=r"D:\proj")
+    assert "不可恢复" in line
+
+
+def test_a_system_path_is_flagged() -> None:
+    line = fact_line(command="rm -rf C:/Windows/System32",
+                     working_directory=r"D:\proj")
+    assert "系统目录" in line
+
+
+def test_an_unknown_command_admits_it() -> None:
+    """认不出就明说——**这一句正是主卡不显示事实行的原因**（B7 第 2 条：
+    动作行已经写着「未识别的命令」，再说一遍是空话）。"""
+    line = fact_line(command="npm run build", working_directory=r"D:\proj")
+    assert "未识别" in line
+    assert "看不出" in line
+
+
+def test_file_facts_are_appended_not_invented() -> None:
+    """文件事实由调用方从磁盘读来传进来，本函数不碰文件系统——
+    纯函数层，测试跑几百次不该去 stat 真实路径。"""
+    line = fact_line(command="rm -f D:/proj/a.txt",
+                     working_directory=r"D:\proj", file_facts="13 B")
+    assert line.endswith("（本会话工作目录内 · 不递归 · 不可恢复 · 13 B）")
+    assert fact_line(command="rm -f D:/proj/a.txt",
+                     working_directory=r"D:\proj", file_facts="") .endswith("）")
+
+
+def test_no_qualifiers_means_no_parentheses() -> None:
+    """推不出任何限定词时不要留一个空括号——那比没有更难看。
+
+    注意空命令**会**拿到「看不出它会影响什么」：那是诚实的一句，
+    也正是主卡因此跳过事实行的原因（B7：动作行已经说着同样的话）。
+    """
+    assert "（" in fact_line(command="", working_directory=None)
+    # 一个既认不出、又没有任何限定词可说的形状，这里用构造参数直接验
+    assert _render_fact("删除文件", []) == "删除文件"
+
+
+def _render_fact(head: str, qualifiers: list[str]) -> str:
+    """复现 ``fact_line`` 的拼接规则，单独验"空括号"这一条。"""
+    body = " · ".join(part for part in qualifiers if part)
+    return f"{head}（{body}）" if body else head

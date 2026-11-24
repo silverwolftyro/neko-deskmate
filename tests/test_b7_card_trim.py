@@ -55,31 +55,41 @@ def _card(**overrides) -> str:
     return build_card_html(**base)
 
 
-# ── 1. 结论行 ────────────────────────────────────────────────────────────
+# ── 1. 结论行：2026-11-24 真机验收 §5.4 起，主卡上不再有结论 ────────────
+#
+# 用户原话：正文只留「删哪个文件 + 允许/拒绝分别会怎样」，而结论是别人的
+# 判断，不该排在用户自己的依据前面。结论搬进了「这是什么」（见
+# test_card_advice.py 那一组），所以这一组从"结论长什么样"变成
+# "主卡上不许再有结论"——同一个不变式，换了个方向守。
 
 def test_no_advice_means_no_conclusion_line_at_all() -> None:
     """任务书 B7 测试第一条：无模型建议 → 没有结论行、没有建议块。"""
     for state in ("disabled", "no_key", "unauthorized", "fallback"):
-        html = _card(advice_state=state, conclusion=CONCLUSION_ALLOW)
+        html = _card(advice_state=state)
         assert 'class="verdict"' not in html, state
         assert CONCLUSION_ALLOW not in _visible(html), state
 
 
 def test_the_unsure_conclusion_is_silent_not_printed() -> None:
     """「无法判断，需要你决定」整行不显示。"""
-    html = _card(advice_state=ADVICE_STATE_READY, conclusion=CONCLUSION_UNSURE)
+    html = _card(advice_state=ADVICE_STATE_READY)
     assert CONCLUSION_UNSURE not in _visible(html)
-    # 沉默不等于没有卡片：动作行和按钮照旧
-    assert "⚠️ 它要删除文件" in html
+    # 沉默不等于没有卡片：事实行和按钮照旧
+    assert 'class="fact"' in html
     assert 'data-neko-action="deskmate_approve"' in html
 
 
-@pytest.mark.parametrize("conclusion", [CONCLUSION_ALLOW, CONCLUSION_DENY])
-def test_a_definite_conclusion_is_bold_and_on_top(conclusion: str) -> None:
-    """任务书 B7 测试第四条：有确定结论 → 结论行在最上方、加粗。"""
-    html = _card(advice_state=ADVICE_STATE_READY, conclusion=conclusion)
-    assert f'<p class="verdict"><strong>{conclusion}</strong></p>' in html
-    assert html.index(f"<strong>{conclusion}</strong>") < html.index("⚠️ 它要")
+@pytest.mark.parametrize("state", ["ready", "disabled", "no_key", "fallback"])
+def test_the_main_card_never_shows_a_conclusion(state: str) -> None:
+    """§5.4：结论搬走了，**主卡上一个字都不许留**。
+
+    三种合法结论 + 第三态全查一遍——漏一个就意味着用户还能在卡片上
+    看到"建议允许"，而那正是本轮要改掉的东西。
+    """
+    html = _card(advice_state=state)
+    assert 'class="verdict"' not in html, state
+    for phrase in (CONCLUSION_ALLOW, CONCLUSION_DENY, CONCLUSION_UNSURE):
+        assert phrase not in _visible(html), (state, phrase)
 
 
 # ── 2. 后果 / 范围：空字段不占位 ─────────────────────────────────────────
@@ -104,9 +114,13 @@ def test_a_non_delete_command_shows_neither() -> None:
 
 
 def test_a_delete_still_shows_its_scope() -> None:
-    """删除类的范围是**这条请求独有**的判据，必须显示。"""
+    """删除类的范围是**这条请求独有**的判据，必须显示。
+
+    2026-11-24 真机验收 §5.1 起它不再是独立一行，折进事实行的小括号
+    （长句压成能并排读的短语）。判据没变，位置变了。"""
     html = _card(command="rm -rf D:/other/x.txt")
-    assert "范围：这个文件在它的工作目录之外" in html
+    assert "工作目录之外" in html
+    assert "范围：" not in html
 
 
 def test_the_specificity_predicates() -> None:
@@ -128,7 +142,13 @@ def test_the_main_card_has_no_actor_or_upstream_lines() -> None:
     assert "执行：" not in html
     assert "上游" not in html
     assert "DeepSeek Harness" not in html
-    assert "会话" not in html
+    # **只查定位三件套的实际形状，不查「会话」这两个字**。
+    # 2026-11-24 之前这里写的是 ``"会话" not in html``，而真机验收 §5.6
+    # 要求正文写「拒绝 → 这次调用不执行，会话继续」——那句话里的"会话"
+    # 是普通名词，不是定位信息。拿裸词当判据会把合法文案一起判死，
+    # 于是下次改文案只会看到一条莫名其妙的红。
+    assert "会话 " not in html          # 「会话 800257f3」这种定位尾巴
+    assert "800257f3" not in html
 
 
 def test_they_land_in_the_explain_card_instead() -> None:
@@ -161,11 +181,9 @@ def test_the_card_stays_within_the_line_budget() -> None:
     按**渲染后的可见文本行**计：标题、结论（有的话）、动作、辅助、三个按钮。
     """
     cases = [
-        dict(command="rm -rf ~"),                                   # 删除 + 结论 + 范围
-        dict(command="rm -rf ~", advice_state=ADVICE_STATE_READY,
-             conclusion=CONCLUSION_DENY),
-        dict(command="rm a && git reset --hard"),                    # 两条动作
-        dict(command="git status"),                                 # 什么都说不清
+        dict(command="rm -rf ~"),                       # 删除：事实行 + 允许/拒绝
+        dict(command="rm a && git reset --hard"),       # 两条动作
+        dict(command="git status"),                     # 什么都说不清
         dict(command="npm run build"),
     ]
     for case in cases:
@@ -175,17 +193,19 @@ def test_the_card_stays_within_the_line_budget() -> None:
         assert actions <= 2, (case, actions)
         assert len(lines) <= 1 + actions + MAX_CARD_AUX_LINES + 3, (
             case, lines)
-        assert 'class="verdict"' in html or actions >= 1
+        # 结论撤了之后，"有内容"这件事由事实行或动作行担着
+        assert 'class="fact"' in html or actions >= 1, case
 
 
-def test_a_compound_command_gets_two_action_lines_and_one_auxiliary() -> None:
-    """两条动作 + 结论 = 预算用满；后果让位（范围优先，它是独有判据）。"""
-    html = _card(command="rm -rf a && git reset --hard",
-                 advice_state=ADVICE_STATE_READY, conclusion=CONCLUSION_ALLOW)
+def test_a_compound_command_gets_two_action_lines() -> None:
+    """B3 的安全件：一条命令里两个动作，**两条都要列**——
+    没被描述的动作等于被默认批准。这条在 §5.4 之后更重要了：
+    结论撤了，动作行是卡片上唯一说"它到底要干什么"的地方。"""
+    html = _card(command="rm -rf a && git reset --hard")
     assert html.count('class="act"') == 2
-    assert 'class="verdict"' in html
+    assert 'class="verdict"' not in html
     assert "后果：" not in html
-    assert "范围：" in html          # 范围优先于后果，它是这条请求独有的
+    assert "范围：" not in html      # 范围折进事实行了，不再单列
     # 主卡只列两条；第三条没有丢——在「这是什么」里
     explanation = explain_request(
         tool_name="Bash", tool_summary="Bash", working_directory=WD,
@@ -210,8 +230,7 @@ def test_an_over_limit_command_shows_no_conclusion() -> None:
     别的调用方漏了这道检查，一个没有依据的"建议允许"照样会印到卡上。
     """
     long_command = "rm -rf " + " ".join(f"dir{i}" for i in range(60))
-    html = _card(command=long_command, advice_state=ADVICE_STATE_READY,
-                 conclusion=CONCLUSION_ALLOW)
+    html = _card(command=long_command)
     assert 'class="verdict"' not in html
     assert "建议允许" not in _visible(html)
     assert "命令共" in html          # 但"你没看全"那句在

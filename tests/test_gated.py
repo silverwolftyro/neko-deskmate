@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 
 from plugin.plugins.agent_deskmate.gated import (
+    GATED_DEGRADED_WINDOW_SECONDS,
     GATED_FAILURE_LIMIT,
     GATED_FAILURE_WINDOW_SECONDS,
     MODE_DEGRADED,
@@ -199,3 +200,29 @@ def test_claim_without_a_session_is_a_plain_miss(session, tool_use_id) -> None:
     log.record(session="s1", tool_use_id="tu_1", kind="Bash", at=T0)
     assert log.claim(session=session, tool_use_id=tool_use_id,
                      degraded_window=120, now=T0) == ""
+
+
+def test_the_degraded_window_is_the_documented_one() -> None:
+    """30s，不是 ``failure_confirm_seconds``(120s)。
+
+    要匹配的是「闸门的 fallout 什么时候落进转录」——hook 阻塞着 Agent，
+    了结 → 宿主回填 → Claude 写转录 → 下一轮 3 秒轮询读到，各环节都是秒级。
+    120s 的代价是闸门了结之后 Agent 继续干活，90 秒后一次**无关的真实失败**
+    也会被静音——压掉真失败是最坏方向。
+    """
+    assert GATED_DEGRADED_WINDOW_SECONDS == 30.0
+
+
+def test_a_failure_well_after_the_gate_settled_is_not_blamed() -> None:
+    """**这一条是窄化窗口的收益。** 120s 窗口会把 90 秒后一次无关的
+    真实失败一起静音；30s 不会。"""
+    log = _log()
+    log.record(session="s1", tool_use_id="", kind="Bash", at=T0)
+    assert log.claim(session="s1", tool_use_id="",
+                     degraded_window=GATED_DEGRADED_WINDOW_SECONDS,
+                     now=T0 + 30) == MODE_DEGRADED
+    # 31 秒后：链条早该走完了，这次失败是 Agent 自己后面干出来的
+    log.record(session="s2", tool_use_id="", kind="Bash", at=T0)
+    assert log.claim(session="s2", tool_use_id="",
+                     degraded_window=GATED_DEGRADED_WINDOW_SECONDS,
+                     now=T0 + 31) == ""

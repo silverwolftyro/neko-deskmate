@@ -51,6 +51,7 @@ from plugin.plugins.agent_deskmate.approval import (
     ENTRY_DECIDE,
     ENTRY_EXPLAIN,
     HOOK_PATH,
+    WARNING_BANNER,
     ApprovalGateway,
     ApprovalRequest,
     AuthorizationRecord,
@@ -1306,24 +1307,28 @@ def _card(**overrides) -> str:
     base = dict(subject="claude-code", tool_summary="Bash: rm -f x.txt",
                 session_id="800257f3", working_directory=r"D:\workspace",
                 command="rm -f D:/other/x.txt",
-                conclusion=CONCLUSION_DENY, advice_state=ADVICE_STATE_READY)
+                advice_state=ADVICE_STATE_READY)
     base.update(overrides)
     return build_card_html(**base)
 
 
-def test_card_html_has_all_four_blocks() -> None:
-    """主卡只有决策需要的东西（B7 之后）：结论 / 动作 / 至多两行辅助 + 三按钮。
+def test_card_html_has_only_what_the_decision_needs() -> None:
+    """主卡只放决策需要的东西。
 
-    会话 id、工作目录、超时说明、免责说明、执行者、上游**全不在主卡上**——
-    它们搬到「这是什么」了。这条测试两头都盯：该在的必须在，不该在的不许在。
+    2026-11-24 真机验收 §5.4 之后：**事实摘要 + 允许/拒绝分别会怎样 + 三按钮**。
+    会话 id、工作目录、超时说明、免责说明、执行者、上游、模型的结论
+    **全不在主卡上**——它们搬到「这是什么」了。这条两头都盯：
+    该在的必须在，不该在的不许在。
     """
     html = _card()
     # 1) 标题
     assert "同桌猫 · 审批请求" in html
-    # 2) 动作行（主体，永远在）
-    assert "⚠️ 它要删除文件 D:/other/x.txt" in html
-    # 3) 结论行（有确定结论时置顶）
-    assert "<strong>建议拒绝</strong>" in html
+    # 2) 事实摘要行（§5.1：第一行必须是能扫读的事实，不是结论）
+    assert 'class="fact"' in html
+    assert "删除文件：D:/other/x.txt" in html
+    # 3) 允许/拒绝分别会怎样（§5.4/§5.7）
+    assert "允许 → 执行这次操作" in html
+    assert "拒绝 → 这次调用不执行" in html
     # 4) **不在主卡上的东西**（B7：空字段不占位，无价值不显示）
     assert "执行：" not in html, "执行者还压在卡片上（B7 搬去「这是什么」了）"
     assert "上游：" not in html, "上游还压在卡片上（B7 搬去「这是什么」了）"
@@ -1356,57 +1361,31 @@ def test_the_explain_card_does_not_invent_an_upstream() -> None:
     assert "upstream" not in explanation
 
 
-def test_card_conclusion_line_is_independent_and_first() -> None:
-    """规格 P2：结论独立成行、加粗，而且排在正文最前面。"""
+def test_the_fact_line_comes_before_the_buttons() -> None:
+    """规格 P2 的"置于最上"在这里被实测反馈推翻：结论是别人的判断，
+    事实是自己的依据，依据该在前（2026-11-24 真机验收 §5.1 原话：
+    "第一行必须是事实摘要，不是「建议拒绝」"）。这条钉住新顺序。"""
     html = _card()
-    verdict_at = html.index("<strong>建议拒绝</strong>")
-    for later in ("⚠️ 它要", "范围："):
-        assert verdict_at < html.index(later), f"{later} 排在结论前面了"
+    fact_at = html.index('class="fact"')
+    for later in ('data-neko-action="deskmate_approve"',):
+        assert fact_at < html.index(later), f"{later} 排在事实行前面了"
 
 
-@pytest.mark.parametrize("conclusion", [CONCLUSION_ALLOW, CONCLUSION_DENY])
-def test_card_accepts_the_two_definite_conclusions(conclusion: str) -> None:
-    """规格 P2：确定的结论只有两种，原样加粗置顶。"""
-    html = _card(conclusion=conclusion, advice_state=ADVICE_STATE_READY)
-    assert f"<strong>{conclusion}</strong>" in html
+def test_the_main_card_never_shows_a_conclusion() -> None:
+    """2026-11-24 真机验收 §5.4：**主卡上不许再出现模型的结论**。
 
-
-def test_the_unsure_conclusion_is_not_rendered_at_all() -> None:
-    """B7 第 1 条：「无法判断，需要你决定」**整行不显示**。
-
-    它没告诉用户任何新东西，只是承认"我不知道"；而沉默比说"我不知道"
-    更干净——为什么没有结论，由「这是什么」去解释。
+    正文只留「删哪个文件 + 允许/拒绝分别会怎样」，而结论是别人的判断，
+    不该排在用户自己的依据前面。信息不丢——搬进「这是什么」了，
+    见 test_card_advice.py 里那一组。这条是守门人：哪天有人把结论
+    加回主卡，它会红。
     """
-    html = _card(conclusion=CONCLUSION_UNSURE, advice_state=ADVICE_STATE_READY)
-    assert CONCLUSION_UNSURE not in _visible(html)
-    # 但卡片本身照样成立：动作行和按钮都在
-    assert "⚠️ 它要删除文件" in html
-    assert 'data-neko-action="deskmate_approve"' in html
-
-
-@pytest.mark.parametrize("conclusion", [
-    "倾向别放行", "不建议", "最好不", "可以但", "拒绝或允许都可以",
-    "allow", "deny", "", "建议放行", "同意", "批准", None,
-])
-def test_card_rejects_any_other_conclusion(conclusion: object) -> None:
-    """非法结论**一行都不渲染**，原文也不外溢。"""
-    html = _card(conclusion=conclusion, advice_state=ADVICE_STATE_READY)
-    assert 'class="verdict"' not in html, "非法结论居然渲染出了一行"
-    if isinstance(conclusion, str) and conclusion:
-        assert conclusion not in _visible(html), (
-            f"非法结论 {conclusion!r} 外溢到卡片上了")
-
-
-def test_conclusion_requires_a_real_advice_state() -> None:
-    """建议层降级时**没有结论行**——哪怕调用方误传了一个结论。
-
-    这是防"没有依据的建议允许出现在卡片上"：调用方说 ready 却给了降级的
-    状态，或者状态是 disabled 却给了结论，两种都不许放行。
-    """
-    for state in ("disabled", "unauthorized", "no_key", "pending_backend"):
-        html = _card(conclusion=CONCLUSION_ALLOW, advice_state=state)
+    for state in ("disabled", "unauthorized", "no_key", "pending_backend",
+                  ADVICE_STATE_READY):
+        html = _card(advice_state=state)
         assert 'class="verdict"' not in html, state
         assert CONCLUSION_ALLOW not in _visible(html), state
+        assert CONCLUSION_DENY not in _visible(html), state
+        assert CONCLUSION_UNSURE not in _visible(html), state
 
 
 def test_card_has_no_banned_words() -> None:
@@ -1466,13 +1445,17 @@ def test_card_has_no_english_command_tokens() -> None:
 
 
 def test_card_scope_detects_a_system_directory() -> None:
+    """2026-11-24 §5.1：范围不再是独立一行，折进事实行的小括号。
+    措辞从长句压成了能并排读的短语。"""
     html = _card(command=r"rm -rf C:\Windows\System32")
-    assert "这是系统目录" in html
+    assert "系统目录" in html
+    assert "范围：" not in html
 
 
 def test_card_scope_says_inside_the_working_directory() -> None:
     html = _card(command="rm -rf D:/workspace/build")
-    assert "在它的工作目录之内" in html
+    assert "本会话工作目录内" in html
+    assert "范围：" not in html
 
 
 def test_card_unknown_command_is_not_guessed() -> None:
@@ -1481,7 +1464,7 @@ def test_card_unknown_command_is_not_guessed() -> None:
     B7：**「看不出」那句不上卡片**。认不出命令时，后果行只能是空话，
     而空话占着最显眼的位置——那一行让给「这是什么」。
     """
-    html = _card(command="npm run build", conclusion="")
+    html = _card(command="npm run build")
     assert "未识别的命令" in html
     assert "npm run build" in html
     assert "看不出" not in html, "认不出命令还把空话写在卡片上"
@@ -1495,10 +1478,18 @@ def test_card_echo_of_a_delete_is_not_a_delete() -> None:
 
 
 def test_card_highlights_high_risk_in_red() -> None:
-    """规格 §2 硬规则 3：不可恢复动作 → 标红 + 明说不自动放行。"""
+    """规格 §2 硬规则 3：不可恢复动作 → 标红。
+
+    2026-11-24 真机验收 §5.3：红字原文「任何配置都不会让它自动放行」是
+    **一句假承诺**——自动放行是 ``auto_decide`` 配置项，今天关着而已。
+    改成陈述当前状态。风险档与门控一个字没动（那是安全件），
+    改的只是"不许替用户保证一件配置能决定的事"。
+    """
     html = _card(action_class=ACTION_CLASS_IRREVERSIBLE)
     assert 'class="risk"' in html
-    assert "必须由你亲自点允许或拒绝" in html
+    assert "正在等待你确认" in html
+    assert "任何配置都不会" not in html
+    assert "永远不会" not in html
 
 
 def test_card_highlights_critical_even_without_a_class() -> None:
@@ -1566,17 +1557,48 @@ def test_result_card_says_expired_not_auto_denied() -> None:
 
 # ── 「这是什么」 ────────────────────────────────────────────────────────────
 
-def test_explain_delete_mentions_it_never_auto_decides() -> None:
+def test_explain_delete_leads_with_facts_not_a_verdict() -> None:
+    """2026-11-24 真机验收 §5.1：第一句必须是能扫读的事实摘要。
+
+    原文「这是一次删除文件的操作，属于高风险。」被批一刀切——用户要决策的是
+    「这个文件删了要不要紧」，不是「这条被标了什么档」。
+    """
+    explanation = explain_request(tool_name="Bash", tool_summary="Bash: rm -rf x",
+                                  working_directory=r"D:\workspace", rule="delete",
+                                  severity="critical", command="rm -rf x")
+    assert "删除" in explanation["verdict"]
+    assert "x" in explanation["verdict"]
+    # 括号里跟的是这条请求独有的判据，不是每张卡都重复的那句话
+    assert "工作目录" in explanation["verdict"]
+    assert "高风险。" not in explanation["verdict"]
+    assert "当前请求正在等待你确认" in explanation["extra"]
+
+
+def test_explain_delete_falls_back_when_the_command_is_unknown() -> None:
+    """命令为空或认不出时，事实行只剩「未识别的命令」——比"属于高风险"
+    信息更少，所以退回原措辞。调用方不传 command 是正常路径。"""
     explanation = explain_request(tool_name="Bash", tool_summary="Bash: rm -rf x",
                                   working_directory=r"D:\workspace", rule="delete",
                                   severity="critical")
     assert "删除文件" in explanation["verdict"]
     assert "高风险" in explanation["verdict"]
-    assert "永远不会自动放行" in explanation["extra"]
-    assert "亲自点允许或拒绝" in explanation["extra"]
-    # 到期不等于拒绝（规格 §2 硬规则 1）：这句话必须在解释卡里说清楚
-    assert "未决定" in explanation["timeout"]
-    assert "不代你判断" in explanation["timeout"]
+
+
+def test_the_explain_card_says_what_expiry_really_does() -> None:
+    """2026-11-24 真机验收 §5.5：「由 Claude Code 自己接手」被批含糊，
+    且对 ``-p`` 无头会话没有说明。三句都已实测，可以写死。"""
+    explanation = explain_request(tool_name="Bash", tool_summary="Bash: rm -f x",
+                                  working_directory=r"D:\workspace", rule="delete",
+                                  severity="critical", command="rm -f x")
+    timeout = explanation["timeout"]
+    assert "原本的确认流程" in timeout
+    assert "无头会话" in timeout
+    assert "等于不执行" in timeout
+    # 到期不等于拒绝（规格 §2 硬规则 1）
+    assert "未决定" in timeout
+    assert "不代你判断" in timeout
+    # 拒绝只中止这次调用、不掐回合（2026-11-24 09:43:56 实测）
+    assert "不会掐掉整个回合" in timeout
 
 
 def test_explain_does_not_repeat_the_tool_name() -> None:
@@ -2000,3 +2022,15 @@ def test_settle_pending_cards_only_once() -> None:
 def test_find_returns_none_for_unknown() -> None:
     gateway = ApprovalGateway(ListLogger(), port=_free_port())
     assert gateway.find("nope") is None
+
+
+def test_the_warning_banner_keeps_the_risk_marker() -> None:
+    """规格 §2 硬规则 3：不可恢复动作必须被标成高风险。
+
+    2026-11-24 真机验收 §5.3 只许改"任何配置都不会让它自动放行"那句假承诺，
+    **不许把风险标记一起删掉**——那是安全件，不是措辞。这条守着它。
+    """
+    assert "高风险" in WARNING_BANNER
+    # 假承诺的两处措辞都不许回来
+    assert "任何配置都不会" not in WARNING_BANNER
+    assert "永远不会" not in WARNING_BANNER

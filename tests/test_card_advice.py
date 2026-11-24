@@ -47,9 +47,12 @@ from plugin.plugins.agent_deskmate.approval import (
     ApprovalGateway,
     ApprovalRequest,
     PendingApproval,
+    advice_text,
     build_card_html,
+    explain_request,
 )
 from plugin.plugins.agent_deskmate.commands import (
+    COMMAND_DISPLAY_MAX,
     CONCLUSION_ALLOW,
     CONCLUSION_DENY,
     CONCLUSIONS,
@@ -226,8 +229,18 @@ def test_successful_advice_survives_the_whole_card_path() -> None:
 
         assert len(ctx.cards) == 1, "卡片没建出来——这就是真机上那个故障"
         html = ctx.cards[0]["html"]
-        # 主卡正文是固定四行，结论行是三种合法写法之一，且是**人话**
-        assert "<strong>建议允许</strong>" in html
+        # 链路通了：模型建议真的到了 pending 上（2026-11-24 §5.4 起，
+        # 结论只进「这是什么」，所以这里验的是 advice 而不是卡片 HTML）
+        assert pending.advice["conclusion"] == CONCLUSION_ALLOW
+        # 主卡上不再有结论行（§5.4：正文只留「删哪个文件 + 允许/拒绝会怎样」）
+        assert 'class="verdict"' not in html
+        # 解释卡上必须有——信息不丢，搬个地方而已
+        explanation = explain_request(
+            tool_name="Bash", tool_summary="Bash: ls", working_directory=None,
+            rule="", severity="warn", command="ls",
+            conclusion=pending.advice["conclusion"],
+            advice_state=pending.advice["state"])
+        assert explanation["conclusion"] == f"模型的判断：{CONCLUSION_ALLOW}"
         # 动作行以 ⚠️ 开头（这条是未识别命令，所以走兜底文案）
         assert "⚠️" in html
         # B7：认不出命令时后果/范围都是空话，**两行都不上卡片**
@@ -241,8 +254,10 @@ def test_successful_advice_survives_the_whole_card_path() -> None:
         # 三个按钮一个都不能少
         for action in ("deskmate_approve", "deskmate_deny", "deskmate_explain"):
             assert f'data-neko-action="{action}"' in html
-        # 结论行在按钮上方（规格 P2：置于最上）
-        assert html.index("<strong>建议允许</strong>") < html.index(
+        # 2026-11-24 真机验收 §5.1：**第一行必须是事实摘要**，不是结论。
+        # （规格 P2 的"置于最上"在这里被用户的实测反馈推翻——结论是别人的
+        # 判断，事实是自己的依据，依据该在前。这条钉住新顺序。）
+        assert html.index('class="outcome"') < html.index(
             'data-neko-action="deskmate_approve"')
         # 依据不进主卡（规格 P3：折叠进「这是什么」），但必须留在记录上
         basis = pending.advice.get("basis", "")
@@ -434,20 +449,22 @@ def test_known_states_do_not_warn() -> None:
 def test_every_known_state_renders_a_legal_conclusion() -> None:
     """ADVICE_STATES 里每个状态都必须渲染出一个合法结论。
 
-    主卡正文是固定四行，所以这里验的是结论行：ready 态可以用调用方给的
-    结论，其余状态一律第三态——两条都有测试盯着。
+    2026-11-24 真机验收 §5.4：结论从主卡撤进了「这是什么」，所以这里验的
+    是解释卡（``explain_request``）——结论现在唯一的去处。
+    ready 态可以用调用方给的结论，其余状态一律不出现。
     """
     for state in sorted(ADVICE_STATES):
-        html = build_card_html(subject="c", tool_summary="Bash: ls",
-                               session_id="s", working_directory=None,
-                               advice_state=state,
-                               conclusion=CONCLUSION_ALLOW)
+        explanation = explain_request(
+            tool_name="Bash", tool_summary="Bash: ls", working_directory=None,
+            rule="", severity="warn", command="ls",
+            conclusion=CONCLUSION_ALLOW, advice_state=state,
+            model_note=(advice_text(state) if state != ADVICE_STATE_READY else ""))
         if state == ADVICE_STATE_READY:
-            assert f"<strong>{CONCLUSION_ALLOW}</strong>" in html, state
+            assert f"模型的判断：{CONCLUSION_ALLOW}" == explanation.get("conclusion"), state
         else:
-            # B7：建议层不就绪 → 没有结论，也**没有结论行**
-            assert 'class="verdict"' not in html, (
-                f"{state} 档位下居然渲染出了结论行")
+            # 建议层不就绪 → 没有结论，也**没有结论行**
+            assert "conclusion" not in explanation, (
+                f"{state} 档位下居然渲染出了结论")
 
 
 def test_fallback_state_is_itself_known() -> None:
@@ -456,35 +473,54 @@ def test_fallback_state_is_itself_known() -> None:
     assert ADVICE_STATE_READY in ADVICE_STATES
 
 
-def test_conclusion_cannot_appear_without_a_ready_state() -> None:
-    """建议层降级时，结论只能是第三态——哪怕调用方误传了一个结论。
+def test_the_main_card_never_renders_a_conclusion() -> None:
+    """2026-11-24 真机验收 §5.4：**主卡上不许再出现模型的结论**。
 
-    这是防"没有依据的建议允许出现在卡片上"。
+    理由（用户原话）：正文只留「删哪个文件 + 允许/拒绝分别会怎样」，
+    而结论是别人的判断，不该排在用户自己的依据前面。
+    这条是那道闸门的守门人——哪天有人把结论加回主卡，它会红。
     """
-    for state in ("disabled", "unauthorized", "no_key", "pending_backend"):
+    for state in sorted(ADVICE_STATES):
         html = build_card_html(subject="c", tool_summary="Bash: ls",
                                session_id="s", working_directory=None,
-                               advice_state=state,
-                               conclusion=CONCLUSION_ALLOW)
-        # B7：建议层不就绪 → 没有结论，也**没有结论行**
+                               advice_state=state)
         assert 'class="verdict"' not in html, state
         assert CONCLUSION_ALLOW not in _visible(html), state
+        assert CONCLUSION_DENY not in _visible(html), state
 
 
 @pytest.mark.parametrize("conclusion", [
     "倾向别放行", "不建议", "最好不", "可以但", "拒绝或允许都可以",
     "allow", "deny", "", "建议放行", "同意", "批准", None,
 ])
-def test_illegal_conclusion_never_reaches_the_card(conclusion: object) -> None:
-    """非法结论一律落最保守的第三态，原文不外溢。"""
-    html = build_card_html(subject="c", tool_summary="Bash: ls", session_id="s",
-                           working_directory=None,
-                           advice_state=ADVICE_STATE_READY,
-                           conclusion=conclusion)
-    assert 'class="verdict"' not in html, "非法结论居然渲染出了一行"
+def test_illegal_conclusion_never_reaches_the_explain_card(
+        conclusion: object) -> None:
+    """非法结论一律不外溢到解释卡上。**闸门跟着结论一起搬了家**
+    （2026-11-24 §5.4），所以这条测的是新住处——搬了地方不等于不用守。
+    """
+    explanation = explain_request(
+        tool_name="Bash", tool_summary="Bash: ls", working_directory=None,
+        rule="", severity="warn", command="ls", conclusion=conclusion,
+        advice_state=ADVICE_STATE_READY)
+    assert "conclusion" not in explanation, "非法结论居然渲染出了一行"
     if isinstance(conclusion, str) and conclusion:
-        assert conclusion not in _visible(html), (
-            f"非法结论 {conclusion!r} 外溢到卡片上了")
+        assert conclusion not in str(explanation), (
+            f"非法结论 {conclusion!r} 外溢到解释卡上了")
+
+
+def test_an_over_limit_command_shows_no_conclusion() -> None:
+    """A 批 A1 第 5 条：命令超过展示上限时结论必须是空的。
+
+    用户只看得到前 80 字，此时给他"建议允许"就是替他省掉最不该省的那一步。
+    **闸门在渲染边界**（``explain_request`` 是纯函数），不只放在调用方——
+    别的调用方漏了这道检查，一个没有依据的结论照样会印到卡上。
+    """
+    long_command = "ls " + "x" * (COMMAND_DISPLAY_MAX + 50)
+    explanation = explain_request(
+        tool_name="Bash", tool_summary="Bash: ls", working_directory=None,
+        rule="", severity="warn", command=long_command,
+        conclusion=CONCLUSION_ALLOW, advice_state=ADVICE_STATE_READY)
+    assert "conclusion" not in explanation
 
 
 # ── Q5：「这是什么」是追加一条新消息，不替换审批卡 ────────────────────────
@@ -714,7 +750,16 @@ def test_short_command_card_stays_clean() -> None:
         asyncio.run(plugin._create_approval_card(pending))  # noqa: SLF001
 
         assert "尾部未显示" not in ctx.cards[0]["html"]
-        assert "<strong>建议允许</strong>" in ctx.cards[0]["html"]
+        # 2026-11-24 §5.4：结论从主卡撤进「这是什么」。两头都验——
+        # 主卡没有，解释卡有。
+        assert 'class="verdict"' not in ctx.cards[0]["html"]
+        explanation = explain_request(
+            tool_name="Bash", tool_summary="Bash: rm -rf build/",
+            working_directory=None, rule="delete", severity="warn",
+            command="rm -rf build/",
+            conclusion=pending.advice["conclusion"],
+            advice_state=pending.advice["state"])
+        assert explanation["conclusion"] == f"模型的判断：{CONCLUSION_ALLOW}"
     finally:
         server.shutdown()
         server.server_close()
@@ -863,7 +908,17 @@ def test_a_deny_on_a_critical_request_still_shows_deny() -> None:
 
         asyncio.run(plugin._create_approval_card(pending))  # noqa: SLF001
 
-        assert "<strong>建议拒绝</strong>" in ctx.cards[0]["html"]
+        # 阀门是单向的：只压 allow。所以 DENY 一路到达 pending，
+        # 只是按 §5.4 显示在「这是什么」而不是主卡上。
+        assert pending.advice["conclusion"] == CONCLUSION_DENY
+        assert 'class="verdict"' not in ctx.cards[0]["html"]
+        explanation = explain_request(
+            tool_name="Bash", tool_summary="Bash: rm -rf build/",
+            working_directory=None, rule="delete", severity="critical",
+            command="rm -rf build/",
+            conclusion=pending.advice["conclusion"],
+            advice_state=pending.advice["state"])
+        assert explanation["conclusion"] == f"模型的判断：{CONCLUSION_DENY}"
         assert not pending.advice["conflict"]
     finally:
         server.shutdown()

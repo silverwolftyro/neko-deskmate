@@ -106,7 +106,11 @@ from .events import (
     attribute,
     delegated_server,
 )
-from .gated import MODE_DEGRADED, GatedFailureLog
+from .gated import (
+    GATED_DEGRADED_WINDOW_SECONDS,
+    MODE_DEGRADED,
+    GatedFailureLog,
+)
 from .hooksetup import (
     install_hook,
     installed_hook,
@@ -1167,19 +1171,20 @@ class AgentDeskmatePlugin(NekoPluginBase):
         """
         if event.event != EVENT_TOOL_RESULT or event.is_error is not True:
             return False
-        cfg = self._tracker_cfg
-        window = (cfg.failure_confirm_seconds if cfg is not None
-                  else DEFAULT_CONFIG.failure_confirm_seconds)
-        mode = self._gated.claim(session=event.session,
-                                 tool_use_id=event.tool_use_id or "",
-                                 degraded_window=window)
+        mode = self._gated.claim(
+            session=event.session,
+            tool_use_id=event.tool_use_id or "",
+            degraded_window=GATED_DEGRADED_WINDOW_SECONDS)
         if mode == MODE_DEGRADED:
             # 降级路径每次都要留痕。静默的降级等于没有降级——真机上
             # 出了一次"该报的没报"，排查时唯一能依靠的就是这一行。
+            # **在 Claude Code 上这是常态**（hook 负载不带 tool_use_id，
+            # 证据链见 gated 模块 docstring），所以这一行不是异常信号，
+            # 是"现在跑的是粗判"的常态标记。
             self.logger.info(
                 "审批造成的失败按降级规则静音：会话 {} 拿不到 tool_use_id，"
-                "只能按「会话 + {}s 窗口内首次」判，未做精确配对",
-                event.session or "无", f"{window:g}")
+                "只能按「会话 + {:g}s 窗口内首次」判，未做精确配对",
+                event.session or "无", GATED_DEGRADED_WINDOW_SECONDS)
         return bool(mode)
 
     def _approval_blocked_sessions(self) -> set[tuple[str, str]]:
@@ -1414,12 +1419,15 @@ class AgentDeskmatePlugin(NekoPluginBase):
         warning = self._warning_policy(pending)
         # 卡片与模型用**同一份完整命令**（A 批 A1）：不再从截断的摘要反推。
         command = _command_of(request)
+        # 2026-11-24 真机验收 §5.4：模型的结论不再进主卡，只进「这是什么」
+        # （见 approval.explain_request 的 conclusion 参数）。这里仍然算 advice
+        # 是为了审计与自动放行判断，卡片上不显示它。
         html = build_card_html(
             subject=subject, tool_summary=body, session_id=request.session_id,
             working_directory=request.working_directory,
             advice_state=advice["state"],
             risk=pending.severity, action_class=pending.action_class,
-            command=command, conclusion=advice["conclusion"],
+            command=command,
             upstream=request.upstream, warning=warning,
             logger=self.logger,
         )
@@ -1654,6 +1662,12 @@ class AgentDeskmatePlugin(NekoPluginBase):
             # 但用户点「这是什么」时该看到。
             model_note=(advice_text(advice.get("state", ADVICE_STATE_FALLBACK))
                         if advice.get("state") != ADVICE_STATE_READY else ""),
+            # 2026-11-24 真机验收 §5.4：模型的结论从主卡撤到这里。
+            # 主卡正文只留「删哪个文件 + 允许/拒绝分别会怎样」。
+            # advice_state 一并传过来：结论的三道闸门（只有真拿到建议才可能是
+            # "建议允许" / 命令超长时为空 / 第三态不显示）现在守在这个函数里。
+            conclusion=advice.get("conclusion", ""),
+            advice_state=advice.get("state", ADVICE_STATE_FALLBACK),
             session_id=pending.request.session_id,
             timeout_seconds=self._approval.timeout_seconds,
             verbosity=_verbosity_of(getattr(self, "_last_config", {}) or {}),

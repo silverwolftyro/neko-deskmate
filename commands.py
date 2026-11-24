@@ -925,6 +925,64 @@ def scope_line(facts: CommandFacts, working_directory: str | None) -> str:
             if "目录" in facts.action else where)
 
 
+# ── 事实摘要行（2026-11-24 真机验收 §5.1）────────────────────────────────
+#
+# 用户原话：第一行必须是能扫读的事实摘要，不是「建议拒绝 / 属于高风险」。
+# 理由：用户要决策的是「这个文件删了要不要紧」，不是「这条被标了什么档」。
+#
+# 形态：``删除文件：<目标>（本会话工作目录内 · 不递归 · 13 B · 未被 git 跟踪）``
+# 括号里是**这条请求独有**的判据；每张卡都重复的那句话（"高风险"）不放这里。
+#
+# **只描述能从命令本身推出来的事实，不碰文件系统**：本模块是纯函数层，
+# 测试跑几百次不该去 stat 真实路径。文件大小/在不在由调用方（审批卡片）
+# 用 ``file_facts`` 传进来，它那边有 try/except 兜着。
+
+def fact_line(*, command: str, working_directory: str | None,
+              file_facts: str = "") -> str:
+    """主卡第一行：能扫读的事实摘要。
+
+    ``file_facts`` 由调用方从文件系统读来（大小 / 在不在），
+    **本函数不碰磁盘**——纯函数层的理由见上面的注释。
+    """
+    facts = translate_segments(command, working_directory=working_directory)
+    top = facts[0] if facts else translate(command)
+    action = top.action
+    target = top.targets[0] if top.targets else ""
+    head = f"{action}：{target}" if target and target not in action else action
+
+    qualifiers: list[str] = []
+    scope = scope_line(top, working_directory)
+    qualifiers.extend(_compact_qualifiers(top, scope, working_directory))
+    if file_facts:
+        qualifiers.append(file_facts)
+    body = " · ".join(part for part in qualifiers if part)
+    return f"{head}（{body}）" if body else head
+
+
+def _compact_qualifiers(facts: CommandFacts, scope: str,
+                        working_directory: str | None) -> list[str]:
+    """把 ``scope_line`` 的长句压成能并排读的短语。
+
+    **不新造判据**：每个短语都从既有事实推（在不在工作目录内、递不递归、
+    认不认得这条命令）。推不出来就不填——空一项比填错一项好。
+    """
+    out: list[str] = []
+    if not facts.known:
+        out.append("看不出它会影响什么")
+        return out
+    if "系统目录" in scope:
+        out.append("系统目录")
+    elif working_directory:
+        out.append("本会话工作目录内" if "之内" in scope else "工作目录之外")
+    # 递不递归只对删除类有意义（用户示例：`删 1 个文件 · 不递归`——
+    # 那是在说"只动这一个，不殃及里面"）。非删除动作提它是句废话。
+    if "删除" in facts.action:
+        out.append("递归" if "含它下面的所有内容" in scope else "不递归")
+    if facts.irreversible:
+        out.append("不可恢复")
+    return out
+
+
 def card_lines(*, command: str, working_directory: str | None) -> dict[str, Any]:
     """主卡正文的前三行（规格 P3）。第四行结论由调用方填——词典不给结论。
 

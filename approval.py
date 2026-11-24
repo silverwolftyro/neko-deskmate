@@ -70,6 +70,7 @@ deny 可另带 ``message`` 与 ``interrupt``。``interrupt`` 默认 False——
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -99,9 +100,11 @@ from .commands import (
     command_length,
     conclusion_for,
     delete_targets,
+    fact_line,
     severity_for_tier,
     tier_for_command,
     translate,
+    translate_segments,
 )
 from .rules import delete_tier, l2_readonly_allowed, match_delete
 from .warncount import WarningCounter
@@ -945,8 +948,15 @@ WARNING_NEVER = "never"
 WARNING_MODES = (WARNING_ALWAYS, WARNING_FIRST_N, WARNING_NEVER)
 DEFAULT_WARNING_MODE = WARNING_FIRST_N
 DEFAULT_WARNING_FIRST_N = 3
-WARNING_BANNER = ("高风险动作：任何配置都不会让它自动放行，"
-                  "必须由你亲自点允许或拒绝。")
+# 2026-11-24 真机验收 §5.3：原文是「高风险动作：任何配置都不会让它自动放行，
+# 必须由你亲自点允许或拒绝」。**那是一句假承诺**——自动放行是 ``auto_decide``
+# 配置项，今天关着而已，写成"永远不会"等于替用户保证一件配置能决定的事。
+#
+# 改成陈述当前状态，**但「高风险」三个字留着**：规格 §2 硬规则 3 要求不可恢复
+# 动作必须被标出来，把它一并删掉就是把安全提示改没了。具体的为什么危险跟在
+# 事实行的括号里（见 ``commands.fact_line``），两处分工：这里说"要你决定"，
+# 那里说"这条为什么危险"。
+WARNING_BANNER = "⚠ 高风险：当前请求正在等待你确认。"
 WARNING_BADGE = "⚠ 高风险"
 
 # B7：主卡辅助行的上限。预算是「动作（1–2 行）+ 至多两行辅助 + 三个按钮」——
@@ -1157,20 +1167,62 @@ def _minutes(seconds: float) -> str:
     return f"约 {minutes} 分钟"
 
 
+def file_facts(command: str) -> str:
+    """从命令里取第一个目标，报它在不在、多大。
+
+    2026-11-24 真机验收 §5.1 建议补的"文件事实"。**刻意只做这两项**：
+
+    * 「在不在 / 多大」——``os.stat`` 一次就有，失败就返回空串；
+    * 「有没有被 git 跟踪」要跑 ``git`` 或解析 ``.git``，那是子进程 +
+      路径猜测，而猜错的代价是把"未跟踪"说成"已跟踪"（用户据此判断能不能恢复）；
+    * 「能不能恢复」是**判断**不是事实，词典的原则是不猜。
+
+    **任何异常都返回空串**：目标可能是通配符（``*.log``）、可能已经被删了、
+    可能是 Agent 编造出来的路径。报不出来就不报——卡片上少一项没关系，
+    把 stat 的异常冒到卡片渲染会让整张卡消失，那才是事故。
+    """
+    try:
+        facts = translate_segments(command)
+        target = facts[0].targets[0] if facts and facts[0].targets else ""
+        if not target:
+            return ""
+        path = Path(target)
+        if not path.is_absolute():
+            return ""           # 相对路径的基准不确定，不猜
+        if not path.exists():
+            return "目标不存在"
+        size = os.stat(target).st_size
+        return _human_size(size)
+    except (OSError, ValueError, IndexError):
+        return ""
+
+
+def _human_size(size: int) -> str:
+    """字节数说成人话。512 以下按字节，往上按 KiB/MiB，一位小数。"""
+    if size < 1024:
+        return f"{size} B"
+    for unit in ("KiB", "MiB", "GiB"):
+        size /= 1024.0
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+    return f"{size:.1f} TiB"
+
+
 def build_card_html(*, subject: str, tool_summary: str, session_id: str,
                     working_directory: str | None,
                     advice_state: str = ADVICE_STATE_FALLBACK,
                     risk: str = DEFAULT_RISK_SEVERITY,
                     action_class: str = DEFAULT_ACTION_CLASS,
-                    command: str = "", conclusion: str = "",
+                    command: str = "",
                     upstream: Any = (), warning: WarningPolicy | None = None,
                     logger: Any = None) -> str:
     """审批卡片的 HTML。纯函数——卡片文案是验收项，必须能单测。
 
     **只放决策需要的东西**（2026-11-22 真机反馈：原来半屏是免责声明与
-    术语解释，结论被埋在中间）：结论、动作、后果、范围、三个按钮，
-    外加一行小字的执行者与上游进程链。会话 id / 工作目录 / 超时说明 /
-    免责声明全部搬到「这是什么」与配置页。
+    术语解释，结论被埋在中间）：事实摘要、允许/拒绝分别会怎样、三个按钮，
+    外加命令超长时的"你看全了吗"。会话 id / 工作目录 / 超时说明 /
+    免责声明 / 执行者 / 上游 / 模型的结论**全部搬到「这是什么」**
+    （最后一项是 2026-11-24 真机验收 §5.4 撤的）。
 
     ``subject`` 由调用方用归因语法生成（``describe_actor``），
     这样播报和卡片说的是同一套话。``upstream`` 是中继爬进程树的结果。
@@ -1217,35 +1269,18 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
     # 算一行辅助——安全件，优先级高于后果/范围。
     note = command_display_note(command or tool_summary)
 
-    # 结论行的取值受 advice_state 约束：**只有真的拿到了模型建议，
-    # 结论才可能是"建议允许/建议拒绝"**。建议层降级时（没 key、没签字、
-    # 调用失败、状态未知）一律落最保守的第三态——哪怕调用方误传了一个结论，
-    # 也不能让一个没有依据的"建议允许"出现在卡片上。
-    if advice_state == ADVICE_STATE_READY and conclusion in CONCLUSIONS:
-        conclusion_text = conclusion
-    else:
-        conclusion_text = ""
-    # A 批 A1 第 5 条：命令超过展示上限时结论必须是空的。
-    # **放在渲染边界，不只放在调用方**——卡片是纯函数，别的调用方漏了这道
-    # 检查，一个没有依据的"建议允许"照样会印到卡上。用户只看得到前 80 字，
-    # 此时给他"建议允许"就是替他省掉最不该省的那一步。
-    if command and command_length(command) > COMMAND_DISPLAY_MAX:
-        conclusion_text = ""
-    # **「无法判断」整行不显示**（B7 第 1 条）。它没告诉用户任何新东西，
-    # 只是承认"我不知道"；而沉默比说"我不知道"更干净——那一行留给
-    # 「这是什么」去解释为什么没有结论。
+    # 2026-11-24 真机验收 §5.4：**模型的结论整行从主卡撤出**，搬进「这是什么」。
+    # 理由：正文只留「删哪个文件 + 允许/拒绝分别会怎样」，而结论是别人的判断，
+    # 不该排在用户自己的依据前面（§5.1 原话：第一行必须是事实摘要，
+    # 不是「建议拒绝」）。信息不丢，搬个地方而已。
+    #
+    # 原来守在这儿的两道闸门（只有真拿到模型建议才可能是"建议允许"；
+    # 命令超长时结论必须为空）**跟着搬到了 explain_request**——那也是渲染边界，
+    # 而且是结论现在唯一的去处。闸门留在已经没人看的函数里，比没有更危险：
+    # 它会让人以为还守着什么。
     auxiliary: list[str] = []
-    if conclusion_text and conclusion_text != CONCLUSION_UNSURE:
-        auxiliary.append(f'<p class="verdict"><strong>{_escape(conclusion_text)}'
-                         "</strong></p>")
     if note:
         auxiliary.append(f'<p class="src">{_escape(note)}</p>')
-    # 范围 / 后果：只在说得清具体内容时才上卡片（B7 第 2 条）。
-    # 范围优先——它是这条请求独有的判据；后果对删除类基本是同一句。
-    if lines["scope_specific"]:
-        auxiliary.append(f"<p>{_escape(lines['scope'])}</p>")
-    if lines["consequence_specific"]:
-        auxiliary.append(f"<p>{_escape(lines['consequence'])}</p>")
     auxiliary = auxiliary[:MAX_CARD_AUX_LINES]
 
     # B3：一条命令里有多个动作时（`rm a && git reset --hard`），**每一段都要
@@ -1254,10 +1289,42 @@ def build_card_html(*, subject: str, tool_summary: str, session_id: str,
     action_html = "".join(f'<p class="act">{_escape(text)}</p>'
                           for text in lines["actions"]) or \
         f'<p class="act">{_escape(lines["action"])}</p>'
+    # 2026-11-24 真机验收 §5.1：第一行必须是**能扫读的事实摘要**，
+    # 不是「建议拒绝 / 属于高风险」。用户要决策的是「这个文件删了要不要紧」。
+    # 事实行与「这是什么」里的那一句同源（都走 ``commands.fact_line``），
+    # 所以两处永远说的是同一件事——写两遍的后果就是下次只改到一处。
+    #
+    # **认不出命令时不显示**（B7 第 2 条）：那时候事实行只剩一句
+    # 「看不出它会影响什么」，而动作行已经写着「未识别的命令：npm run build」。
+    # 同一件事说两遍、其中一遍还是空话，正是 B7 从卡片上删掉的那类内容。
+    fact_html = ""
+    if lines["known"]:
+        summary = fact_line(command=command,
+                            working_directory=working_directory,
+                            file_facts=file_facts(command))
+        fact_html = f'<p class="fact">{_escape(summary)}</p>'
+        # 事实行已经点名了目标，**单个动作时动作行就是重复**
+        # （「删除文件：X（…）」vs「⚠️ 它要删除文件 X」）。
+        # 多段命令不撤——那时动作行是 B3 的安全件，列的是"还有别的动作"。
+        if len(lines["actions"]) <= 1:
+            action_html = ""
+        # 范围/后果与事实行同源冗余：括号里已经写着「本会话工作目录内 ·
+        # 不可恢复」。B7 自己就说过"删除类的后果基本是同一句"——
+        # 有了这句具体的，那句通用的更没有留存价值。
+        # 只留 auxiliary[0]：要么是结论，要么是「你看全了吗」那条安全提示。
+        auxiliary = auxiliary[:1]
+    # 2026-11-24 真机验收 §5.4/§5.7：**允许/拒绝分别会怎样**要进正文。
+    # 原来它只出现在「这是什么」里，而用户点按钮之前就该知道。
+    # 这两句都已真机验证过（§5.5），可以写死。
+    outcome_html = ('<p class="outcome">允许 → 执行这次操作；'
+                    '拒绝 → 这次调用不执行，会话继续</p>')
     # 结论行**置于最上**（规格 P2）：快速扫读时眼睛先落在哪里，
     # 结论就该在那里。P3 的四行样例把结论排在最后，与 P2 的"置于最上"冲突；
     # 这里按 P2 排，因为 P2 给了理由（误读），P3 只给了内容清单。
-    body_lines = auxiliary[:1] + [action_html] + auxiliary[1:] + [warn_html]
+    # 事实摘要排在结论之前（§5.1）：结论是别人的判断，事实是自己的依据。
+    body_lines = ([line for line in (fact_html, outcome_html) if line]
+                  + auxiliary + ([action_html] if action_html else [])
+                  + [warn_html])
 
     # B7 第 3 条：执行者与上游**移出主卡**，进「这是什么」。
     # 它们回答"这是我自己开的吗"，属于定位信息；原来压在卡片最下面两行，
@@ -1282,7 +1349,9 @@ def explain_request(*, tool_name: str, tool_summary: str,
                     full_command: str = "",
                     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
                     verbosity: str = DEFAULT_VERBOSITY,
-                    subject: str = "", upstream: Any = ()) -> dict[str, str]:
+                    subject: str = "", upstream: Any = (),
+                    conclusion: str = "",
+                    advice_state: str = ADVICE_STATE_FALLBACK) -> dict[str, str]:
     """「这是什么」按钮的落点：解释，只说事实，不猜意图。
 
     主卡的正文只有四行（规格 P3），所以**会话 id、工作目录、超时说明、
@@ -1296,8 +1365,19 @@ def explain_request(*, tool_name: str, tool_summary: str,
     用户不知道那是什么）。风险档只用来分支措辞，**不把档位名印出来**。
     """
     if rule == "delete":
-        verdict = "这是一次删除文件的操作，属于高风险。"
-        extra = "这类操作永远不会自动放行，必须你亲自点允许或拒绝。"
+        # 2026-11-24 真机验收 §5.1/§5.2：原文「这是一次删除文件的操作，属于高风险。」
+        # 被批"一刀切"——用户要决策的是「这个文件删了要不要紧」，
+        # 不是「这条被标了什么档」。改成事实摘要（与主卡第一行同源，
+        # 见 ``commands.fact_line``），具体理由跟在括号里。
+        #
+        # **命令为空或认不出时退回原来的措辞**：那时候事实行只剩
+        # 「未识别的命令」，比"属于高风险"信息更少。调用方不传 command
+        # 是正常路径（``tool_summary`` 就够建卡了）。
+        summary = fact_line(command=command, working_directory=working_directory,
+                            file_facts=file_facts(command)) if command else ""
+        verdict = (summary if summary and "未识别" not in summary
+                   else "这是一次删除文件的操作，属于高风险。")
+        extra = "当前请求正在等待你确认。"
     elif rule:
         verdict = "本地规则命中了这次操作，按高风险处理。"
         extra = "是否放行由你决定，插件只转发、不代判。"
@@ -1309,11 +1389,17 @@ def explain_request(*, tool_name: str, tool_summary: str,
     # 主卡上原来那段"允许后…/拒绝则…/约 N 分钟后…"整块搬到这里
     # （规格 Q2：卡片上不重复免责说明）。**到期不等于拒绝**——
     # 这句话必须说清楚，否则用户会以为不点就是不同意。
+    #
+    # 2026-11-24 真机验收 §5.5：「由 Claude Code 自己接手」被批含糊，
+    # 且对 ``-p`` 无头会话没有说明。两句都已实测（拒绝：deny.txt 保留、
+    # 同会话随后仍能执行别的命令；到期：目标文件未被执行），可以写死。
+    # 无头会话那条也实测过：没有确认框，等价于不执行。
     timeout_line = (
         f"允许后 Claude Code 继续执行；拒绝则中止这次调用"
-        f"（不会掐掉整个回合）。{_minutes(timeout_seconds)}后无人决定，"
-        "这条视为未决定，由 Claude Code 自己接手——插件不代你判断，"
-        "也不把「一直没点」记成拒绝。")
+        f"（不会掐掉整个回合）。{_minutes(timeout_seconds)}后仍无人决定，"
+        "这条视为未决定，会交还给 Claude Code 原本的确认流程——插件不代你判断，"
+        "也不把「一直没点」记成拒绝。无头会话（``-p``）不会弹确认框，"
+        "那种情况下等于不执行。")
 
     short_session = (session_id or "")[:8]
     where = working_directory or "工作目录未知"
@@ -1367,6 +1453,24 @@ def explain_request(*, tool_name: str, tool_summary: str,
         # 没接入模型时的那句陈述。放在解释卡而不是主卡：主卡正文是四行，
         # 而这句话属于"细节"，正是「这是什么」该放的地方。
         explanation["model_note"] = model_note
+    # 2026-11-24 真机验收 §5.4：模型的结论（「建议允许/拒绝」）**从主卡撤出**，
+    # 搬到这里。理由：正文只留「删哪个文件 + 允许/拒绝分别会怎样」，
+    # 而结论是别人的判断，不该排在用户自己的依据前面。
+    # **信息不丢**——搬个地方而已，用户点「这是什么」时照样看得到。
+    #
+    # 三道闸门**原样跟着搬过来**（原来守在 build_card_html 里）：
+    #   1. 只有真的拿到模型建议，结论才可能是"建议允许/建议拒绝"。
+    #      建议层降级时（没 key、没签字、调用失败、状态未知）一律不出现；
+    #   2. 命令超过展示上限时结论必须是空的——用户只看得见前 80 字，
+    #      给他"建议允许"是替他省掉最不该省的那一步；
+    #   3. 第三态（「无法判断」）不显示：它没告诉用户任何新东西。
+    # **闸门必须在渲染边界**：这个函数是纯函数，别的调用方漏了检查，
+    # 一个没有依据的"建议允许"照样会印到卡上。
+    if (advice_state == ADVICE_STATE_READY
+            and conclusion in CONCLUSIONS
+            and conclusion != CONCLUSION_UNSURE
+            and not (command and command_length(command) > COMMAND_DISPLAY_MAX)):
+        explanation["conclusion"] = f"模型的判断：{conclusion}"
     if model_reason:
         explanation["model_reason"] = f"模型给的理由：{model_reason}"
     if basis:
@@ -1399,6 +1503,10 @@ def build_explain_html(explanation: dict[str, str]) -> str:
            if explanation.get("all_actions") else "")
         + (f"<p class=\"src\">{_escape(explanation['model_note'])}</p>"
            if explanation.get("model_note") else "")
+        # 2026-11-24 真机验收 §5.4：模型的结论从主卡搬到这里。
+        # 排在理由之前——先看结论，再看它为什么这么判。
+        + (f"<p class=\"verdict\">{_escape(explanation['conclusion'])}</p>"
+           if explanation.get("conclusion") else "")
         # B7：执行者与上游从主卡搬到这里。
         + (f"<p class=\"src\">{_escape(explanation['actor'])}</p>"
            if explanation.get("actor") else "")

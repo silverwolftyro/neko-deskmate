@@ -138,7 +138,11 @@ def test_first_n_of_zero_or_negative_means_always_badge() -> None:
 def test_banner_before_the_threshold() -> None:
     html = _card(warning=WarningPolicy(mode=WARNING_FIRST_N, first_n=3, seen=1))
     assert WARNING_BANNER in html
-    assert WARNING_BADGE not in html
+    # **查元素类，不查文案子串**：2026-11-24 起红字文案里含「⚠ 高风险」
+    # （见 approval.WARNING_BANNER 的注释：风险标记不能因为改措辞就丢掉），
+    # 于是 ``WARNING_BADGE not in html`` 会误判。真正区分两种形态的是
+    # ``class="badge"`` 这个元素在不在。
+    assert 'class="badge"' not in html
 
 
 def test_badge_after_the_threshold() -> None:

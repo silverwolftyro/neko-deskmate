@@ -245,7 +245,7 @@ def test_card_text_never_leaks_internal_tier_names(severity: str,
     html = build_card_html(subject="claude-code", tool_summary="Bash: rm -rf x",
                            session_id="s", working_directory=r"D:\workspace\proj",
                            command="rm -rf x", risk=risk,
-                           advice_state="ready", conclusion="无法判断，需要你决定")
+                           advice_state="ready")
     for word in BANNED_INTERNAL:
         assert word not in html, f"卡片上出现了内部词 {word!r}"
 
