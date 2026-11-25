@@ -95,11 +95,13 @@ from .approval import (
 from .auto_review import AutoReviewer
 from .broadcast import (
     NOTICE_MERGE_SECONDS,
+    RESPOND_COOLDOWN,
     Broadcaster,
     NoticeMerger,
     broadcast_notice,
     describe_actor,
     render_text,
+    speak,
 )
 from .commands import (
     COMMAND_DISPLAY_MAX,
@@ -167,6 +169,11 @@ TRANSCRIPT_TAIL_BYTES = 65536
 # 单轮最多播几条，防止适配器积压后一次刷屏。
 # 超出的部分进 ``_pending_pushes`` 队列，**下一轮接着发，不是丢掉**。
 MAX_BROADCAST_PER_TICK = 5
+
+# speak_test 的台词长度上限。侦查笔记的实测：句子越长她越容易跑偏
+# （改写、加舞台提示、吞尾巴）。80 是判断值不是测出来的阈值，但方向明确——
+# 这个入口是调试用的，不是让她念课文。
+SPEAK_TEST_MAX = 80
 
 # 积压队列的硬顶。第一道防线是 Coalescer（把 100 条相似删除合成一两条），
 # 这个队列只是兜持续洪水的。超顶时丢**最旧**的——正在发生的动作比
@@ -2026,6 +2033,75 @@ class AgentDeskmatePlugin(NekoPluginBase):
             "message": ("已保存。下一次播报生效；"
                         + ("猫娘会用她自己的话复述一遍，原文照旧上屏。"
                            if want else "只出文字，角色不开口。")),
+        })
+
+    @ui.action(id="speak_test",
+               label=tr("entry.speak_test.name", default="让她念一句"))
+    @plugin_entry(
+        id="speak_test",
+        name=tr("entry.speak_test.name", default="让她念一句"),
+        description=tr(
+            "entry.speak_test.description",
+            default="把一段文字用她的声音念出来，同时发一条精确文字留底。"
+                    "用来验证语音链，也是唯一能推任意文本的入口。",
+        ),
+    )
+    async def speak_test(self, text: str = "", _ctx: dict | None = None):
+        """让她把 ``text`` 原样念出来（语音链调试入口）。
+
+        **为什么需要这个入口**：插件能自主触发的播报只有规则命中那条路，
+        而那条路的文本永远是「事件报告：<命令>」形状——指示会被包在里面、
+        处在 shell 命令的语法位置上，她合理地当成命令文本而非对她的指示。
+        所以「让她按预先的脚本说话」在这条路上做不到，必须有一个人能推
+        任意文本的口子。这就是那个口子。
+
+        走 ``broadcast.speak`` 的双通道（念 + 留底），不自己拼 push——
+        红线 1 的"推送只有一处出口"照样成立。
+
+        **冷却照算**：宿主前端有个连发 respond 会弄坏音频的 bug
+        （见 ``broadcast.RESPOND_COOLDOWN``），调试入口不例外。
+        被挡了就明说还差几秒，不假装发了。
+        """
+        body = str(text or "").strip()
+        if not body:
+            return Err(SdkError("要给一句让她念的话。"))
+        if len(body) > SPEAK_TEST_MAX:
+            return Err(SdkError(
+                "太长了（{} 字，上限 {}）。句子越长她越容易跑偏，"
+                "这不是保守，是实测出来的。".format(len(body), SPEAK_TEST_MAX)))
+
+        config = await self._plugin_config()
+        model_cfg = config.get("model") if isinstance(
+            config.get("model"), dict) else {}
+        key = str(model_cfg.get("api_key") or config.get("api_key") or "")
+        if not key.strip():
+            return Err(SdkError(
+                "没配 API key——让她念需要主模型接一轮。"
+                "先在插件管理器的「配置」页填 key。"))
+
+        # 只解析一次，念和留底都用这个结果：拆成两次调用会让第二次
+        # 看到的是第一次刚刷新的时间戳，凭空多出一段冷却。
+        behavior = "respond"
+        if self._broadcaster is not None:
+            behavior = self._broadcaster.resolve_ai_behavior()
+
+        spoken, precise = speak(
+            self.push_message, body, source=SOURCE, logger=self.logger,
+            tag="speak_test", ai_behavior=behavior,
+        )
+        if behavior != "respond":
+            return Ok({
+                "spoken": spoken,
+                "precise": precise,
+                "message": ("精确文字已留底，但这一轮没让她念——"
+                            "上一条 respond 还没过 {} 秒冷却"
+                            "（宿主前端连发会弄坏音频）。再等一会儿。".format(
+                                int(RESPOND_COOLDOWN))),
+            })
+        return Ok({
+            "spoken": spoken,
+            "precise": precise,
+            "message": "发了。她应该会念出来，同时精确文字也留底了。",
         })
 
     # 暴露成 ui.action 是为了设置面板能一键调用（API 规定「A surface cannot

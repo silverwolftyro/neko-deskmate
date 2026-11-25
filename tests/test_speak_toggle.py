@@ -108,3 +108,84 @@ def test_no_broadcaster_yet_is_not_an_error():
     res = _run(host.settings_set_speak(speak=True))
     assert res.is_ok() is True
     assert host._written["agent_deskmate.approval.broadcast_speak"] is True
+
+
+# ── speak_test：唯一能推任意文本的入口 ───────────────────────────────────
+
+
+class SpeakTestHost(SpeakHost):
+    speak_test = AgentDeskmatePlugin.speak_test
+
+    def __init__(self, *, key_set: bool = True, broadcaster=None):
+        super().__init__(key_set=key_set)
+        self._broadcaster = broadcaster if broadcaster is not None else self._broadcaster
+        # 父类造的广播器默认 speak=False；这个入口测的是"让她念"，
+        # 所以默认按用户开了开关来。
+        self._broadcaster.speak = True
+        self.pushed: list[dict] = []
+
+        class _Push:
+            def __call__(inner, **kw):
+                self.pushed.append(kw)
+                return {"submitted": True}
+
+        self.push_message = _Push()
+
+
+def test_pushes_both_channels():
+    host = SpeakTestHost()
+    res = _run(host.speak_test(text="已自动放行，风险很低。"))
+    assert res.is_ok() is True
+    assert len(host.pushed) == 2
+    # ① 念：空 visibility + respond + 指示包裹
+    assert host.pushed[0]["visibility"] == []
+    assert host.pushed[0]["ai_behavior"] == "respond"
+    assert "念出来" in host.pushed[0]["parts"][0]["text"]
+    # ② 留底：chat + blind + 精确原文
+    assert host.pushed[1]["visibility"] == ["chat"]
+    assert host.pushed[1]["ai_behavior"] == "blind"
+    assert host.pushed[1]["parts"][0]["text"] == "已自动放行，风险很低。"
+
+
+def test_empty_text_refused():
+    host = SpeakTestHost()
+    res = _run(host.speak_test(text="   "))
+    assert res.is_ok() is False
+    assert host.pushed == []
+
+
+def test_too_long_refused():
+    host = SpeakTestHost()
+    res = _run(host.speak_test(text="啊" * 200))
+    assert res.is_ok() is False
+    assert "越长" in str(res.err())
+    assert host.pushed == []
+
+
+def test_no_key_refused():
+    host = SpeakTestHost(key_set=False)
+    res = _run(host.speak_test(text="x"))
+    assert res.is_ok() is False
+    assert "key" in str(res.err()).lower()
+    assert host.pushed == []
+
+
+def test_cooldown_blocks_and_says_so():
+    """被冷却挡了要明说——不假装发了。"""
+    host = SpeakTestHost()
+    # 先消耗掉一次 respond（构造时 last_respond_at=0，第一次一定放行）
+    host._broadcaster.resolve_ai_behavior(now=1000.0)
+    import plugin.plugins.agent_deskmate.broadcast as bc
+    real_time = bc.time.time
+    bc.time.time = lambda: 1001.0
+    try:
+        res = _run(host.speak_test(text="第二句"))
+    finally:
+        bc.time.time = real_time
+    assert res.is_ok() is True
+    payload = res.unwrap()
+    assert payload["spoken"] == "skipped"
+    assert "冷却" in payload["message"]
+    # 留底照发——用户眼睛看的那条不该被语音的冷却拖累
+    assert len(host.pushed) == 1
+    assert host.pushed[0]["ai_behavior"] == "blind"

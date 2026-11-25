@@ -170,6 +170,8 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
   )
   const [savingRoots, setSavingRoots] = useLocalState("saving_roots", false)
   const [savingSpeak, setSavingSpeak] = useLocalState("saving_speak", false)
+  const [speakDraft, setSpeakDraft] = useLocalState("speak_draft", "")
+  const [speaking, setSpeaking] = useLocalState("speaking", false)
   // Tabs 的 activeId 是受控的：状态页的「去声明」要能把它切到设置页。
   // （原来用 querySelector 猜 data-neko-tab，Tabs 没这个属性，点了没反应。）
   const [tab, setTab] = useLocalState("tabs:deskmate", "status")
@@ -241,6 +243,33 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
       toast.error(String(err && err.message ? err.message : err))
     } finally {
       setSavingSpeak(false)
+    }
+  }
+
+  const onSpeakTest = async () => {
+    const body = speakDraft.trim()
+    if (!body) {
+      toast.error(t("panel.settings.speak_test_empty", {
+        defaultValue: "先写一句要她念的话。",
+      }))
+      return
+    }
+    setSpeaking(true)
+    try {
+      const res = await props.api.call(
+        "speak_test",
+        { text: body },
+        { userInitiated: true },
+      )
+      const msg =
+        res && typeof res === "object" && "message" in res
+          ? String((res as any).message)
+          : t("panel.settings.speak_test_done", { defaultValue: "发了。" })
+      toast.success(msg)
+    } catch (err: any) {
+      toast.error(String(err && err.message ? err.message : err))
+    } finally {
+      setSpeaking(false)
     }
   }
 
@@ -534,6 +563,63 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
           </Text>
         </Stack>
       </Card>
+
+      {/* 语音链调试入口。存在的理由：插件能自主触发的播报只有规则命中，
+          那条路的文本永远是「事件报告：<命令>」形状，指示会被包在里面，
+          她合理地当成命令文本——所以「让她按脚本说话」必须有一个能推
+          任意文本的口子，这就是那个口子。 */}
+      {hasAction("speak_test") ? (
+        <Card
+          title={t("panel.settings.speak_test", {
+            defaultValue: "让她念一句（调试）",
+          })}
+        >
+          <Stack gap="sm">
+            <Text>
+              {t("panel.settings.speak_test_help", {
+                defaultValue:
+                  "验证语音链用的。她会把这句话原样念出来，同时精确文字也留一份在聊天窗。",
+              })}
+            </Text>
+            <Field
+              label={t("panel.settings.speak_test_label", {
+                defaultValue: "要她念的话",
+              })}
+            >
+              <Textarea
+                value={speakDraft}
+                placeholder={t("panel.settings.speak_test_placeholder", {
+                  defaultValue: "例如：已自动放行，这条命令只是打印一句话，风险很低。",
+                })}
+                onChange={(v: string) => setSpeakDraft(v)}
+              />
+            </Field>
+            <Button
+              tone="primary"
+              disabled={!running || !state.api_key_set || speaking}
+              onClick={onSpeakTest}
+            >
+              {speaking
+                ? t("panel.settings.speak_test_running", {
+                    defaultValue: "在等她说完…",
+                  })
+                : t("panel.settings.speak_test_go", {
+                    defaultValue: "让她念",
+                  })}
+            </Button>
+            {!state.api_key_set ? (
+              <Alert
+                tone="warning"
+                message={t("panel.settings.speak_need_key", {
+                  defaultValue:
+                    "没配 API key，只能用「只出文字」——让猫娘复述需要主模型接一轮。"
+                    + "去上面填 key。",
+                })}
+              />
+            ) : null}
+          </Stack>
+        </Card>
+      ) : null}
 
       <Card title={t("panel.settings.api_key", { defaultValue: "API key" })}>
         <Stack gap="sm">

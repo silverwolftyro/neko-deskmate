@@ -78,7 +78,7 @@ def test_events_registered() -> None:
         "approval_authorize", "hook_install", "hook_uninstall",
         "model_test",
         "pending_list", "audit_list",
-        "settings_set_roots", "settings_set_speak",
+        "settings_set_roots", "settings_set_speak", "speak_test",
     }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"
     assert registered["shutdown"].event_type == "lifecycle"
