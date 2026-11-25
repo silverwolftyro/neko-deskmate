@@ -1308,7 +1308,9 @@ class AgentDeskmatePlugin(NekoPluginBase):
                                 source=SOURCE, logger=self.logger,
                                 # 跟着 Broadcaster 走，不另读配置——
                                 # 一处决定，避免"删除类开说、通知类不开"的半成品。
-                                speak=getattr(broadcaster, "speak", False)))
+                                # 也走同一个冷却：两条播报连着来，第二条自动
+                                # 降级成 blind，不连发 respond。
+                                ai_behavior=broadcaster.resolve_ai_behavior()))
 
         outcomes: list[str] = []
         for job in jobs:

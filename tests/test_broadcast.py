@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from plugin.plugins.agent_deskmate.broadcast import (
+    RESPOND_COOLDOWN,
     NOTICE_MERGE_SECONDS,
     Broadcaster,
     NoticeMerger,
@@ -948,11 +949,12 @@ def test_notice_follows_the_same_switch():
                       detail="等你决定", at=1_700_000_000.0,
                       fingerprint="fp|speak")
     broadcast_notice(push, notice, source="agent_deskmate",
-                     logger=FakeLogger(), speak=True)
+                     logger=FakeLogger(), ai_behavior="respond")
     assert push.calls[0]["ai_behavior"] == "respond"
 
     push2 = _RecordingPush()
-    broadcast_notice(push2, notice, source="agent_deskmate", logger=FakeLogger())
+    broadcast_notice(push2, notice, source="agent_deskmate",
+                     logger=FakeLogger(), ai_behavior="blind")
     assert push2.calls[0]["ai_behavior"] == "blind"
 
 
@@ -962,3 +964,52 @@ def test_push_text_default_stays_blind():
     push = _RecordingPush()
     push_text(push, "x", source="s", priority=5, logger=FakeLogger())
     assert push.calls[0]["ai_behavior"] == "blind"
+
+
+# ── respond 冷却：不连发（绕宿主前端一个弄坏要重启 App 的 bug） ──────────
+
+
+def test_two_responds_in_a_row_second_is_demoted():
+    """宿主前端 `app-audio-playback.js:1590` 每次新语音接管都
+    `incomingAudioEpoch += 1`，676 行按代际丢块。连续接管疑似把音频
+    推进"开头吞字"的坏状态，恢复要重启整个 App（侦查笔记结论 3，
+    机制已在代码里核实；但"连发就会坏"本身未做可控复现）。
+    所以插件侧不连发：第二条自动降级成 blind，文字照旧上屏。
+    """
+    b = Broadcaster(RecordingPush(), FakeLogger(), source="s", speak=True)
+    assert b.resolve_ai_behavior(now=1000.0) == "respond"
+    assert b.resolve_ai_behavior(now=1001.0) == "blind"
+    # 过了冷却窗才恢复
+    assert b.resolve_ai_behavior(now=1000.0 + RESPOND_COOLDOWN) == "respond"
+
+
+def test_cooldown_does_not_leak_into_later_broadcasts():
+    """降温只影响窗口内那一条，不是把自己关掉。"""
+    b = Broadcaster(RecordingPush(), FakeLogger(), source="s", speak=True)
+    b.resolve_ai_behavior(now=1000.0)
+    assert b.resolve_ai_behavior(now=1005.0) == "blind"
+    assert b.resolve_ai_behavior(now=1100.0) == "respond"
+    assert b.ai_behavior == "respond"   # 配置没变，只是这一条降温
+
+
+def test_blind_mode_never_touches_the_cooldown():
+    b = Broadcaster(RecordingPush(), FakeLogger(), source="s", speak=False)
+    for i in range(5):
+        assert b.resolve_ai_behavior(now=1000.0 + i) == "blind"
+    # 从来没让她说过话，所以之后一开就能说
+    b.speak = True
+    assert b.resolve_ai_behavior(now=1001.0) == "respond"
+
+
+def test_real_broadcast_sequence_respects_cooldown():
+    """端到端：连着播两条，第一条 respond、第二条 blind。"""
+    push = RecordingPush()
+    b = Broadcaster(push, FakeLogger(), source="s", speak=True)
+    b.broadcast(_speak_hit())
+    b.broadcast(_speak_hit())
+    assert push.calls[0]["ai_behavior"] == "respond"
+    assert push.calls[1]["ai_behavior"] == "blind"
+    # 降级不改别的：source / visibility / 原文都在（红线 1 的四条不随冷却变）
+    assert push.calls[1]["source"] == "s"
+    assert push.calls[1]["visibility"] == ["chat"]
+    assert push.calls[1]["parts"][0]["type"] == "text"

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import replace
 from typing import Any, Callable
 
@@ -180,6 +181,26 @@ UNKNOWN_EXECUTOR = "未知执行者"
 
 def priority_for(severity: str) -> int:
     return SEVERITY_PRIORITY.get(severity, 5)
+
+
+#: 两条 ``respond`` 播报之间的最短间隔（秒）。
+#:
+#: **这是绕宿主 bug 的规避，不是产品参数。** 依据
+#: `06-随手笔记/语音提示-接口侦查-2026-11-23.md` 结论 3：
+#: 前端 `static/app/app-audio-playback.js:1590`` 的
+#: ``interruptCurrentAssistantSpeech()`` 每次"新语音接管"都
+#: ``incomingAudioEpoch += 1`` 并清空队列，而 676 行按代际丢块——
+#: 连续接管疑似某次重置没落地，于是**此后每段音频的首块都被当旧代际丢弃**，
+#: 用户所有回复（含正常聊天）都缺开头几个字。
+#: 恢复方式只有**重启整个 N.E.K.O App**（11-23 01:29 实测）。
+#:
+#: 所以文档的结论是"插件侧不连发 respond"。超窗的那条**自动降级成 blind**：
+#: 文字照旧上屏（``visibility=["chat"]`` 不变），只是这一轮不让她开口。
+#: 语音不是验收项，噪音和弄坏 App 之间选前者。
+#:
+#: ⚠️ 30 秒是**判断值，不是测出来的**——文档明写"尚未做可控复现"
+#: （做那个实验会把 App 再弄哑，需用户同意）。宿主修好之后这个常量该删掉。
+RESPOND_COOLDOWN = 30.0
 
 
 # ── 推送的唯一出口（红线 1） ─────────────────────────────────────────────────
@@ -396,14 +417,37 @@ class Broadcaster:
         # **默认 False**：这是插件一直的行为，改成默认开会让每个用户
         # 第一次启动就多出一堆角色发言，而且每条都要烧一轮模型。
         self.speak = bool(speak)
+        # 上一条 respond 的时间戳。0 = 从来没让她说过话。
+        self._last_respond_at = 0.0
         self.sent = 0
         self.rejected = 0
         self.coalesced = 0
 
     @property
     def ai_behavior(self) -> str:
-        """播报走哪个 ai_behavior。**只有这一处决定**（红线 1）。"""
+        """当前配置想要的播报行为。**不带冷却判断**——给面板/日志读现状用。
+
+        真要发一条时用 ``resolve_ai_behavior()``：那个才管"不连发"。
+        """
         return "respond" if self.speak else "blind"
+
+    def resolve_ai_behavior(self, now: float | None = None) -> str:
+        """发一条播报前问一次：这条能不能让她开口。
+
+        ``speak`` 关着 → 永远 ``blind``。
+        ``speak`` 开着但**上一条 respond 还没过冷却窗** → 这条降级成 ``blind``。
+
+        降级不是"少个功能"：宿主前端有个弄坏了要重启整个 App 的 bug
+        （见 ``RESPOND_COOLDOWN`` 的注释），而插件没有任何理由去连发。
+        文字照旧上屏，用户只是这一轮听不到她说话。
+        """
+        if not self.speak:
+            return "blind"
+        stamp = time.time() if now is None else float(now)
+        if stamp - self._last_respond_at < RESPOND_COOLDOWN:
+            return "blind"
+        self._last_respond_at = stamp
+        return "respond"
 
     def broadcast(self, hit: RuleHit) -> str:
         """播一条。返回 ``sent`` / ``coalesced`` / 拒绝原因，永不抛异常。"""
@@ -424,7 +468,7 @@ class Broadcaster:
             tag=hit.severity,
             log_commands=self._log_commands,
             command_length=command_length,
-            ai_behavior=self.ai_behavior,
+            ai_behavior=self.resolve_ai_behavior(),
         )
         if outcome == "sent":
             self.sent += 1
@@ -645,7 +689,7 @@ class NoticeMerger:
 
 
 def broadcast_notice(push: Callable[..., dict], notice: Notice, *, source: str,
-                     logger: Any, speak: bool = False) -> str:
+                     logger: Any, ai_behavior: str = "blind") -> str:
     """播一条状态机 Notice。返回 ``sent`` / 拒绝原因，**永不抛异常**。
 
     **刻意不与 Broadcaster 合体**：规则层播 RuleHit（要脱敏、要合并、要按
@@ -673,5 +717,5 @@ def broadcast_notice(push: Callable[..., dict], notice: Notice, *, source: str,
         # 通知类（进度/卡住/等待）跟着同一个开关走。
         # 用户要的是"时不时说一下进行到哪一步"——那正是这一类，
         # 只给删除类开 speak 会得到一个半成品。
-        ai_behavior=("respond" if speak else "blind"),
+        ai_behavior=ai_behavior,
     )

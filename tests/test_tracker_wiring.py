@@ -141,6 +141,10 @@ class _TaggingBroadcaster:
         self._sink.append(f"rule:{hit}")
         return "sent"
 
+    def resolve_ai_behavior(self, now=None) -> str:
+        # 真 Broadcaster 才有冷却；桩只需要别让调用方炸。
+        return "blind"
+
 
 class _Host:
     """只借 ``AgentDeskmatePlugin`` 的那几个方法，其余手搭。
