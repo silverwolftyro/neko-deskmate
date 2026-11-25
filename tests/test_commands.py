@@ -511,3 +511,47 @@ def test_target_unparseable_agrees_with_is_delete_command():
     cmd = _heredoc_case()
     assert is_delete_command(cmd) is False
     assert target_unparseable(cmd) is False
+
+
+# ── % 不是"目标被藏起来"（2026-11-26 真机，第四条误报） ────────────────
+
+
+def test_percent_is_not_unparseable():
+    """``date +%H:%M:%S`` 里的 % 是格式符，不藏任何路径。
+
+    原正则含 %，于是任何带 % 的命令加上一个 rm 都爆【严重】——
+    实测：我为了"温和一点"加了 ``date +%H:%M:%S``，反而把 warn 抬成了 critical。
+    """
+    assert target_unparseable("date +%H:%M:%S") is False
+    assert target_unparseable("rm -f x && date +%H:%M:%S") is False
+    assert target_unparseable("printf '%s' done") is False
+
+
+def test_dollar_and_backtick_still_unparseable():
+    """删了 % 不能把真能藏目标的那几个也一起放掉。"""
+    assert target_unparseable("rm -rf $DIR") is True
+    assert target_unparseable("rm -rf `cat list`") is True
+    assert target_unparseable("rm -rf ${f%%.txt}") is True   # $ 抓到了，不靠 %
+
+
+def test_globs_still_unparseable():
+    assert target_unparseable("rm -rf *.log") is True
+    assert target_unparseable("rm -rf a?b") is True
+    assert target_unparseable("rm -rf f[0-9].txt") is True
+
+
+def test_the_real_incident_command_is_warn_not_critical():
+    """端到端复现 2026-11-26 01:21 那条真机误报。"""
+    from plugin.plugins.agent_deskmate.events import UnifiedEvent
+    cmd = ('cd "D:/w/agent_deskmate" && date +%H:%M:%S && echo probe > '
+           '.speak-probe.tmp && rm -f .speak-probe.tmp && echo done && '
+           'date +%H:%M:%S')
+    src = UnifiedEvent(event="tool_use", ts="2026-11-26T01:21:40",
+                       agent="claude-code", session="547ea690",
+                       working_directory=r"D:\workspace\N.E.K.O\N.E.K.O-agent_help",
+                       command="x")
+    hit = evaluate_delete(cmd, agent="claude-code", session="547ea690",
+                          source=src)
+    assert hit is not None
+    assert hit.severity == "warn", (
+        "带 % 的普通命令又变成 critical 了——红字会贬值")
