@@ -70,14 +70,15 @@ def test_events_registered() -> None:
     #
     # ``panel_context``（2026-11-25）不是入口而是 ``@ui.context``，
     # 所以不进这张集合；它供的是设置面板的 state。
-    # ``settings_set_roots`` 是面板唯一的写入口（面板没有写配置的能力）。
+    # ``settings_set_roots`` 是面板的第一个写入口（面板没有写配置的能力）。
+    # ``settings_set_speak`` 是第二个——切播报方式，同样只能走入口。
     assert set(registered) == {
         "startup", "shutdown", "config_change", "status", "dump_events", "scan_now",
         "watch", "approval", "approval_decide", "approval_explain",
         "approval_authorize", "hook_install", "hook_uninstall",
         "model_test",
         "pending_list", "audit_list",
-        "settings_set_roots",
+        "settings_set_roots", "settings_set_speak",
     }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"
     assert registered["shutdown"].event_type == "lifecycle"

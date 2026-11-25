@@ -124,6 +124,15 @@ auto_decide_max_severity = "notice"
 # standard（加上范围与规则判据，默认）| detailed（再叠加模型给的理由与依据）。
 explain_verbosity = "standard"
 
+# 播报方式：false（默认）= ai_behavior="blind"，只出文字，角色不开口；
+#           true = "respond"，每条播报让主模型接一轮，用角色自己的话复述。
+# **它不保证语音**——那一轮话会不会被念出来，取决于用户在 N.E.K.O 里
+# 有没有开角色语音，那是宿主侧的设置，插件管不着。所以配置名是 speak
+# 而不是 voice：写成 voice 就是骗人，只不过骗得深一层。
+# **没配 api_key 时不许开**：respond 要主模型接一轮，而红线 3 是零 key 只跑 L0。
+# visibility=["chat"] 照旧带着，原文始终上屏——语音那一路漏了，人也看得见。
+broadcast_speak = false
+
 # 高风险警示的强调程度：first_n（默认）| always | never。
 # 高危卡片上原来每条都顶一整行红字。真机反馈：前几次有用，之后价值像反比
 # 函数一样暴跌——看多了就等于没有，真到该被叫住的那一刻也被一起跳过。

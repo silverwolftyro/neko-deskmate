@@ -882,3 +882,83 @@ def test_different_kinds_are_never_merged() -> None:
 
 def test_the_default_window_is_the_documented_one() -> None:
     assert NOTICE_MERGE_SECONDS == 20.0
+
+
+# ── 播报方式：blind（只出文字）↔ respond（让猫娘说一说） ────────────────
+
+
+class _RecordingPush:
+    """记录 push_message 收到的参数。只看 kwargs，不看正文。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"status": "accepted"}
+
+
+def _speak_hit():
+    from plugin.plugins.agent_deskmate.rules import RuleHit
+    return RuleHit(rule="delete", severity="critical", summary="删除文件：x",
+                   matched="rm", agent="claude-code", session="547ea690",
+                   ts="2026-11-26T00:00:00", command_length=12)
+
+
+def test_default_is_blind():
+    """默认只出文字——这是插件一直的行为，不能因为加了开关就变。"""
+    push = _RecordingPush()
+    b = Broadcaster(push, FakeLogger(), source="agent_deskmate")
+    assert b.ai_behavior == "blind"
+    b.broadcast(_speak_hit())
+    assert push.calls[0]["ai_behavior"] == "blind"
+
+
+def test_speak_true_switches_to_respond():
+    push = _RecordingPush()
+    b = Broadcaster(push, FakeLogger(), source="agent_deskmate", speak=True)
+    assert b.ai_behavior == "respond"
+    b.broadcast(_speak_hit())
+    assert push.calls[0]["ai_behavior"] == "respond"
+
+
+def test_source_and_visibility_unchanged_by_speak():
+    """红线 1 的四条不随播报方式变：source 显式、visibility=["chat"]、
+    永不 await、只有这一个出口。"""
+    push = _RecordingPush()
+    b = Broadcaster(push, FakeLogger(), source="agent_deskmate", speak=True)
+    b.broadcast(_speak_hit())
+    call = push.calls[0]
+    assert call["source"] == "agent_deskmate"
+    assert call["visibility"] == ["chat"]
+    # 原文始终上屏——语音那一路漏了，人也看得见
+    assert call["parts"][0]["type"] == "text"
+
+
+def test_notice_follows_the_same_switch():
+    """通知类（进度/卡住/等待）跟着同一个开关。
+    用户要的是"时不时说一下进行到哪一步"——那正是这一类，
+    只给删除类开 speak 会得到半成品。
+    """
+    from plugin.plugins.agent_deskmate.broadcast import broadcast_notice
+    push = _RecordingPush()
+    notice = Notice(role=Role.OUTCOME, light=Light.WAITING,
+                      agent="claude-code", session="547ea690",
+                      who="claude-code", headline="在等你",
+                      detail="等你决定", at=1_700_000_000.0,
+                      fingerprint="fp|speak")
+    broadcast_notice(push, notice, source="agent_deskmate",
+                     logger=FakeLogger(), speak=True)
+    assert push.calls[0]["ai_behavior"] == "respond"
+
+    push2 = _RecordingPush()
+    broadcast_notice(push2, notice, source="agent_deskmate", logger=FakeLogger())
+    assert push2.calls[0]["ai_behavior"] == "blind"
+
+
+def test_push_text_default_stays_blind():
+    """push_text 的默认值必须是 blind——它还有其他调用方。"""
+    from plugin.plugins.agent_deskmate.broadcast import push_text
+    push = _RecordingPush()
+    push_text(push, "x", source="s", priority=5, logger=FakeLogger())
+    assert push.calls[0]["ai_behavior"] == "blind"

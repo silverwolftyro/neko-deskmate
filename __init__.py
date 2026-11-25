@@ -1021,10 +1021,13 @@ class AgentDeskmatePlugin(NekoPluginBase):
             self.push_message, self.logger, source=SOURCE,
             coalescer=Coalescer(window_seconds=coalesce_seconds),
             log_commands=_to_bool(config.get("log_commands"), False),
+            # 「让猫娘说一说」。默认关——见 Broadcaster.__init__ 的理由。
+            speak=_to_bool(_approval_section(config).get("broadcast_speak"), False),
         )
         self.logger.info(
-            "观测适配器就绪 transcript={} gateway={} 合并窗口={}s",
+            "观测适配器就绪 transcript={} gateway={} 合并窗口={}s 播报方式={}",
             projects_dir, db_path, coalesce_seconds,
+            "猫娘复述" if self._broadcaster.speak else "只出文字",
         )
         return self._broadcaster
 
@@ -1302,7 +1305,10 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 jobs.append(partial(broadcaster.broadcast, hit))
         for notice in notices:
             jobs.append(partial(broadcast_notice, self.push_message, notice,
-                                source=SOURCE, logger=self.logger))
+                                source=SOURCE, logger=self.logger,
+                                # 跟着 Broadcaster 走，不另读配置——
+                                # 一处决定，避免"删除类开说、通知类不开"的半成品。
+                                speak=getattr(broadcaster, "speak", False)))
 
         outcomes: list[str] = []
         for job in jobs:
@@ -1899,6 +1905,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
             explain_verbosity=str(approval_cfg.get("explain_verbosity") or "brief"),
             warning_emphasis=str(approval_cfg.get("warning_emphasis") or "first_n"),
             warning_first_n=int(approval_cfg.get("warning_first_n") or 3),
+            speak=_to_bool(approval_cfg.get("broadcast_speak"), False),
             sessions=sessions,
             approvals=approvals,
             now=time.time(),
@@ -1952,6 +1959,55 @@ class AgentDeskmatePlugin(NekoPluginBase):
             "count": len(cleaned),
             "message": ("已保存 {} 个目录。下一次播报就用新声明；"
                         "不声明时高危通知显示「发起者未知」。".format(len(cleaned))),
+        })
+
+    @ui.action(id="settings_set_speak",
+               label=tr("entry.settings_set_speak.name", default="保存播报方式"))
+    @plugin_entry(
+        id="settings_set_speak",
+        name=tr("entry.settings_set_speak.name", default="保存播报方式"),
+        description=tr(
+            "entry.settings_set_speak.description",
+            default="切换播报是只出文字，还是让猫娘用她自己的话复述一遍。",
+        ),
+    )
+    async def settings_set_speak(self, speak: bool = False,
+                                 _ctx: dict | None = None):
+        """写 ``[agent_deskmate.approval].broadcast_speak``。
+
+        为什么叫 ``broadcast_speak`` 而不叫 ``broadcast_voice``：
+        **它不保证语音**。它只决定 ``ai_behavior`` 是 ``blind``（只出文字）
+        还是 ``respond``（主模型接一轮、角色开口）。那一轮话会不会被念出来，
+        取决于用户在 N.E.K.O 里有没有开角色语音——宿主侧的设置，插件管不着。
+        配置名写成 voice 就是在骗人，只不过骗得深一层。
+
+        **没配 api_key 时不许开**：``respond`` 要主模型接一轮，
+        而红线 3 是零 key 只跑 L0。这时返回 Err 让面板说明原因，
+        而不是假装保存成功、下次播报静默失效。
+        """
+        want = bool(speak)
+        if want:
+            config = await self._plugin_config()
+            model_cfg = config.get("model") if isinstance(
+                config.get("model"), dict) else {}
+            key = str(model_cfg.get("api_key") or config.get("api_key") or "")
+            if not key.strip():
+                return Err(SdkError(
+                    "没配 API key，不能让猫娘复述——那需要主模型接一轮。"
+                    "先在插件管理器的「配置」页填 key，再来开这个。"))
+        try:
+            await self.config.set("agent_deskmate.approval.broadcast_speak",
+                                  want, timeout=5.0)
+        except Exception as exc:
+            self.logger.error("写播报方式失败：{}", type(exc).__name__)
+            return Err(SdkError("保存失败：{}".format(type(exc).__name__)))
+        self.logger.info("播报方式已改为：{}",
+                         "猫娘复述（respond）" if want else "只出文字（blind）")
+        return Ok({
+            "speak": want,
+            "message": ("已保存。下一次播报生效；"
+                        + ("猫娘会用她自己的话复述一遍，原文照旧上屏。"
+                           if want else "只出文字，角色不开口。")),
         })
 
     # 暴露成 ui.action 是为了设置面板能一键调用（API 规定「A surface cannot

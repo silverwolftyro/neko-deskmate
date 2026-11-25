@@ -103,6 +103,10 @@ type DeskmateState = {
   explain_verbosity?: string
   warning_emphasis?: string
   warning_first_n?: number
+  // 播报方式。``speak_available`` 由后端算好——没配 key 时 respond 走不了，
+  // 前端不该自己去推这个结论（推错了就是"能点、点了不生效"）。
+  speak?: boolean
+  speak_available?: boolean
   session_count?: number
   last_broadcast_at?: number
   sessions?: SessionRow[]
@@ -165,6 +169,7 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
     roots.join("\n"),
   )
   const [savingRoots, setSavingRoots] = useLocalState("saving_roots", false)
+  const [savingSpeak, setSavingSpeak] = useLocalState("saving_speak", false)
   // Tabs 的 activeId 是受控的：状态页的「去声明」要能把它切到设置页。
   // （原来用 querySelector 猜 data-neko-tab，Tabs 没这个属性，点了没反应。）
   const [tab, setTab] = useLocalState("tabs:deskmate", "status")
@@ -219,6 +224,23 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
       toast.error(String(err && err.message ? err.message : err))
     } finally {
       setSavingRoots(false)
+    }
+  }
+
+  const onSetSpeak = async (want: boolean) => {
+    setSavingSpeak(true)
+    try {
+      await props.api.call(
+        "settings_set_speak",
+        { speak: want },
+        { userInitiated: true },
+      )
+      await props.api.refresh()
+      toast.success(t("panel.settings.saved", { defaultValue: "已保存" }))
+    } catch (err: any) {
+      toast.error(String(err && err.message ? err.message : err))
+    } finally {
+      setSavingSpeak(false)
     }
   }
 
@@ -452,6 +474,64 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
           >
             {t("panel.settings.save", { defaultValue: "保存" })}
           </Button>
+        </Stack>
+      </Card>
+
+      <Card title={t("panel.settings.speak", { defaultValue: "播报方式" })}>
+        <Stack gap="sm">
+          {/* 两个按钮而不是下拉：只有两个值，而且当前值要一眼看得出来。
+              下拉默认显示当前值，用户分不清"这是设置"还是"这是状态"。 */}
+          <Inline gap="sm">
+            <Button
+              tone={state.speak ? "default" : "primary"}
+              disabled={!running || savingSpeak || state.speak === true}
+              onClick={() => {
+                onSetSpeak(false)
+              }}
+            >
+              {t("panel.settings.speak.off", { defaultValue: "只出文字" })}
+            </Button>
+            <Button
+              tone={state.speak ? "primary" : "default"}
+              disabled={!running || savingSpeak || !state.speak_available}
+              onClick={() => {
+                onSetSpeak(true)
+              }}
+            >
+              {t("panel.settings.speak.on", { defaultValue: "让猫娘说一说" })}
+            </Button>
+          </Inline>
+          <StatusBadge
+            tone={state.speak ? "success" : "default"}
+            label={state.speak
+              ? t("panel.settings.speak.on", { defaultValue: "让猫娘说一说" })
+              : t("panel.settings.speak.off", { defaultValue: "只出文字" })}
+          />
+          <Text>
+            {t("panel.settings.speak_help", {
+              defaultValue:
+                "「让猫娘说一说」= 每条播报让主模型接一轮，用她自己的话复述。"
+                + "原文照旧上屏，所以语音漏了你也看得见。",
+            })}
+          </Text>
+          {/* 没配 key 时必须说清为什么点不了——红线 3。 */}
+          {!state.speak_available ? (
+            <Alert
+              tone="warning"
+              message={t("panel.settings.speak_need_key", {
+                defaultValue:
+                  "没配 API key，只能用「只出文字」——让猫娘复述需要主模型接一轮。"
+                  + "去上面填 key。",
+              })}
+            />
+          ) : null}
+          <Text>
+            {t("panel.settings.speak_voice_note", {
+              defaultValue:
+                "它不保证语音：那一轮话会不会被念出来，取决于你在 N.E.K.O 里"
+                + "有没有开角色语音。插件只能让她开口，不能让她出声。",
+            })}
+          </Text>
         </Stack>
       </Card>
 

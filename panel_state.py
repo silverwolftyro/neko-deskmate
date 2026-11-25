@@ -34,6 +34,7 @@ def build_panel_state(
     explain_verbosity: str,
     warning_emphasis: str,
     warning_first_n: int,
+    speak: bool = False,
     sessions: list[dict[str, Any]],
     approvals: list[dict[str, Any]],
     now: float,
@@ -195,6 +196,11 @@ def build_panel_state(
         "explain_verbosity": explain_verbosity,
         "warning_emphasis": warning_emphasis,
         "warning_first_n": warning_first_n,
+        # 播报方式。``speak_available`` 单独一个字段而不是让前端去推：
+        # 没配 key 时 respond 走不了（红线 3），控件必须置灰并说清原因，
+        # 而不是"能点、点了不生效"——那正是假控件的定义。
+        "speak": bool(speak),
+        "speak_available": bool(speak) or api_key_set,
         "session_count": len(sessions),
         "sessions": session_rows,
         "attention": attention,

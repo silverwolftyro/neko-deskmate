@@ -406,6 +406,20 @@
                 "detailed"
               ]
             },
+            "broadcast_speak": {
+              "type": "boolean",
+              "title": "Broadcast style",
+              "description": "false (default) = ai_behavior blind, plain text only, the character stays silent. true = respond, the main model takes a turn for every broadcast and restates it in her own words. It does NOT guarantee voice: whether that turn is spoken aloud depends on whether character voice is enabled in N.E.K.O. Cannot be turned on without an API key, because respond needs a model turn.",
+              "x-title-i18n": {
+                "en": "Broadcast style",
+                "zh-CN": "播报方式"
+              },
+              "x-description-i18n": {
+                "en": "false (default) = ai_behavior blind, plain text only, the character stays silent. true = respond, the main model takes a turn for every broadcast and restates it in her own words. It does NOT guarantee voice: whether that turn is spoken aloud depends on whether character voice is enabled in N.E.K.O. Cannot be turned on without an API key, because respond needs a model turn.",
+                "zh-CN": "false（默认）= ai_behavior blind，只出文字，角色不开口。true = respond，每条播报让主模型接一轮，用角色自己的话复述。它不保证语音：那一轮话会不会被念出来，取决于在 N.E.K.O 里有没有开角色语音。没配 API key 时不能开——respond 需要主模型接一轮。"
+              },
+              "default": false
+            },
             "warning_emphasis": {
               "type": "string",
               "title": "High-risk warning emphasis",

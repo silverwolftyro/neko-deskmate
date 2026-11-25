@@ -190,16 +190,23 @@ def priority_for(severity: str) -> int:
 
 def push_text(push: Callable[..., dict], text: str, *, source: str, priority: int,
               logger: Any, tag: str = "", log_commands: bool = False,
-              command_length: int | None = None) -> str:
+              command_length: int | None = None,
+              ai_behavior: str = "blind") -> str:
     """把一段文本推去聊天窗。返回 ``sent`` / 拒绝原因，**永不抛异常**。
 
     ``tag`` 只进日志（``播报未被接受（backpressure）：[error] …``），不进正文。
+
+    ``ai_behavior`` 默认 ``"blind"``（纯播报，角色不开口）——红线 1 的原口径。
+    传 ``"respond"`` 会让主模型接一轮、用角色自己的话复述；
+    **它不保证语音**，宿主有没有开角色语音是用户侧的设置，插件管不着。
+    ``visibility=["chat"]`` 照旧带着，所以原文始终上屏——
+    语音那一路漏了，人也看得见（群 bot 2026-11-26 给的兜底，与 SDK 一致）。
     """
     try:
         result = push(
             source=source,
             visibility=["chat"],
-            ai_behavior="blind",
+            ai_behavior=ai_behavior,
             parts=[{"type": "text", "text": text}],
             priority=priority,
         )
@@ -377,15 +384,26 @@ class Broadcaster:
         source: str,
         coalescer: Any = None,
         log_commands: bool = False,
+        speak: bool = False,
     ) -> None:
         self._push = push
         self._logger = logger
         self._source = source
         self._coalescer = coalescer
         self._log_commands = log_commands
+        # 「让猫娘说一说」。False = ai_behavior="blind"（只出文字，角色不开口），
+        # True = "respond"（主模型接一轮，用她自己的话复述）。
+        # **默认 False**：这是插件一直的行为，改成默认开会让每个用户
+        # 第一次启动就多出一堆角色发言，而且每条都要烧一轮模型。
+        self.speak = bool(speak)
         self.sent = 0
         self.rejected = 0
         self.coalesced = 0
+
+    @property
+    def ai_behavior(self) -> str:
+        """播报走哪个 ai_behavior。**只有这一处决定**（红线 1）。"""
+        return "respond" if self.speak else "blind"
 
     def broadcast(self, hit: RuleHit) -> str:
         """播一条。返回 ``sent`` / ``coalesced`` / 拒绝原因，永不抛异常。"""
@@ -406,6 +424,7 @@ class Broadcaster:
             tag=hit.severity,
             log_commands=self._log_commands,
             command_length=command_length,
+            ai_behavior=self.ai_behavior,
         )
         if outcome == "sent":
             self.sent += 1
@@ -626,7 +645,7 @@ class NoticeMerger:
 
 
 def broadcast_notice(push: Callable[..., dict], notice: Notice, *, source: str,
-                     logger: Any) -> str:
+                     logger: Any, speak: bool = False) -> str:
     """播一条状态机 Notice。返回 ``sent`` / 拒绝原因，**永不抛异常**。
 
     **刻意不与 Broadcaster 合体**：规则层播 RuleHit（要脱敏、要合并、要按
@@ -651,4 +670,8 @@ def broadcast_notice(push: Callable[..., dict], notice: Notice, *, source: str,
         logger=logger,
         tag=key,
         log_commands=True,
+        # 通知类（进度/卡住/等待）跟着同一个开关走。
+        # 用户要的是"时不时说一下进行到哪一步"——那正是这一类，
+        # 只给删除类开 speak 会得到一个半成品。
+        ai_behavior=("respond" if speak else "blind"),
     )

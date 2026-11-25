@@ -343,3 +343,31 @@ def test_agent_summary_counts_by_badge_not_state():
     assert state["agent_summary"] == {"full": 1, "metadata": 1,
                                       "conditional": 0, "feasible": 0,
                                       "blind": 1}
+
+
+# ── 播报方式：speak 与 speak_available ───────────────────────────────────
+
+
+def test_speak_defaults_off():
+    """默认只出文字——这是插件一直的行为，不能因为加了开关就变。"""
+    assert _base()["speak"] is False
+
+
+def test_speak_available_when_key_present():
+    state = _base(api_key_set=True, speak=False)
+    assert state["speak_available"] is True
+
+
+def test_speak_unavailable_without_key():
+    """没 key 时 respond 走不了（红线 3）。控件必须置灰并说清原因，
+    而不是"能点、点了不生效"——那正是假控件的定义。"""
+    state = _base(api_key_set=False, speak=False)
+    assert state["speak_available"] is False
+
+
+def test_speak_stays_available_once_on():
+    """已经开着的不因为后来 key 被撤掉就变成不可用——
+    那会让控件显示成"你现在这个设置不合法"，而用户只是想改回去。"""
+    state = _base(api_key_set=False, speak=True)
+    assert state["speak"] is True
+    assert state["speak_available"] is True
