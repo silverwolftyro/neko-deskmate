@@ -26,9 +26,13 @@ from plugin.plugins.agent_deskmate.commands import (
     conclusion_for,
     fact_line,
     first_banned,
+    is_delete_command,
     scope_line,
+    strip_heredocs,
+    target_unparseable,
     translate,
 )
+from plugin.plugins.agent_deskmate.rules import evaluate_delete, match_delete
 
 CWD = r"D:\workspace\N.E.K.O"
 
@@ -426,3 +430,84 @@ def _render_fact(head: str, qualifiers: list[str]) -> str:
     """复现 ``fact_line`` 的拼接规则，单独验"空括号"这一条。"""
     body = " · ".join(part for part in qualifiers if part)
     return f"{head}（{body}）" if body else head
+
+
+# ── heredoc 正文是数据，不是命令（2026-11-26 真机连误报三次） ────────────
+
+
+def _heredoc_case():
+    return (
+        'cd "D:/w/agent_deskmate" && python - <<\'PYEOF\'\n'
+        "cases = [\n"
+        "    'rm -f /tmp/neko-tsx/hooks.mjs',\n"
+        "    'rm -rf ~',\n"
+        "]\n"
+        "PYEOF"
+    )
+
+
+def test_strip_heredocs_drops_body_keeps_delimiters():
+    got = strip_heredocs(_heredoc_case())
+    assert "rm -rf" not in got
+    assert "PYEOF" in got           # 开头行与结束行都在
+    assert 'cd "D:/w/agent_deskmate"' in got
+
+
+def test_strip_heredocs_idempotent():
+    once = strip_heredocs(_heredoc_case())
+    assert strip_heredocs(once) == once
+
+
+def test_strip_heredocs_noop_without_marker():
+    cmd = "rm -rf ~"
+    assert strip_heredocs(cmd) == cmd
+
+
+def test_strip_heredocs_unclosed_returns_original():
+    """没闭合就不剥——Transcript 被截断时不能让我们对真命令视而不见。"""
+    cmd = "cat <<'EOF'\nrm -rf ~\n"
+    assert strip_heredocs(cmd) == cmd
+    assert "rm -rf" in strip_heredocs(cmd)
+
+
+def test_strip_heredocs_handles_dash_and_double_quote():
+    cmd = 'cat <<-"END"\nrm -rf ~\nEND\necho done'
+    got = strip_heredocs(cmd)
+    assert "rm -rf" not in got
+    assert "echo done" in got
+
+
+def test_strip_heredocs_multiple_blocks():
+    cmd = "a <<'A'\nrm -rf ~\nA\nb <<'B'\nrm -rf /\nB\nc"
+    got = strip_heredocs(cmd)
+    assert "rm -rf" not in got
+    for keep in ("a <<'A'", "A", "b <<'B'", "B", "c"):
+        assert keep in got
+
+
+def test_heredoc_delete_text_is_not_a_delete_command():
+    """**这条是回归测试**：写测试/脚本/文档提到 rm -rf 不该爆【严重】。"""
+    assert is_delete_command(_heredoc_case()) is False
+    assert match_delete(_heredoc_case()) is None
+
+
+def test_heredoc_command_does_not_broadcast_critical():
+    """端到端：经 evaluate_delete 出来不该有 hit，更不该是 critical。"""
+    hit = evaluate_delete(_heredoc_case(), agent="claude-code",
+                          session="547ea690")
+    assert hit is None
+
+
+def test_real_delete_after_heredoc_still_caught():
+    """剥了 heredoc 不能把同一条命令里**真的**删除也一起放掉。"""
+    cmd = _heredoc_case() + "\nrm -rf ~"
+    hit = evaluate_delete(cmd, agent="a", session="b")
+    assert hit is not None
+    assert hit.severity == "critical"
+
+
+def test_target_unparseable_agrees_with_is_delete_command():
+    """两个函数看同一份文本——不许一个说"不是删除"另一个说"目标藏起来了"。"""
+    cmd = _heredoc_case()
+    assert is_delete_command(cmd) is False
+    assert target_unparseable(cmd) is False

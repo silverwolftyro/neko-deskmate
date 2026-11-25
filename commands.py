@@ -634,13 +634,87 @@ def _raw_tokens(text: str) -> list[str]:
 
 
 def _segments(command: str) -> list[list[tuple[str, str]]]:
-    """每段是 ``[(原文, 归一化), …]``。原文给展示层，归一化给判定层。"""
+    """每段是 ``[(原文, 归一化), …]``。原文给展示层，归一化给判定层。
+
+    **heredoc 正文在这里整段丢掉**（见 ``strip_heredocs``）——这是所有判定的
+    唯一共同上游（``simple_commands`` 与 ``delete_targets`` 都走这里），
+    所以放这一处就够，不会出现"词典剥了、闸门没剥"的两套判据。
+    """
     out: list[list[tuple[str, str]]] = []
-    for part in _SIMPLE_SPLIT.split(str(command or "")):
+    for part in _SIMPLE_SPLIT.split(strip_heredocs(str(command or ""))):
         pairs = [(raw, normalise_token(raw)) for raw in _raw_tokens(part)]
         if pairs:
             out.append(pairs)
     return out
+
+
+#: heredoc 开头：``<<EOF`` / ``<<-EOF`` / ``<<'EOF'`` / ``<<"EOF"``。
+#: 结束标记可以是引号包着的，也可以不包；``<<-`` 只是允许正文行首有 Tab。
+_HEREDOC_OPEN = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+
+
+def strip_heredocs(command: str) -> str:
+    """把 heredoc 的**正文行**丢掉，只留开头行与结束行。幂等。
+
+    ## 为什么需要它（2026-11-26 真机，连误报三次）
+
+    实测一条完全正常的命令：
+
+        cd "…/agent_deskmate" && python - <<'PYEOF'
+        cases = ['rm -f /tmp/a.tgz', 'rm -rf ~']
+        PYEOF
+
+    被判成【严重】删除文件，severity=critical。heredoc 里那两个 ``rm`` 是
+    **Python 的字符串字面量**，是测试用的数据，shell 一个都不会执行。
+    但经 ``_segments`` 切段后照样命中删除词。
+
+    于是这是一个**大类误报**：任何 agent 写测试、写脚本、写文档、
+    甚至在对话里引用一条危险命令，用户就收到一条红字。
+    误报反复几次，用户就被训练成无脑点确认——**闸门真的失效**，
+    而且是在最不该失效的时候。
+
+    语义上这与既有的"打印类不算命令"是同一条：
+    ``echo "rm -rf 是危险操作"`` 不该顶红字，
+    ``python - <<'EOF' … rm -rf … EOF`` 也不该。
+
+    ## 两条边界
+
+    1. **开头行保留**。``cd … && python - <<'PYEOF'`` 这一行本身有真命令
+       （``cd``、``python``），同一行里 ``<<`` 之前的删除词也照旧算——
+       那确实在命令行上，确实会执行。
+    2. **没闭合就整体不剥**。转录被截断时 heredoc 可能没有结束行；
+       这时把后半全丢掉会让我们对一个可能真含删除命令的命令视而不见。
+       宁可漏剥（回到误报）也不盲掉——**方向要对**。
+    """
+    text = str(command or "")
+    if "<<" not in text:
+        return text
+
+    lines = text.split("\n")
+    keep: list[str] = []
+    delim: str | None = None
+    strip_tabs = False
+    closed = True
+
+    for line in lines:
+        if delim is not None:
+            probe = line.lstrip("\t") if strip_tabs else line.strip()
+            if probe == delim:
+                delim = None          # 结束行本身是 shell 语法，保留
+                keep.append(line)
+            continue                 # 正文行：数据，丢掉
+        match = _HEREDOC_OPEN.search(line)
+        if match:
+            delim = match.group(3)
+            strip_tabs = bool(match.group(1))
+        keep.append(line)
+
+    if delim is not None:
+        # 走到结尾还没闭合：不剥，原样返回。
+        closed = False
+    if not closed:
+        return text
+    return "\n".join(keep)
 
 
 def simple_commands(command: str) -> list[list[str]]:
@@ -794,8 +868,14 @@ def _looks_like_path(token: str) -> bool:
 
 
 def target_unparseable(command: str) -> bool:
-    """目标集合算不算得出来。算不出来 → 调用方必须按最坏的档处理。"""
-    return bool(_UNPARSEABLE_RE.search(str(command or "")))
+    """目标集合算不算得出来。算不出来 → 调用方必须按最坏的档处理。
+
+    **同样要先剥 heredoc**：这个函数看的是原始命令串，而
+    ``_segments`` 已经剥过了。两边看不用的文本，就会出现
+    "``is_delete_command`` 说不是删除、``target_unparseable`` 却说目标藏起来了"
+    这种自相矛盾——正是"两套判据"要避免的那件事。
+    """
+    return bool(_UNPARSEABLE_RE.search(strip_heredocs(str(command or ""))))
 
 
 def is_recoverable_target(target: str) -> bool:
