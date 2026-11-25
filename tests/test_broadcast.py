@@ -18,8 +18,10 @@ from plugin.plugins.agent_deskmate.broadcast import (
     coalesce_same_workspace,
     for_log,
     priority_for,
+    read_instruction,
     redact,
     render_text,
+    speak,
 )
 from plugin.plugins.agent_deskmate.events import UnifiedEvent, attribute
 from plugin.plugins.agent_deskmate.progress import Light, Role
@@ -1013,3 +1015,87 @@ def test_real_broadcast_sequence_respects_cooldown():
     assert push.calls[1]["source"] == "s"
     assert push.calls[1]["visibility"] == ["chat"]
     assert push.calls[1]["parts"][0]["type"] == "text"
+
+
+# ── speak()：让她「念」台词（手法照抄侦查笔记结论 5） ────────────────────
+
+
+class _Rec:
+    """记录桩。返回值形状照 RecordingPush——push_text 认 submitted=True。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, **kw):
+        self.calls.append(kw)
+        return {"submitted": True}
+
+
+def test_read_instruction_has_all_three_elements():
+    """prompt 三要素缺一不可——每一条都对应一次真实跑偏。"""
+    got = read_instruction("已自动放行，风险很低。")
+    assert "念" in got                      # 动词是念，不是播报/通知
+    assert "不要改写" in got                # 禁令：防纯改写+追问
+    assert "舞台提示" in got                # 禁令：防「本喵念得标准吧？」
+    assert "『" in got and "』" in got       # 引号隔离：分清台词与指示
+
+
+def test_read_instruction_puts_lead_inside_the_quotes():
+    """语气词垫在台词**里面**——被吞的才落在垫子上而不是内容上。"""
+    got = read_instruction("abc", lead="嗯，")
+    assert "『嗯，abc』" in got
+
+
+def test_read_instruction_lead_can_be_disabled():
+    assert read_instruction("abc", lead="") == (
+        "请把下面这句原样念出来，不要改写、不要加任何说明或舞台提示：『abc』")
+
+
+def test_speak_sends_two_pushes():
+    push = _Rec()
+    spoken, precise = speak(push, "已自动放行。", source="s",
+                            logger=FakeLogger())
+    assert len(push.calls) == 2
+    # ① 念：空 visibility + respond + 指示包裹
+    assert push.calls[0]["visibility"] == []
+    assert push.calls[0]["ai_behavior"] == "respond"
+    assert "念出来" in push.calls[0]["parts"][0]["text"]
+    # ② 留底：chat + blind + 精确原文（不包引号、不加语气词）
+    assert push.calls[1]["visibility"] == ["chat"]
+    assert push.calls[1]["ai_behavior"] == "blind"
+    assert push.calls[1]["parts"][0]["text"] == "已自动放行。"
+    assert (spoken, precise) == ("sent", "sent")
+
+
+def test_speak_backstop_is_byte_exact():
+    """用户眼睛看的那条必须一字不差——垫的语气词和引号都不许进去。"""
+    push = _Rec()
+    speak(push, "它要执行：rm -rf build/", source="s", logger=FakeLogger())
+    assert push.calls[1]["parts"][0]["text"] == "它要执行：rm -rf build/"
+
+
+def test_speak_blind_mode_only_sends_backstop():
+    """没配 key 时优雅降级：红线 3 是零 key 只跑 L0。"""
+    push = _Rec()
+    spoken, precise = speak(push, "x", source="s", logger=FakeLogger(),
+                            ai_behavior="blind")
+    assert len(push.calls) == 1
+    assert push.calls[0]["ai_behavior"] == "blind"
+    assert spoken == "skipped"
+    assert precise == "sent"
+
+
+def test_speak_source_is_explicit():
+    push = _Rec()
+    speak(push, "x", source="agent_deskmate", logger=FakeLogger())
+    for call in push.calls:
+        assert call["source"] == "agent_deskmate"
+
+
+def test_speak_never_raises_on_push_failure():
+    def boom(**kw):
+        raise RuntimeError("宿主不在")
+
+    spoken, precise = speak(boom, "x", source="s", logger=FakeLogger())
+    assert spoken == "exception"
+    assert precise == "exception"

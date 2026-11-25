@@ -212,21 +212,24 @@ RESPOND_COOLDOWN = 30.0
 def push_text(push: Callable[..., dict], text: str, *, source: str, priority: int,
               logger: Any, tag: str = "", log_commands: bool = False,
               command_length: int | None = None,
-              ai_behavior: str = "blind") -> str:
+              ai_behavior: str = "blind",
+              visibility: list[str] | None = None) -> str:
     """把一段文本推去聊天窗。返回 ``sent`` / 拒绝原因，**永不抛异常**。
 
     ``tag`` 只进日志（``播报未被接受（backpressure）：[error] …``），不进正文。
 
     ``ai_behavior`` 默认 ``"blind"``（纯播报，角色不开口）——红线 1 的原口径。
-    传 ``"respond"`` 会让主模型接一轮、用角色自己的话复述；
-    **它不保证语音**，宿主有没有开角色语音是用户侧的设置，插件管不着。
-    ``visibility=["chat"]`` 照旧带着，所以原文始终上屏——
-    语音那一路漏了，人也看得见（群 bot 2026-11-26 给的兜底，与 SDK 一致）。
+    传 ``"respond"`` 会让主模型接一轮、用角色自己的话复述。
+
+    ``visibility`` 默认 ``["chat"]``（原文上屏）。**只有 ``speak`` 会传空列表**：
+    那时 chat 里只出现她的回复，用户看不到指示原文——那是"让她念台词"的
+    专门形状，配一条 ``speak`` 自己发的静默留底用。别处不许传空：
+    "原文不上屏"意味着语音那一路漏了就什么都没有了。
     """
     try:
         result = push(
             source=source,
-            visibility=["chat"],
+            visibility=list(visibility) if visibility is not None else ["chat"],
             ai_behavior=ai_behavior,
             parts=[{"type": "text", "text": text}],
             priority=priority,
@@ -718,4 +721,97 @@ def broadcast_notice(push: Callable[..., dict], notice: Notice, *, source: str,
         # 用户要的是"时不时说一下进行到哪一步"——那正是这一类，
         # 只给删除类开 speak 会得到一个半成品。
         ai_behavior=ai_behavior,
+    )
+
+
+# ── 让她「念」台词（2026-11-26，手法照抄侦查笔记结论 5） ──────────────────
+#
+# **不让她"说"，让她"念"。** 这是两件事：
+#   「说」= 她把这件事用自己的话评论一遍（会改写、会追问、会加舞台提示）
+#   「念」= 她把给定的一段字逐字读出来
+# 同一个 ``respond`` 回合，取决于 prompt 怎么下。
+#
+# prompt 里三件东西缺一不可，每一条都是前几次真实跑偏逼出来的：
+#
+# | 要素 | 写法 | 对应哪次跑偏 |
+# |---|---|---|
+# | 动词用「念」 | 「原样**念**出来」 | 说「播报/通知」她会当成"这件事我要评论一下" |
+# | 禁令清单 | 「不要改写、不要加任何说明或舞台提示」 | 01:19 那次纯改写+追问；长文本那次「（盯着屏幕上的测试文本念）…怎么样？本喵念得标准吧？」——舞台提示+尾巴 |
+# | 引号隔离 | 台词包在 ``『』`` 里 | 不包的话她把指示也一起念进去 |
+#
+# 完整实证见 `06-随手笔记/语音提示-接口侦查-2026-11-23.md` 结论 5。
+#
+# **两条推送，不是一条**：
+#   ① ``visibility=[] + respond`` 指示+台词 —— chat 里只出现她的回复
+#   ② ``visibility=["chat"] + blind`` 精确原文 —— 用户眼睛看这条
+# ② 不是冗余：语音那一路有开头吞字（宿主前端老问题）、且不保证 100% 逐字，
+# 句子越长越容易跑偏。**精确播报永远靠文字留底，语音只能算附赠。**
+#
+# ⚠️ 仍未验证的部分：这套手法在 2026-11-23 的手工副本上实测通过（一字不差），
+# 但**本插件内没有跑通过**——因为插件唯一能自主触发的播报路是规则命中，
+# 那条路的文本永远是「事件报告：<命令>」形状，指示会被包在里面、
+# 处在 shell 命令的语法位置上，她合理地当成命令文本而非对她的指示。
+# 要真用起来，先得有一个能推任意文本的触发路径（调试入口或 direct_reply）。
+
+#: 台词的引号。用日式引号而不是 ASCII 双引号：台词里常含代码/路径，
+#: 混用同一种引号会让"哪里是台词"重新变模糊。
+_SCRIPT_QUOTE = ("『", "』")
+
+#: 开头垫的语气词。宿主前端 ``interruptCurrentAssistantSpeech`` 的老问题：
+#: 音频前几个字会没声。台词开头放个垫子，让被吞的那个字落在垫子上而不是
+#: 落在内容上——**这是糊补不是修**，注释里写清楚，将来看见别当成设计。
+_LEAD_FILLER = "嗯，"
+
+#: 念台词的指示模板。``{script}`` 是包好引号的台词。
+_READ_INSTRUCTION = (
+    "请把下面这句原样念出来，不要改写、不要加任何说明或舞台提示：{script}"
+)
+
+
+def read_instruction(text: str, *, lead: str = _LEAD_FILLER) -> str:
+    """把一段台词包成"给她下的指令"。
+
+    单独一个函数是为了能单测：prompt 三要素（念 / 禁令 / 引号隔离）
+    哪一条丢了，测试就该红——而丢了的症状是"她偶尔跑偏"，不红。
+    """
+    body = (lead + text) if lead else text
+    return _READ_INSTRUCTION.format(
+        script=_SCRIPT_QUOTE[0] + body + _SCRIPT_QUOTE[1])
+
+
+def speak(push: Callable[..., dict], text: str, *, source: str, logger: Any,
+          priority: int = 5, tag: str = "speak",
+          lead: str = _LEAD_FILLER,
+          ai_behavior: str = "respond") -> tuple[str, str]:
+    """让她把 ``text`` 念出来，并发一条静默消息把精确文字留底。
+
+    返回 ``(念那条的结果, 留底那条的结果)``，都是 ``sent`` / 拒绝原因，
+    **永不抛异常**（与 ``push_text`` 同一条规矩）。
+
+    ``ai_behavior`` 默认 ``"respond"``。传 ``"blind"`` 就只发留底那条
+    （念那条跳过）——用来在没配 key 时优雅降级：红线 3 是零 key 只跑 L0，
+    而 ``respond`` 要主模型接一轮。
+    """
+    if ai_behavior != "respond":
+        # 没配 key（或调用方明确不要）：只发留底，不起了。
+        # 红线 3——零 key 只跑 L0，而 respond 要主模型接一轮。
+        return "skipped", push_text(
+            push, text, source=source, priority=priority, logger=logger,
+            tag=tag, ai_behavior="blind",
+        )
+
+    # ① 先发"念"。顺序照侦查笔记结论 5 实证过的形状，不无故调换。
+    spoken = push_text(
+        push, read_instruction(text, lead=lead), source=source,
+        priority=priority, logger=logger, tag=tag + ":read",
+        ai_behavior="respond",
+        # **空 visibility**：chat 里只出现她的回复。
+        # 这不是"少上个屏"，是这套手法的必要形状——她收到的整条消息
+        # 必须只有「指示+台词」，混进任何事件报告她就会把它当命令文本。
+        visibility=[],
+    )
+    # ② 再发留底。精确文字永远靠这条，语音只能算附赠。
+    return spoken, push_text(
+        push, text, source=source, priority=priority, logger=logger,
+        tag=tag, ai_behavior="blind",
     )
