@@ -569,6 +569,17 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                 + "有没有开角色语音。插件只能让她开口，不能让她出声。",
             })}
           </Text>
+          {/* 30 秒限制必须写在明面上。2026-11-26 真机：用户连着点三次，
+              后两次被静默挡下，聊天框里只剩文字没有声音，看着像"该说的没说"。
+              用户的裁决是限制保留、但不许静默——所以它是常驻文案，不是注释。 */}
+          <Alert
+            tone="info"
+            message={t("panel.settings.speak_cooldown", {
+              defaultValue:
+                "有 30 秒的时间限制：30 秒内不会重复让她说，只把文字留在聊天窗。"
+                + "这是为了绕开宿主前端一个连发声响会弄坏音频的问题。",
+            })}
+          />
         </Stack>
       </Card>
 
@@ -586,7 +597,8 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
             <Text>
               {t("panel.settings.speak_test_help", {
                 defaultValue:
-                  "验证语音链用的。她会把这句话原样念出来，同时精确文字也留一份在聊天窗。",
+                  "验证语音链用的。她会把这句话原样念出来，同时精确文字也留一份在聊天窗。"
+                  + "有 30 秒的时间限制，30 秒内不会重复让她说。",
               })}
             </Text>
             <Field

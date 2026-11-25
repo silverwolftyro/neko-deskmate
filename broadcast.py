@@ -427,6 +427,15 @@ class Broadcaster:
         self.coalesced = 0
 
     @property
+    def last_respond_at(self) -> float:
+        """上一条 respond 的时间戳。0 = 从来没让她说过话。
+
+        单独暴露是给 ``speak_test`` 记日志用——它绕过冷却，但风险不消失，
+        真出了事得能查到"刚才那次是手动点的"。
+        """
+        return self._last_respond_at
+
+    @property
     def ai_behavior(self) -> str:
         """当前配置想要的播报行为。**不带冷却判断**——给面板/日志读现状用。
 

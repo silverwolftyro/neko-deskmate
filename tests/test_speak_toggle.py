@@ -170,14 +170,20 @@ def test_no_key_refused():
     assert host.pushed == []
 
 
-def test_cooldown_blocks_and_says_so():
-    """被冷却挡了要明说——不假装发了。"""
-    host = SpeakTestHost()
-    # 先消耗掉一次 respond（构造时 last_respond_at=0，第一次一定放行）
-    host._broadcaster.resolve_ai_behavior(now=1000.0)
+
+
+def test_manual_entry_respects_the_cooldown_and_says_so():
+    """**2026-11-26 真机踩过**：连着点三次，后两次被冷却挡了，聊天框里
+    只剩留底文字，看起来像"该说的没说"。
+
+    用户 2026-11-26 的裁决：限制保留，但**必须写在 UI 上**，不能静默挡人。
+    所以这里钉两件事——照算冷却，且返回的 message 明说原因。
+    """
     import plugin.plugins.agent_deskmate.broadcast as bc
+    host = SpeakTestHost()
+    host._broadcaster.resolve_ai_behavior(now=1000.0)   # 消耗一次 respond
     real_time = bc.time.time
-    bc.time.time = lambda: 1001.0
+    bc.time.time = lambda: 1001.0                        # 只过了 1 秒
     try:
         res = _run(host.speak_test(text="第二句"))
     finally:
@@ -185,7 +191,22 @@ def test_cooldown_blocks_and_says_so():
     assert res.is_ok() is True
     payload = res.unwrap()
     assert payload["spoken"] == "skipped"
-    assert "冷却" in payload["message"]
+    assert "30 秒" in payload["message"]
     # 留底照发——用户眼睛看的那条不该被语音的冷却拖累
     assert len(host.pushed) == 1
     assert host.pushed[0]["ai_behavior"] == "blind"
+
+
+def test_after_the_window_it_speaks_again():
+    import plugin.plugins.agent_deskmate.broadcast as bc
+    host = SpeakTestHost()
+    host._broadcaster.resolve_ai_behavior(now=1000.0)
+    real_time = bc.time.time
+    bc.time.time = lambda: 1000.0 + bc.RESPOND_COOLDOWN + 1
+    try:
+        res = _run(host.speak_test(text="第三句"))
+    finally:
+        bc.time.time = real_time
+    assert res.is_ok() is True
+    assert len(host.pushed) == 2
+    assert host.pushed[0]["ai_behavior"] == "respond"

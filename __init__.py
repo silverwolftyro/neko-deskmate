@@ -95,7 +95,6 @@ from .approval import (
 from .auto_review import AutoReviewer
 from .broadcast import (
     NOTICE_MERGE_SECONDS,
-    RESPOND_COOLDOWN,
     Broadcaster,
     NoticeMerger,
     broadcast_notice,
@@ -2081,6 +2080,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
         # 只解析一次，念和留底都用这个结果：拆成两次调用会让第二次
         # 看到的是第一次刚刷新的时间戳，凭空多出一段冷却。
+        # **手动入口也照算**——用户 2026-11-26 明确要求保留这 30 秒限制，
+        # 前提是它必须写在 UI 上（见面板那段文案），不能静默挡人。
         behavior = "respond"
         if self._broadcaster is not None:
             behavior = self._broadcaster.resolve_ai_behavior()
@@ -2094,9 +2095,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 "spoken": spoken,
                 "precise": precise,
                 "message": ("精确文字已留底，但这一轮没让她念——"
-                            "上一条 respond 还没过 {} 秒冷却"
-                            "（宿主前端连发会弄坏音频）。再等一会儿。".format(
-                                int(RESPOND_COOLDOWN))),
+                            "30 秒内不重复发，上一条还没过冷却。"
+                            "再等一会儿。"),
             })
         return Ok({
             "spoken": spoken,
