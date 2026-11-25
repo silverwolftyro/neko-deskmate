@@ -56,6 +56,11 @@ from .adapters.claude_code import (
 )
 from .adapters.discovery import discover_agents
 from .adapters.gateway import GatewayReadError, current_watermark, read_new_gateway_events
+from .adapters.sessions import (
+    gateway_app_types,
+    glance_gateway_sessions,
+    glance_transcript_sessions,
+)
 from .approval import (
     ADVICE_STATE_FALLBACK,
     ADVICE_STATE_READY,
@@ -1829,15 +1834,60 @@ class AgentDeskmatePlugin(NekoPluginBase):
             )
             hook_health = health.as_dict()
 
-        # 本机 Agent 发现。**只判存在、不读内容**（discovery 模块的铁律），
-        # 所以它不可能因为某个 Agent 的目录古怪就把面板拖垮；
-        # 但保险起见仍然单独兜住——面板打不开比少一张卡严重得多。
+        # 本机 Agent 发现 + 会话清单。**两者都只读元数据**：
+        # discovery 只判目录存在，sessions 只 stat 文件 / 聚合查询 sqlite。
+        # 所以它们不可能因为某个 Agent 的目录古怪就把面板拖垮；
+        # 但保险起见仍然各自单独兜住——面板打不开比少一张卡严重得多。
         agents: list[dict[str, object]] = []
+        agent_sessions: dict[str, list[dict[str, object]]] = {}
         try:
-            agents = [probe.as_dict() for probe in discover_agents()]
+            home = Path(os.path.expanduser("~"))
+            watch_cfg = _watch_section(config)
+            # 网关库路径与观测循环**读同一份配置**，不另猜默认值——
+            # 两边路径不一致时，面板会盘出一个观测循环根本没在读的库。
+            gateway_db = _expand(watch_cfg.get("cc_switch_db"))
+            projects_dir = _expand(watch_cfg.get("claude_projects_dir")) or (
+                home / ".claude" / "projects")
+
+            # 网关索引：给了它，网关侧 Agent 的状态才由事实决定
+            # （dsh/opencode/copilot 都在网关里有账，不给就一律降成 conditional）。
+            gateway_index: dict[str, int] = {}
+            if gateway_db is not None:
+                try:
+                    gateway_index = gateway_app_types(gateway_db)
+                except Exception as exc:
+                    self.logger.warning(
+                        "面板读网关 app_type 失败：{}", type(exc).__name__)
+                    gateway_index = {}
+
+            probes = discover_agents(home, gateway=gateway_index)
+            agents = [probe.as_dict() for probe in probes if probe.reported]
+
+            # 按 agent 盘会话。网关是共表，**必须按 app_type 过滤**，
+            # 否则给 Codex 盘出来排第一的是 Claude Code 的会话
+            # （实测本机：Claude 706 次 vs Codex 3 次）。
+            for probe in probes:
+                if not probe.reported:
+                    continue
+                try:
+                    if probe.id == "claude":
+                        rows = glance_transcript_sessions(
+                            projects_dir, agent="claude")
+                    elif probe.gateway_app_type and gateway_db is not None:
+                        rows = glance_gateway_sessions(
+                            gateway_db, agent=probe.id,
+                            app_type=probe.gateway_app_type)
+                    else:
+                        rows = []
+                except Exception as exc:
+                    self.logger.warning(
+                        "面板盘 {} 的会话失败：{}", probe.id, type(exc).__name__)
+                    rows = []
+                agent_sessions[probe.id] = [r.as_dict() for r in rows]
         except Exception as exc:  # 面板不该因为发现失败就整个打不开
             self.logger.warning("面板取本机 Agent 清单失败：{}", type(exc).__name__)
             agents = []
+            agent_sessions = {}
 
         return build_panel_state(
             running=self._approval is not None and self._approval.running(),
@@ -1853,6 +1903,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
             approvals=approvals,
             now=time.time(),
             agents=agents,
+            agent_sessions=agent_sessions,
         )
 
     @ui.action(id="settings_set_roots",

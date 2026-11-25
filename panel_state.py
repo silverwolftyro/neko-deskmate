@@ -38,6 +38,7 @@ def build_panel_state(
     approvals: list[dict[str, Any]],
     now: float,
     agents: list[dict[str, Any]] | None = None,
+    agent_sessions: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """把插件的内部状态压成面板要的那一份。
 
@@ -47,6 +48,10 @@ def build_panel_state(
     ``agents`` 是 ``discovery.discover_agents()`` 的结果（``as_dict`` 后的），
     缺省 ``None`` 表示调用方没做发现——面板据此不渲染那张卡，
     而不是渲染一个空的"没检测到 Agent"吓唬人。
+    ``agent_sessions`` 是 ``agent id → 会话行``，由
+    ``adapters/sessions.py`` 盘出来。与上面的 ``sessions`` **不是一回事**：
+    那个来自事件流水线（插件启动后的新事件），这个来自磁盘/数据库
+    （本机实际有哪些会话）。两条路的事实互相独立，不许互相冒充。
     """
     attention: list[dict[str, Any]] = []
 
@@ -134,25 +139,46 @@ def build_panel_state(
 
     # ── 本机 Agent 清单 ─────────────────────────────────────────────────────
     # 只收 ``reported`` 的（absent = 本机没装，说出来是噪音）。
-    # 顺序按状态排：正在观测的靠前，blind 靠后——用户第一眼该看到
+    # 顺序按 badge 排：看得见内容的靠前，blind 靠后——用户第一眼该看到
     # "插件在干活"，而不是一列"不支持"。
-    _STATE_ORDER = {
-        "observable": 0, "conditional": 1, "feasible": 2, "blind": 3,
+    #
+    # **只转该转的字段**：badge / label / detail / state，加上会话。
+    # 早先也转过 home 与 data 的绝对路径，面板一个都没渲染——
+    # 白算白传，还把 `C:\Users\...` 透给一个不需要它的前端。
+    #
+    # **计数按 badge 不按 state**：observable 内部还要分 full / metadata，
+    # 合成一个"正在观测 N"会把"只看得到请求记录"的那个也算进去，
+    # 汇总行于是比徽标说得还漂亮。
+    _BADGE_ORDER = {
+        "full": 0, "metadata": 1, "conditional": 2, "feasible": 3, "blind": 4,
     }
+    # 每个 Agent 在面板上最多列几个会话。再多就该有专门一页了，
+    # 而不是把状态卡变成第二份文件管理器。
+    AGENT_SESSION_LIMIT = 3
+
     agent_rows: list[dict[str, Any]] = []
     for row in agents or []:
         if not row.get("reported", True):
             continue
+        state = str(row.get("state") or "")
+        badge = str(row.get("badge") or state)
+        agent_id = str(row.get("id") or "")
+        # 会话由调用方单独盘（``adapters/sessions.py``），按 agent id 发。
+        # 盘不到就空列表——**不许用事件流水线的会话数冒充**，
+        # 那两条路的事实是互相独立的，混在一起就再也对照不出来了。
+        # 计数用**全量**，展示只展示前几条：数字要真，列表要短。
+        full = list((agent_sessions or {}).get(agent_id) or [])
+        own = full[:AGENT_SESSION_LIMIT]
         agent_rows.append({
-            "id": str(row.get("id") or ""),
-            "label": str(row.get("label") or row.get("id") or ""),
-            "state": str(row.get("state") or ""),
+            "badge": badge,
+            "label": str(row.get("label") or agent_id),
             "detail": str(row.get("detail") or ""),
-            # 家目录只给"在哪"，不给内容——用户需要知道数据在哪个盘，
-            # 而发现层本来也只判存在、不读内容。
-            "home": str(row.get("home") or ""),
+            "state": state,
+            "session_total": len(full),
+            "session_live": sum(1 for s in full if s.get("live")),
+            "sessions": own,
         })
-    agent_rows.sort(key=lambda r: (_STATE_ORDER.get(r["state"], 9), r["label"]))
+    agent_rows.sort(key=lambda r: (_BADGE_ORDER.get(r["badge"], 9), r["label"]))
 
     return {
         "running": running,
@@ -189,13 +215,13 @@ _APPROVAL_LABEL = {
 
 
 def _count_states(rows: list[dict[str, Any]]) -> dict[str, int]:
-    """按发现状态计数。只数四种要报告的状态，``absent`` 不算。"""
-    counts = {state: 0 for state in
-              ("observable", "conditional", "feasible", "blind")}
+    """按徽标 key 计数。只数五种要报告的，``absent`` 不算。"""
+    counts = {key: 0 for key in
+              ("full", "metadata", "conditional", "feasible", "blind")}
     for row in rows:
-        state = row.get("state")
-        if state in counts:
-            counts[state] += 1
+        badge = row.get("badge")
+        if badge in counts:
+            counts[badge] += 1
     return counts
 
 

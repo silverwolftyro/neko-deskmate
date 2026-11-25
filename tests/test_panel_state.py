@@ -261,3 +261,85 @@ def test_garbage_broadcast_timestamp_is_ignored() -> None:
          "last_event_at": NOW, "last_broadcast_at": "not-a-number"},
     ])
     assert state["last_broadcast_at"] == 0.0
+
+
+# ── Agent 卡：会话来自磁盘，不来自事件流水线 ──────────────────────────────
+
+
+def _agent_row(**kw):
+    row = {"id": "claude", "label": "Claude Code", "state": "observable",
+           "badge": "full", "detail": "d", "reported": True}
+    row.update(kw)
+    return row
+
+
+def _sess(sid, live=False):
+    return {"session": sid, "last_seen": NOW, "size_bytes": 100,
+            "where": "proj", "live": live}
+
+
+def test_agents_carry_their_own_sessions():
+    state = _base(
+        agents=[_agent_row()],
+        agent_sessions={"claude": [_sess("a", live=True), _sess("b")]},
+    )
+    row = state["agents"][0]
+    assert row["session_total"] == 2
+    assert row["session_live"] == 1
+    assert [s["session"] for s in row["sessions"]] == ["a", "b"]
+
+
+def test_session_list_truncated_but_count_is_full():
+    """数字要真，列表要短——3 条以后该有专门一页，不是把状态卡变成文件管理器。"""
+    state = _base(
+        agents=[_agent_row()],
+        agent_sessions={"claude": [_sess("s%d" % i) for i in range(9)]},
+    )
+    row = state["agents"][0]
+    assert row["session_total"] == 9
+    assert len(row["sessions"]) == 3
+
+
+def test_agent_without_sessions_reports_zero():
+    state = _base(agents=[_agent_row()], agent_sessions={})
+    assert state["agents"][0]["session_total"] == 0
+    assert state["agents"][0]["sessions"] == []
+
+
+def test_pipeline_sessions_never_fill_agent_sessions():
+    """**这条是 2026-11-25 真机那个"没在跑？"的回归测试。**
+
+    事件流水线的 ``sessions`` 与磁盘盘的 ``agent_sessions`` 是两条独立的事实。
+    老实现只有前者，于是"插件启动后没来新事件"被显示成"还没看到任何会话"，
+    用户明明开着 agent 却被告诉没有。两边不许互相冒充。
+    """
+    state = _base(
+        agents=[_agent_row()],
+        sessions=[{"agent": "claude", "session": "x" * 8,
+                   "last_event_at": NOW, "last_broadcast_at": 0.0}],
+        agent_sessions={"claude": []},
+    )
+    # 流水线有 1 条，磁盘盘出 0 条——Agent 卡必须照实说 0
+    assert state["session_count"] == 1
+    assert state["agents"][0]["session_total"] == 0
+
+
+def test_absent_agents_are_dropped_from_panel():
+    state = _base(agents=[
+        _agent_row(),
+        _agent_row(id="workbuddy", label="WorkBuddy", state="absent",
+                   badge="absent", reported=False),
+    ])
+    assert [a["label"] for a in state["agents"]] == ["Claude Code"]
+
+
+def test_agent_summary_counts_by_badge_not_state():
+    """observable 内部还分 full / metadata，合成一个数就比徽标说得漂亮。"""
+    state = _base(agents=[
+        _agent_row(id="a", badge="full", state="observable"),
+        _agent_row(id="b", badge="metadata", state="observable"),
+        _agent_row(id="c", badge="blind", state="blind"),
+    ])
+    assert state["agent_summary"] == {"full": 1, "metadata": 1,
+                                      "conditional": 0, "feasible": 0,
+                                      "blind": 1}

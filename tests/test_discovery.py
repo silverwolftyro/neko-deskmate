@@ -4,10 +4,12 @@
 这个模块的输入是家目录，拿真家目录测会让结果随机器变化，
 测试就失去了"同样输入同样输出"这个性质。
 
-重点盯两件事：
+重点盯三件事：
 1. **五态各命中一次**，尤其是 ``conditional`` 与 ``blind`` 的区分
    （一个知道该读什么但读不到，一个压根不知道读什么）。
-2. **登记表自身的不变式**——重复 id / 空标记 / ``wired`` 却没登记数据路径，
+2. **观测深度必须把 ``observable`` 再切一刀**——Claude 有转录能出审批卡，
+   Codex 只有网关请求元数据，两者不能共用同一个"正在观测"徽标。
+3. **登记表自身的不变式**——重复 id / 空标记 / ``wired`` 却没登记数据路径，
    这三样错了面板会显示不存在的行为，而代码看起来完全正常。
 """
 
@@ -105,6 +107,77 @@ def test_blind_differs_from_conditional(tmp_path: Path) -> None:
     assert {blind.state, conditional.state} == {BLIND, CONDITIONAL}
 
 
+# ── 观测深度：observable 内部还要分一刀 ──────────────────────────────────
+
+
+def test_observable_with_full_depth_badges_full(tmp_path: Path) -> None:
+    _mk(tmp_path, ".claude/projects/keep")
+    probe = classify(tmp_path, _Agent(
+        id="claude", label="Claude Code", markers=(".claude",),
+        data_markers=(".claude/projects",), wired=True, depth="full"))
+    assert probe.state == OBSERVABLE
+    assert probe.badge == "full"
+
+
+def test_metadata_only_agent_does_not_share_the_full_badge(tmp_path: Path) -> None:
+    """**本轮真机截图逼出来的那条**：Codex 与 Claude 都标"正在观测"，
+    但前者只有网关请求元数据——没有转录、没有思考、出不了审批卡。
+    徽标必须分开，否则就是让面板宣称得比实现给的多。
+    """
+    _mk(tmp_path, ".codex/keep")
+    _mk(tmp_path, ".cc-switch/cc-switch.db")
+    probe = classify(tmp_path, _Agent(
+        id="codex", label="Codex", markers=(".codex",),
+        data_markers=(".cc-switch/cc-switch.db",), wired=True,
+        depth="metadata"))
+    assert probe.state == OBSERVABLE
+    assert probe.badge == "metadata"
+    assert probe.badge != "full"
+
+
+def test_depth_dropped_when_not_observable(tmp_path: Path) -> None:
+    """feasible 是"还没接"，谈不到看得多深——塞个 full 进去就是谎报。"""
+    _mk(tmp_path, ".minimax/v2/sqlite/runtime-state.sqlite")
+    probe = classify(tmp_path, _Agent(
+        id="mcode", label="mcode", markers=(".minimax",),
+        data_markers=(".minimax/v2/sqlite/runtime-state.sqlite",),
+        wired=False, depth="full"))
+    assert probe.state == FEASIBLE
+    assert probe.depth == ""
+    assert probe.badge == FEASIBLE
+
+
+def test_observable_without_declared_depth_falls_back_to_state(tmp_path: Path) -> None:
+    """登记表漏写 depth 时徽标退回 state，不崩也不显示空白。"""
+    _mk(tmp_path, ".claude/projects/keep")
+    probe = classify(tmp_path, _Agent(
+        id="claude", label="Claude Code", markers=(".claude",),
+        data_markers=(".claude/projects",), wired=True))
+    assert probe.badge == OBSERVABLE
+
+
+def test_as_dict_exposes_badge_and_depth() -> None:
+    row = AgentProbe(id="x", label="X", state=OBSERVABLE,
+                     depth="metadata").as_dict()
+    assert row["badge"] == "metadata"
+    assert row["depth"] == "metadata"
+    assert row["reported"] is True
+
+
+def test_as_dict_absent_is_not_reported() -> None:
+    row = AgentProbe(id="x", label="X", state=ABSENT).as_dict()
+    assert row["reported"] is False
+    assert row["badge"] == ABSENT
+
+
+def test_registry_observable_entries_declare_depth() -> None:
+    """observable 却不写 depth = 徽标分不开深浅，这条不变式就是为那个截图的。"""
+    from plugin.plugins.agent_deskmate.adapters.discovery import _AGENTS
+    for agent in _AGENTS:
+        if agent.wired:
+            assert agent.depth, f"{agent.id} 标了 wired 但没声明观测深度"
+
+
 # ── 标记优先级与异常 ─────────────────────────────────────────────────────
 
 
@@ -179,9 +252,17 @@ def test_summarize_counts_only_reported(tmp_path: Path) -> None:
     _mk(tmp_path, ".claude/projects/keep")
     _mk(tmp_path, ".dsh/keep")
     _mk(tmp_path, ".minimax/v2/sqlite/runtime-state.sqlite")
+
+    # 不给网关索引：dsh 是 conditional（知道该读什么，但没证据说读得到）
     counts = summarize(discover_agents(tmp_path))
     assert counts[OBSERVABLE] == 1
-    assert counts[BLIND] == 1
+    assert counts[CONDITIONAL] == 1
+    assert counts[FEASIBLE] == 1
+
+    # 给了索引且里面有 dsh：dsh 升成 observable，conditional 归零
+    counts = summarize(discover_agents(tmp_path, gateway={"dsh": 7221}))
+    assert counts[OBSERVABLE] == 2
+    assert counts[CONDITIONAL] == 0
     assert counts[FEASIBLE] == 1
     # absent 不进汇总——它是"本机没装"，不是一种要用户处理的状态。
     assert ABSENT not in counts
@@ -212,12 +293,91 @@ def test_registry_markers_do_not_collide() -> None:
             seen[marker] = agent.id
 
 
-def test_registry_wired_entries_declare_data() -> None:
+def test_registry_wired_entries_declare_a_source() -> None:
     """``wired=True`` 却不知道该读什么 = 面板会显示"正在观测"一个空源。"""
     from plugin.plugins.agent_deskmate.adapters.discovery import _AGENTS
     for agent in _AGENTS:
         if agent.wired:
-            assert agent.data_markers, f"{agent.id} 标了 wired 但没登记数据路径"
+            assert agent.data_markers or agent.gateway_app_type, (
+                f"{agent.id} 标了 wired 但既没登记本地路径也没登记 app_type")
+
+
+def test_registry_has_no_duplicate_gateway_app_type() -> None:
+    """两个 Agent 认同一个 ``app_type``，网关会话就会列到两个人名下。"""
+    from plugin.plugins.agent_deskmate.adapters.discovery import _AGENTS
+    seen: dict[str, str] = {}
+    for agent in _AGENTS:
+        if not agent.gateway_app_type:
+            continue
+        assert agent.gateway_app_type not in seen, (
+            f"app_type {agent.gateway_app_type} 同时被 "
+            f"{seen[agent.gateway_app_type]} 和 {agent.id} 认领")
+        seen[agent.gateway_app_type] = agent.id
+
+
+def test_registry_dsh_is_not_blind() -> None:
+    """**2026-11-25 真机更正的回归测试**。
+
+    早先把 dsh 登记成 blind，理由是"暂无已知的本地可读数据源"。
+    实测网关里有 7,221 条 dsh 请求——而网关适配器本来就不按 agent 过滤，
+    所以插件一直看得见它，只是发现层不知道。
+    dsh 是问卷里被提名最多的 Agent，这一条错不得。
+    """
+    from plugin.plugins.agent_deskmate.adapters.discovery import _AGENTS
+    by_id = {a.id: a for a in _AGENTS}
+    assert by_id["dsh"].gateway_app_type == "dsh"
+    assert by_id["dsh"].wired is True
+
+
+# ── 网关侧判定：状态必须由网关内容决定，不是 db 文件在不在 ────────────────
+
+
+def test_gateway_agent_observable_when_app_type_present(tmp_path: Path) -> None:
+    _mk(tmp_path, ".dsh/keep")
+    probe = classify(tmp_path, _Agent(
+        id="dsh", label="DeepSeek Harness", markers=(".dsh",),
+        gateway_app_type="dsh", wired=True, depth="metadata"),
+        gateway={"dsh": 7221})
+    assert probe.state == OBSERVABLE
+    assert probe.badge == "metadata"
+
+
+def test_gateway_agent_conditional_when_app_type_absent(tmp_path: Path) -> None:
+    """网关在、但这个 Agent 从来没走过它 → conditional，不是 observable。"""
+    _mk(tmp_path, ".dsh/keep")
+    probe = classify(tmp_path, _Agent(
+        id="dsh", label="DeepSeek Harness", markers=(".dsh",),
+        gateway_app_type="dsh", wired=True, depth="metadata"),
+        gateway={"mcode": 37816, "claude": 13268})
+    assert probe.state == CONDITIONAL
+
+
+def test_gateway_index_not_supplied_does_not_guess(tmp_path: Path) -> None:
+    """没给网关索引时不猜看得见——降级到 conditional，不冒充 observable。"""
+    _mk(tmp_path, ".dsh/keep")
+    probe = classify(tmp_path, _Agent(
+        id="dsh", label="DeepSeek Harness", markers=(".dsh",),
+        gateway_app_type="dsh", wired=True, depth="metadata"))
+    assert probe.state == CONDITIONAL
+
+
+def test_local_path_wins_over_gateway(tmp_path: Path) -> None:
+    """两者都有时走本地：本地库有思考和工具调用，强一个量级。"""
+    _mk(tmp_path, ".minimax/v2/sqlite/runtime-state.sqlite")
+    probe = classify(tmp_path, _Agent(
+        id="mcode", label="mcode", markers=(".minimax",),
+        data_markers=(".minimax/v2/sqlite/runtime-state.sqlite",),
+        gateway_app_type="mcode", wired=False),
+        gateway={"mcode": 37816})
+    assert probe.state == FEASIBLE
+    assert probe.data is not None
+
+
+def test_as_dict_exposes_gateway_app_type() -> None:
+    row = AgentProbe(id="dsh", label="dsh", state=OBSERVABLE,
+                     depth="metadata",
+                     gateway_app_type="dsh").as_dict()
+    assert row["gateway_app_type"] == "dsh"
 
 
 def test_registry_entries_have_labels_and_detail() -> None:

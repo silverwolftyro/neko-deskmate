@@ -57,25 +57,44 @@ type SessionRow = {
 
 /** 发现层的一个 Agent。字段与 ``adapters/discovery.py`` 的 ``as_dict`` 对齐。 */
 type AgentRow = {
-  id?: string
+  badge?: string
   label?: string
-  state?: string
   detail?: string
-  home?: string
-  reported?: boolean
+  state?: string
+  session_total?: number
+  session_live?: number
+  sessions?: SessionGlance[]
 }
 
-/** 发现状态 → 徽标色调。文案走 i18n（``panel.agents.state.<state>``），
- *  这里只留"这个状态是暖是冷"——颜色不该被翻译，标签必须被翻译。 */
+/** 一个会话的一瞥。字段与 ``adapters/sessions.py`` 的 ``as_dict`` 对齐。 */
+type SessionGlance = {
+  session?: string
+  last_seen?: number
+  size_bytes?: number
+  where?: string
+  live?: boolean
+}
+
+/** 徽标 key → 色调。key 来自 Python 的 ``AgentProbe.badge``：
+ *  observable 时按观测深度细分（full / metadata），其余直接用 state。 */
 const AGENT_TONE: Record<string, Tone> = {
-  observable: "success",
+  full: "success",
+  metadata: "info",
   conditional: "warning",
   feasible: "info",
   blind: "default",
 }
 
-function agentTone(state?: string): Tone {
-  return AGENT_TONE[state || ""] || "default"
+function agentTone(badge?: string): Tone {
+  return AGENT_TONE[badge || ""] || "default"
+}
+
+function sizeText(bytes?: number): string {
+  const n = bytes || 0
+  if (n <= 0) return ""
+  if (n < 1024) return n + " B"
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " KB"
+  return (n / 1048576).toFixed(1) + " MB"
 }
 
 type DeskmateState = {
@@ -141,6 +160,10 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
   const roots = state.roots || []
   const agents = state.agents || []
   const summary = state.agent_summary || {}
+  // 磁盘上真实存在的会话数（绕开事件流水线单独盘的）。
+  // 与上面的 ``sessions``（流水线读到的）是两回事，空状态文案要靠它区分。
+  const diskSessions = agents.reduce(
+    (sum: number, a: AgentRow) => sum + (a.session_total || 0), 0)
   const autoReview = state.auto_review || {}
 
   const toast = useToast()
@@ -302,9 +325,10 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
             <Text>
               {t("panel.agents.summary", {
                 defaultValue:
-                  "共 {total} 个：正在观测 {obs}，有条件 {cond}，数据在本机 {fea}，暂无数据源 {blind}",
+                  "共 {total} 个：完整观测 {full}，仅请求记录 {meta}，有条件 {cond}，数据在本机 {fea}，暂无数据源 {blind}",
                 total: String(agents.length),
-                obs: String(summary.observable || 0),
+                full: String(summary.full || 0),
+                meta: String(summary.metadata || 0),
                 cond: String(summary.conditional || 0),
                 fea: String(summary.feasible || 0),
                 blind: String(summary.blind || 0),
@@ -314,14 +338,41 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
               <Stack key={i} gap="sm">
                 <Inline gap="sm">
                   <StatusBadge
-                    tone={agentTone(a.state)}
-                    label={t("panel.agents.state." + (a.state || "unknown"), {
+                    tone={agentTone(a.badge)}
+                    label={t("panel.agents.badge." + (a.badge || "unknown"), {
                       defaultValue: "状态未知",
                     })}
                   />
-                  <Text>{a.label || a.id || "agent"}</Text>
+                  <Text>{a.label || "agent"}</Text>
                 </Inline>
                 {a.detail ? <Text>{a.detail}</Text> : null}
+                {a.session_total ? (
+                  <Text>
+                    {t("panel.agents.session_count", {
+                      defaultValue: "{live} / {total} 个会话最近有活动",
+                      live: String(a.session_live || 0),
+                      total: String(a.session_total || 0),
+                    })}
+                  </Text>
+                ) : null}
+                {(a.sessions || []).map((s: SessionGlance, j: number) => (
+                  <Inline key={j} gap="sm">
+                    <StatusBadge
+                      tone={s.live ? "success" : "default"}
+                      label={s.live
+                        ? t("panel.agents.session.live", {
+                            defaultValue: "有活动",
+                          })
+                        : t("panel.agents.session.idle", {
+                            defaultValue: "静默",
+                          })}
+                    />
+                    <Text>{s.session ? s.session.slice(0, 8) : "—"}</Text>
+                    <Text>{whenText(s.last_seen)}</Text>
+                    <Text>{sizeText(s.size_bytes)}</Text>
+                    <Text>{s.where || ""}</Text>
+                  </Inline>
+                ))}
               </Stack>
             ))}
           </Stack>
@@ -333,14 +384,32 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
         })}
       </Text>
       {sessions.length === 0 ? (
-        <EmptyState
-          title={t("panel.status.no_session", {
-            defaultValue: "还没看到任何会话",
-          })}
-          description={t("panel.status.no_session_hint", {
-            defaultValue: "去跑一个 agent，它就会出现在这里。",
-          })}
-        />
+        /* 「还没看到任何会话」这句话原来的意思是"插件启动后没来新事件"，
+           而用户读成的是"本机没有会话"——2026-11-25 真机：用户开着
+           Claude Code 在跑，面板写这一句，直接被问"没在跑？"。
+           所以这里必须分两种情况说，而且**磁盘上有会话时不许用前一种文案**。 */
+        diskSessions > 0 ? (
+          <EmptyState
+            title={t("panel.status.no_event_session", {
+              defaultValue: "磁盘上有 {n} 个会话，但插件还没读到它们的事件",
+              n: String(diskSessions),
+            })}
+            description={t("panel.status.no_event_session_hint", {
+              defaultValue:
+                "上面「本机 Agent」里能看到它们。插件启动前就开始的会话按设计不回溯历史，"
+                + "要等它产生新事件才会进观测——这是故意的，不是坏了。",
+            })}
+          />
+        ) : (
+          <EmptyState
+            title={t("panel.status.no_session", {
+              defaultValue: "还没看到任何会话",
+            })}
+            description={t("panel.status.no_session_hint", {
+              defaultValue: "去跑一个 agent，它就会出现在这里。",
+            })}
+          />
+        )
       ) : (
         <Card title={t("panel.card.sessions", { defaultValue: "观测会话" })}>
           <Stack gap="sm">
