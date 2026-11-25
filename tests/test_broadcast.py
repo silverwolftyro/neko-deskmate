@@ -11,8 +11,8 @@ from __future__ import annotations
 import pytest
 
 from plugin.plugins.agent_deskmate.broadcast import (
-    RESPOND_COOLDOWN,
     NOTICE_MERGE_SECONDS,
+    RESPOND_COOLDOWN,
     Broadcaster,
     NoticeMerger,
     coalesce_same_workspace,
