@@ -1,8 +1,8 @@
 [plugin]
 id = "agent_deskmate"
 name = "同桌猫"
-description = "替你看着本机的编码 Agent（Claude Code / Codex / mcode）：在需要审批、完成、出错、卡住时按你可调的强度播报与解释，并在 N.E.K.O 里完成同意/拒绝，不必切进 Agent 界面。基本版只接 Claude Code。"
-version = "0.6.1"
+description = "替你看着本机的编码 Agent：在需要审批、完成、出错、卡住时按你可调的强度播报与解释，并在 N.E.K.O 里完成同意/拒绝，不必切进 Agent 界面。当前直接观测 Claude Code，网关侧可见走 cc-switch 的 Agent；面板「本机 Agent」会逐个说明其余的是看得见、有条件、还是暂无数据源。"
+version = "0.6.2"
 type = "plugin"
 entry = "plugin.plugins.agent_deskmate:AgentDeskmatePlugin"
 
@@ -17,3 +17,20 @@ supported = ">=0.1.0,<0.3.0"
 [plugin.i18n]
 default_locale = "zh-CN"
 locales_dir = "i18n"
+
+# 设置面板（2026-11-25，插件第一个 UI 面）。
+# 权限只取三个：state:read（读面板状态）、config:read（显示当前配置值）、
+# action:call（调 hook_install / settings_set_roots）。
+# **刻意不要 config:write**——SDK 里它是合法权限名，但宿主侧没有实现对应通道
+# （PluginSurfaceProps.config 是只读的，HostedApi 里也没有写配置的方法）。
+# 配置写入走 settings_set_roots 入口，校验留在 Python。
+[plugin.ui]
+enabled = true
+
+[[plugin.ui.panel]]
+id = "main"
+title = "同桌猫"
+entry = "ui/panel.tsx"
+mode = "hosted-tsx"
+context = "deskmate"
+permissions = ["state:read", "config:read", "action:call"]

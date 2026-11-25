@@ -11,12 +11,16 @@ from .claude_code import (
     iter_transcript_files,
     read_new_transcript_events,
 )
+from .discovery import AgentProbe, discover_agents, summarize
 from .gateway import GatewayAdapter, read_new_gateway_events
 
 __all__ = [
+    "AgentProbe",
     "ClaudeCodeAdapter",
     "GatewayAdapter",
+    "discover_agents",
     "iter_transcript_files",
     "read_new_gateway_events",
     "read_new_transcript_events",
+    "summarize",
 ]

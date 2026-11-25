@@ -47,12 +47,14 @@ from plugin.sdk.plugin import (
     ui,
 )
 
+from . import hookhealth
 from .adapters import ClaudeCodeAdapter, GatewayAdapter
 from .adapters.claude_code import (
     CwdCache,
     iter_transcript_files,
     read_new_transcript_events,
 )
+from .adapters.discovery import discover_agents
 from .adapters.gateway import GatewayReadError, current_watermark, read_new_gateway_events
 from .approval import (
     ADVICE_STATE_FALLBACK,
@@ -111,10 +113,10 @@ from .gated import (
     MODE_DEGRADED,
     GatedFailureLog,
 )
+from .hookhealth import classify_hook, refine_with_relay
 from .hooksetup import (
     install_hook,
     installed_hook,
-    relay_matches,
     settings_path,
     source_relay_path,
     sync_relay,
@@ -132,6 +134,7 @@ from .model_advice import (
     STATE_UNAUTHORIZED,
     ModelAdvisor,
 )
+from .panel_state import build_panel_state
 from .progress import signal_from_event
 from .rules import (
     Coalescer,
@@ -822,61 +825,26 @@ class AgentDeskmatePlugin(NekoPluginBase):
     def _check_installed_hook_port(self, port: int) -> None:
         """启动自检：已装进 Claude Code settings 的那条 hook 还好不好用。
 
-        四件事分开说，不合成一句"hook 坏了"——用户看到"坏了"不知道该干什么：
+        判定**不在这个方法里**——在 ``hookhealth.classify_hook`` /
+        ``refine_with_relay``。这里是它的一个消费者（另一个是设置面板）。
+        两处各写一遍就是两套判据，诊断自己就成了第二套判据
+        （B8 同类缺陷：诊断与常驻轮询对不上）。
 
-        1. 没装过 → 提示去调 ``hook_install``；
-        2. 残留旧的 http 形状 → 提示替换（那个形状插件没开时会卡死一切）；
-        3. **hook 里的中继文件不存在** → 明确报"中继文件已丢失 + 路径 + 重跑
-           （2026-11-22 真机事故：宿主清空了安装副本，hook 指向死链接，
-           症状是卡片永不出现而用户无感知，只剩一条莫名的"端口不一致"）；
-        4. 端口解析不出 / 与配置不一致 → 分别说清楚。
-
-        端口解析不出时**不许在日志里输出 None**——那看起来像"端口就是 None"，
-        而不是"我没解析出来"。
+        本方法保留启动时才有的**副作用**：中继副本过期就自动重写。
+        面板是只读消费者，不修，只报告。
         """
         target = settings_path()
         installed = installed_hook(target, self.data_path())
-        if installed is None:
-            self.logger.warning(
-                "Claude Code settings 里没有装配审批中继（{} 未找到我们的 hook）。"
-                "PermissionRequest 不会打进来，卡片永远不会出现——"
-                "请调一次 hook_install 入口装上，并重启 Claude Code",
-                target,
-            )
-            return
-        if installed.get("kind") == "http":
-            # 残留的旧形状：既不清它也不提它，用户就完全不知情，
-            # 而那个形状在插件没开时会把该目录下所有权限请求卡死。
-            self.logger.error(
-                "{} 里残留一份过期的 http 形态审批 hook（不是现在用的 command hook）。"
-                "它在插件没启动时可能拦住你所有的权限请求——"
-                "请调一次 hook_install 入口，它会替换成 command hook 并先备份",
-                target,
-            )
-            return
+        health = classify_hook(installed, target=target, expected_port=port)
+        health = refine_with_relay(
+            health, script=installed.get("script") if installed else None,
+            plugin_dir=self.plugin_dir,
+        )
 
-        script = installed.get("script")
-        if not script:
-            self.logger.error(
-                "无法从已装配的 hook 命令里解析出中继脚本路径（{}）。"
-                "请重跑 hook_install 入口重写这条 hook",
-                target,
-            )
-            return
-        if not Path(script).is_file():
-            self.logger.error(
-                "审批中继文件已丢失（{}）。它可能被宿主清理或手动删除了——"
-                "PermissionRequest 会打不通，卡片永远不会出现。"
-                "请调一次 hook_install 入口，它会重新放好这份文件并重写 hook",
-                script,
-            )
-            return
-
-        # 中继副本与插件里的版本逐字节比对，不一致就重写（规格 P0/Q1）。
-        # 只查"文件在不在"不够：旧副本照样能跑，只是**不再发新协议字段**，
-        # 症状是某个功能静默消失且没有任何报错——比坏掉更难查。
-        source = source_relay_path(self.plugin_dir)
-        if not relay_matches(source, script):
+        # 过期：启动时自动修（这是启动自检的传统行为），修不好才报错。
+        if health.state == hookhealth.OUTDATED:
+            source = source_relay_path(self.plugin_dir)
+            script = (installed or {}).get("script")
             ok, why = sync_relay(source, script)
             if not ok:
                 self.logger.error(
@@ -889,22 +857,11 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 "这条 hook 指向的就是它，所以下一次权限请求起就用上新版；"
                 "若重写一直不成功，请调一次 hook_install 入口", script,
             )
-
-        hooked = installed.get("port")
-        if hooked is None:
-            self.logger.error(
-                "无法从已装配的 hook 命令中解析端口（{}）。"
-                "请重跑 hook_install 入口重写这条 hook",
-                target,
-            )
             return
-        if hooked != self._approval.port:
-            self.logger.error(
-                "端口不一致：配置里是 {}，但已装配的 hook 用的是 {}。"
-                "PermissionRequest 会打到旧端口上，请重跑 hook_install 入口"
-                "（它会替换成新端口，不会多出一条）",
-                self._approval.port, hooked,
-            )
+
+        # 用方法名而不是数字级别：测试桩的 logger 只有 info/warning/error。
+        getattr(self.logger, health.log_method)(
+            health.log_message, *health.log_args)
 
     def _log_first_run_hint(self, config: dict[str, Any]) -> None:
         """首启引导：没声明 mine roots 就在日志里提示一次。
@@ -1810,6 +1767,146 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
     # ── hook 装配（5a 实测：没人装 hook，卡片永远不来） ────────────────────
 
+    # ── 设置面板 ───────────────────────────────────────────────────────────
+
+    @ui.context(id="deskmate", title=tr("panel.title", default="同桌猫"))
+    async def panel_context(self) -> dict[str, object]:
+        """设置面板要的那份状态。
+
+        **判定不在这里**：hook 健康度走 ``hookhealth``（与启动自检同一套），
+        汇总走 ``panel_state.build_panel_state``（纯函数）。这里只负责
+        把插件的内部对象翻译成那两个函数的输入。
+
+        取不到的值**不猜**：塞一个看起来像数据的占位符，比显示"未知"更坏。
+        """
+        config = await self._plugin_config()
+        approval_cfg = (config.get("approval")
+                        if isinstance(config.get("approval"), dict) else {})
+        model_cfg = config.get("model") if isinstance(config.get("model"), dict) else {}
+        review_cfg = (config.get("auto_review")
+                      if isinstance(config.get("auto_review"), dict) else {})
+
+        roots = _mine_roots(config)
+        api_key = str(model_cfg.get("api_key") or config.get("api_key") or "")
+        scopes = (list(self._approval.authorized_scopes())
+                  if self._approval is not None else [])
+
+        sessions = []
+        if self._tracker is not None:
+            sessions = [
+                {
+                    "agent": s.agent,
+                    "session": s.session,
+                    "workspace": s.workspace,
+                    "light": str(getattr(s.light, "value", s.light)),
+                    "rounds": s.rounds,
+                    "last_event_at": s.last_event_at,
+                    # fingerprint → 上次播报时间。取不到就 0，面板显示「—」——
+                    # 不拿 last_event_at（最近事件）冒充"最近播报"。
+                    "last_broadcast_at": max(s.fingerprints.values(), default=0.0),
+                }
+                for s in self._tracker.sessions()
+            ]
+
+        approvals = []
+        if self._approval is not None:
+            try:
+                approvals = self._approval.snapshot()
+            except Exception as exc:  # 面板不该因为取不到快照就整个打不开
+                self.logger.warning("面板取审批快照失败：{}", type(exc).__name__)
+                approvals = []
+
+        hook_health = {"state": "ok", "tone": "default", "title": "", "detail": "",
+                       "action": None}
+        if self._approval is not None:
+            installed = installed_hook(settings_path(), self.data_path())
+            health = classify_hook(installed, target=settings_path(),
+                                   expected_port=self._approval.port)
+            health = refine_with_relay(
+                health,
+                script=installed.get("script") if installed else None,
+                plugin_dir=self.plugin_dir,
+            )
+            hook_health = health.as_dict()
+
+        # 本机 Agent 发现。**只判存在、不读内容**（discovery 模块的铁律），
+        # 所以它不可能因为某个 Agent 的目录古怪就把面板拖垮；
+        # 但保险起见仍然单独兜住——面板打不开比少一张卡严重得多。
+        agents: list[dict[str, object]] = []
+        try:
+            agents = [probe.as_dict() for probe in discover_agents()]
+        except Exception as exc:  # 面板不该因为发现失败就整个打不开
+            self.logger.warning("面板取本机 Agent 清单失败：{}", type(exc).__name__)
+            agents = []
+
+        return build_panel_state(
+            running=self._approval is not None and self._approval.running(),
+            hook=hook_health,
+            roots=roots,
+            api_key_set=bool(api_key.strip()),
+            auto_review_enabled=bool(review_cfg.get("enabled")),
+            authorized_scopes=scopes,
+            explain_verbosity=str(approval_cfg.get("explain_verbosity") or "brief"),
+            warning_emphasis=str(approval_cfg.get("warning_emphasis") or "first_n"),
+            warning_first_n=int(approval_cfg.get("warning_first_n") or 3),
+            sessions=sessions,
+            approvals=approvals,
+            now=time.time(),
+            agents=agents,
+        )
+
+    @ui.action(id="settings_set_roots",
+               label=tr("entry.settings_set_roots.name", default="保存目录声明"))
+    @plugin_entry(
+        id="settings_set_roots",
+        name=tr("entry.settings_set_roots.name", default="保存目录声明"),
+        description=tr(
+            "entry.settings_set_roots.description",
+            default="把「这些目录里的会话是我自己开的」写进配置。"
+                    "声明后，高危通知的主语会显示「你自己开的 claude-code」，"
+                    "而不是「发起者未知」。空列表等于撤销声明。",
+        ),
+    )
+    async def settings_set_roots(self, roots: list | None = None, _ctx: dict | None = None):
+        """写 ``[agent_deskmate.mine].roots``。
+
+        为什么走入口而不是让面板直接写配置：**面板没有写配置的能力**
+        （``config:write`` 在 SDK 里是个没有实现的权限，宿主侧也没有对应通道）。
+        而且校验该留在 Python——项目纪律是"真正的兜底全在代码里"，
+        手改配置文件的用户根本不过面板这张表单。
+
+        顺手把 ``/`` 归一成 ``\\``：Windows 上手敲两种都认，
+        但存成一种，用户回来看配置时不用猜。
+        """
+        raw = roots if isinstance(roots, list) else []
+        cleaned: list[str] = []
+        for item in raw:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            path = text.replace("/", "\\").rstrip("\\") or text
+            if path not in cleaned:
+                cleaned.append(path)
+        # 不存在的目录也收：用户可能先声明、后建目录。
+        # 但**不**帮它 expanduser/expandvars——那会让配置里出现
+        # 一个用户没写过的路径，回来看时不认得。
+        try:
+            await self.config.set("agent_deskmate.mine.roots", cleaned, timeout=5.0)
+        except Exception as exc:
+            self.logger.error("写 roots 失败：{}", type(exc).__name__)
+            return Err(SdkError("保存失败：{}".format(type(exc).__name__)))
+        self.logger.info("已声明 {} 个目录为「我自己开的会话」所在处", len(cleaned))
+        return Ok({
+            "roots": cleaned,
+            "count": len(cleaned),
+            "message": ("已保存 {} 个目录。下一次播报就用新声明；"
+                        "不声明时高危通知显示「发起者未知」。".format(len(cleaned))),
+        })
+
+    # 暴露成 ui.action 是为了设置面板能一键调用（API 规定「A surface cannot
+    # call arbitrary entries」）。入口点 tab 仍可用——两个装饰器叠加，
+    # 不是替换。
+    @ui.action(id="hook_install", label=tr("entry.hook_install.name", default="装配审批 hook"))
     @plugin_entry(
         id="hook_install",
         name=tr("entry.hook_install.name", default="装配审批 hook"),

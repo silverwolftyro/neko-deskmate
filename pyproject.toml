@@ -18,4 +18,7 @@ include = [
   "i18n/*",
   "adapters/*",
   "tests/*",
+  # 设置面板（2026-11-25，插件第一个 UI 面）。漏了它面板会静默变成
+  # "surface unavailable"——入口文件不存在，宿主直接标记不可用。
+  "ui/*",
 ]

@@ -67,12 +67,17 @@ def test_events_registered() -> None:
     # ``approval_show``（「返回审批」）在 2026-11-22 第二轮被删掉：
     # 解释卡改成追加新消息而不是替换审批卡之后，"切换回审批态"这个动作
     # 整个消失了，入口也就没有存在理由。
+    #
+    # ``panel_context``（2026-11-25）不是入口而是 ``@ui.context``，
+    # 所以不进这张集合；它供的是设置面板的 state。
+    # ``settings_set_roots`` 是面板唯一的写入口（面板没有写配置的能力）。
     assert set(registered) == {
         "startup", "shutdown", "config_change", "status", "dump_events", "scan_now",
         "watch", "approval", "approval_decide", "approval_explain",
         "approval_authorize", "hook_install", "hook_uninstall",
         "model_test",
         "pending_list", "audit_list",
+        "settings_set_roots",
     }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"
     assert registered["shutdown"].event_type == "lifecycle"

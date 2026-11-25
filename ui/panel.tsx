@@ -1,0 +1,509 @@
+import {
+  ActionButton,
+  Alert,
+  Button,
+  Card,
+  EmptyState,
+  Field,
+  Grid,
+  Inline,
+  Page,
+  Stack,
+  StatCard,
+  StatusBadge,
+  Tabs,
+  Text,
+  Textarea,
+  useConfirm,
+  useLocalState,
+  useToast,
+} from "@neko/plugin-ui"
+import type { PluginSurfaceProps, Tone } from "@neko/plugin-ui"
+
+type HookState = {
+  state?: string
+  tone?: string
+  title?: string
+  detail?: string
+  action?: string | null
+}
+
+type AttentionItem = {
+  ts?: number
+  tone?: string
+  title?: string
+  detail?: string
+  action?: string | null
+}
+
+type LogItem = { ts?: number; tone?: string; text?: string }
+
+type SessionRow = {
+  agent?: string
+  short?: string
+  workspace?: string
+  light?: string
+  rounds?: number
+  last_event_at?: number
+}
+
+/** 发现层的一个 Agent。字段与 ``adapters/discovery.py`` 的 ``as_dict`` 对齐。 */
+type AgentRow = {
+  id?: string
+  label?: string
+  state?: string
+  detail?: string
+  home?: string
+  reported?: boolean
+}
+
+/** 发现状态 → 徽标色调。文案走 i18n（``panel.agents.state.<state>``），
+ *  这里只留"这个状态是暖是冷"——颜色不该被翻译，标签必须被翻译。 */
+const AGENT_TONE: Record<string, Tone> = {
+  observable: "success",
+  conditional: "warning",
+  feasible: "info",
+  blind: "default",
+}
+
+function agentTone(state?: string): Tone {
+  return AGENT_TONE[state || ""] || "default"
+}
+
+type DeskmateState = {
+  running?: boolean
+  hook?: HookState
+  roots?: string[]
+  api_key_set?: boolean
+  auto_review?: {
+    enabled?: boolean
+    signed?: boolean
+    advice_signed?: boolean
+    auto_signed?: boolean
+  }
+  explain_verbosity?: string
+  warning_emphasis?: string
+  warning_first_n?: number
+  session_count?: number
+  last_broadcast_at?: number
+  sessions?: SessionRow[]
+  attention?: AttentionItem[]
+  recent?: LogItem[]
+  agents?: AgentRow[]
+  agent_summary?: Record<string, number>
+}
+
+const TONE_OF: Record<string, Tone> = {
+  success: "success",
+  warning: "warning",
+  danger: "danger",
+  info: "info",
+  default: "default",
+}
+
+function toneOf(value?: string): Tone {
+  return TONE_OF[value || ""] || "default"
+}
+
+function whenText(ts?: number): string {
+  if (!ts) return "—"
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => (n < 10 ? "0" + n : "" + n)
+  return (
+    d.getFullYear() +
+    "-" +
+    pad(d.getMonth() + 1) +
+    "-" +
+    pad(d.getDate()) +
+    " " +
+    pad(d.getHours()) +
+    ":" +
+    pad(d.getMinutes())
+  )
+}
+
+export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) {
+  const t = props.t
+  const state = props.state || {}
+  const running = !!state.running
+  const hook = state.hook || {}
+  const attention = state.attention || []
+  const sessions = state.sessions || []
+  const recent = state.recent || []
+  const roots = state.roots || []
+  const agents = state.agents || []
+  const summary = state.agent_summary || {}
+  const autoReview = state.auto_review || {}
+
+  const toast = useToast()
+  const confirm = useConfirm()
+  const [rootsDraft, setRootsDraft] = useLocalState(
+    "roots_draft",
+    roots.join("\n"),
+  )
+  const [savingRoots, setSavingRoots] = useLocalState("saving_roots", false)
+  // Tabs 的 activeId 是受控的：状态页的「去声明」要能把它切到设置页。
+  // （原来用 querySelector 猜 data-neko-tab，Tabs 没这个属性，点了没反应。）
+  const [tab, setTab] = useLocalState("tabs:deskmate", "status")
+
+  const hasAction = (id: string): boolean =>
+    (props.actions || []).some(
+      (a: any) => a.id === id || a.entry_id === id,
+    )
+
+  const onInstallHook = async () => {
+    const ok = await confirm({
+      title: t("panel.action.install", { defaultValue: "装配" }) + " hook",
+      message:
+        "会写入 Claude Code 的 ~/.claude/settings.json（写之前先备份），" +
+        "并重启 Claude Code 后生效。插件没启动时中继输出空对象，" +
+        "Claude Code 回退原生权限弹窗，不会卡住你。",
+      confirmLabel: t("panel.action.install", { defaultValue: "装配" }),
+    })
+    if (!ok) return
+    try {
+      const res = await props.api.call(
+        "hook_install",
+        {},
+        { userInitiated: true },
+      )
+      await props.api.refresh()
+      const msg =
+        res && typeof res === "object" && "message" in res
+          ? String((res as any).message)
+          : "已装配。重启 Claude Code 后生效。"
+      toast.success(msg)
+    } catch (err: any) {
+      toast.error(installErrorText(err, running))
+    }
+  }
+
+  const onSaveRoots = async () => {
+    const list = rootsDraft
+      .split("\n")
+      .map((s: string) => s.trim())
+      .filter((s: string) => s.length > 0)
+    setSavingRoots(true)
+    try {
+      await props.api.call(
+        "settings_set_roots",
+        { roots: list },
+        { userInitiated: true },
+      )
+      await props.api.refresh()
+      toast.success(t("panel.settings.saved", { defaultValue: "已保存" }))
+    } catch (err: any) {
+      toast.error(String(err && err.message ? err.message : err))
+    } finally {
+      setSavingRoots(false)
+    }
+  }
+
+  // ── 状态页 ─────────────────────────────────────────────────────────────
+  const statusStrip = (
+    <Alert
+      tone={running ? "success" : "danger"}
+      message={
+        running
+          ? t("panel.status.running", { defaultValue: "观测中" }) +
+            " · " +
+            (state.session_count || 0) +
+            " 个会话"
+          : t("panel.status.stopped", { defaultValue: "已停止" })
+      }
+    />
+  )
+
+  const hookTone: Tone = hook.state === "ok" ? "success" : toneOf(hook.tone)
+  const cards = (
+    <Grid cols={2}>
+      <StatCard
+        label={t("panel.card.approval", { defaultValue: "审批功能" })}
+        value={
+          <StatusBadge
+            tone={hookTone}
+            label={
+              hook.state === "ok"
+                ? t("panel.hook.ok", { defaultValue: "已装配" })
+                : t("panel.hook.broken", { defaultValue: "需要装配" })
+            }
+          />
+        }
+      />
+      <StatCard
+        label={t("panel.card.roots", { defaultValue: "高危归因" })}
+        value={
+          <StatusBadge
+            tone={roots.length > 0 ? "success" : "warning"}
+            label={
+              roots.length > 0
+                ? "已声明 " + roots.length + " 个目录"
+                : "未声明"
+            }
+          />
+        }
+      />
+      <StatCard
+        label={t("panel.card.sessions", { defaultValue: "观测会话" })}
+        value={String(state.session_count || 0)}
+      />
+      <StatCard
+        label={t("panel.card.last_broadcast", { defaultValue: "最近播报" })}
+        value={whenText(state.last_broadcast_at)}
+      />
+    </Grid>
+  )
+
+  const actionRow = (
+    <Inline gap="sm">
+      {hasAction("hook_install") && hook.state !== "ok" ? (
+        <Button tone="primary" onClick={onInstallHook} disabled={!running}>
+          {t("panel.action.install", { defaultValue: "装配" })} hook
+        </Button>
+      ) : null}
+      {roots.length === 0 ? (
+        <Button
+          tone="primary"
+          onClick={() => {
+            setTab("settings")
+          }}
+        >
+          {t("panel.action.declare", { defaultValue: "去声明" })}
+        </Button>
+      ) : null}
+      <RefreshButton
+        label={t("panel.action.refresh", { defaultValue: "刷新" })}
+      />
+    </Inline>
+  )
+
+  const statusTab = (
+    <Stack gap="md">
+      {statusStrip}
+      {cards}
+      {actionRow}
+      {agents.length > 0 ? (
+        <Card title={t("panel.card.agents", { defaultValue: "本机 Agent" })}>
+          <Stack gap="sm">
+            <Text>
+              {t("panel.card.agents_hint", {
+                defaultValue:
+                  "只列目录在不在，不读里面任何内容。「暂无数据源」不是坏，是还没接。",
+              })}
+            </Text>
+            <Text>
+              {t("panel.agents.summary", {
+                defaultValue:
+                  "共 {total} 个：正在观测 {obs}，有条件 {cond}，数据在本机 {fea}，暂无数据源 {blind}",
+                total: String(agents.length),
+                obs: String(summary.observable || 0),
+                cond: String(summary.conditional || 0),
+                fea: String(summary.feasible || 0),
+                blind: String(summary.blind || 0),
+              })}
+            </Text>
+            {agents.map((a: AgentRow, i: number) => (
+              <Stack key={i} gap="sm">
+                <Inline gap="sm">
+                  <StatusBadge
+                    tone={agentTone(a.state)}
+                    label={t("panel.agents.state." + (a.state || "unknown"), {
+                      defaultValue: "状态未知",
+                    })}
+                  />
+                  <Text>{a.label || a.id || "agent"}</Text>
+                </Inline>
+                {a.detail ? <Text>{a.detail}</Text> : null}
+              </Stack>
+            ))}
+          </Stack>
+        </Card>
+      ) : null}
+      <Text>
+        {t("panel.status.idle_hint", {
+          defaultValue: "不响是正常的——它只在你需要决定时开口。",
+        })}
+      </Text>
+      {sessions.length === 0 ? (
+        <EmptyState
+          title={t("panel.status.no_session", {
+            defaultValue: "还没看到任何会话",
+          })}
+          description={t("panel.status.no_session_hint", {
+            defaultValue: "去跑一个 agent，它就会出现在这里。",
+          })}
+        />
+      ) : (
+        <Card title={t("panel.card.sessions", { defaultValue: "观测会话" })}>
+          <Stack gap="sm">
+            {sessions.map((s: SessionRow, i: number) => {
+              const lightTone: Tone = s.light === "idle" ? "default" : "info"
+              return (
+              <Inline key={i} gap="sm">
+                <StatusBadge
+                  tone={lightTone}
+                  label={s.agent || "agent"}
+                />
+                <Text>{s.short || "—"}</Text>
+                <Text>{s.workspace || ""}</Text>
+                <Text>{whenText(s.last_event_at)}</Text>
+              </Inline>
+              )
+            })}
+          </Stack>
+        </Card>
+      )}
+    </Stack>
+  )
+
+  // ── 设置页 ─────────────────────────────────────────────────────────────
+  const settingsTab = (
+    <Stack gap="md">
+      <Card title={t("panel.settings.roots", { defaultValue: "你自己的目录" })}>
+        <Stack gap="sm">
+          <Field
+            label={t("panel.settings.roots", { defaultValue: "你自己的目录" })}
+            help={t("panel.settings.roots_help", {
+              defaultValue:
+                "落在这些目录里的会话，播报会说「你自己开的」。留空则高危通知显示「发起者未知」。一行一个。",
+            })}
+          >
+            <Textarea
+              value={rootsDraft}
+              placeholder={t("panel.settings.roots_placeholder", {
+                defaultValue: "D:\\workspace",
+              })}
+              onChange={(v: string) => setRootsDraft(v)}
+            />
+          </Field>
+          <Button
+            tone="primary"
+            disabled={!running || savingRoots}
+            onClick={onSaveRoots}
+          >
+            {t("panel.settings.save", { defaultValue: "保存" })}
+          </Button>
+        </Stack>
+      </Card>
+
+      <Card title={t("panel.settings.api_key", { defaultValue: "API key" })}>
+        <Stack gap="sm">
+          <StatusBadge
+            tone={state.api_key_set ? "success" : "warning"}
+            label={
+              state.api_key_set
+                ? t("panel.settings.api_key_set", { defaultValue: "已设置" })
+                : t("panel.settings.api_key_empty", { defaultValue: "未设置" })
+            }
+          />
+          <Text>
+            {t("panel.settings.api_key_help", {
+              defaultValue:
+                "只用于模型建议与自动审查。不写日志、不进卡片、不给模型看。要改请在插件管理器的「配置」页。",
+            })}
+          </Text>
+        </Stack>
+      </Card>
+
+      <Card
+        title={t("panel.settings.elsewhere", {
+          defaultValue: "其他设置",
+        })}
+      >
+        <Text>
+          {t("panel.settings.elsewhere_help", {
+            defaultValue:
+              "讲解程度、警示强度、自动审查等都在插件管理器的「配置」页。"
+              + "这里只放会直接影响「它看起来是否在工作」的那几项。",
+          })}
+        </Text>
+      </Card>
+    </Stack>
+  )
+
+  // ── 日志页 ─────────────────────────────────────────────────────────────
+  const logTab = (
+    <Stack gap="md">
+      <Card title={t("panel.log.attention", { defaultValue: "需要你注意" })}>
+        {attention.length === 0 ? (
+          <EmptyState
+            title={t("panel.log.empty", { defaultValue: "没有待处理的事。" })}
+          />
+        ) : (
+          <Stack gap="sm">
+            {attention.map((a: AttentionItem, i: number) => (
+              <Stack key={i} gap="sm">
+                <Text>
+                  {whenText(a.ts)} · {a.title || ""}
+                </Text>
+                <Alert tone={toneOf(a.tone)} message={a.detail || ""} />
+              </Stack>
+            ))}
+          </Stack>
+        )}
+      </Card>
+      <Card title={t("panel.log.recent", { defaultValue: "最近发生" })}>
+        {recent.length === 0 ? (
+          <EmptyState
+            title={t("panel.log.empty", { defaultValue: "还没有记录。" })}
+          />
+        ) : (
+          <Stack gap="sm">
+            {recent.map((item: LogItem, i: number) => (
+              <Inline key={i} gap="sm">
+                <Text>{whenText(item.ts)}</Text>
+                <StatusBadge tone={toneOf(item.tone)} label="" />
+                <Text>{item.text}</Text>
+              </Inline>
+            ))}
+          </Stack>
+        )}
+      </Card>
+    </Stack>
+  )
+
+  return (
+    <Page
+      title={t("panel.title", { defaultValue: "同桌猫" })}
+      subtitle={t("panel.subtitle", {
+        defaultValue: "它在干活吗、缺什么、刚才说了什么",
+      })}
+    >
+      <Tabs
+        id="deskmate"
+        activeId={tab}
+        onChange={(id: string) => {
+          setTab(id)
+        }}
+        items={[
+          {
+            id: "status",
+            label: t("panel.tab.status", { defaultValue: "状态" }),
+            content: statusTab,
+          },
+          {
+            id: "settings",
+            label: t("panel.tab.settings", { defaultValue: "设置" }),
+            content: settingsTab,
+          },
+          {
+            id: "log",
+            label: t("panel.tab.log", { defaultValue: "日志" }),
+            content: logTab,
+          },
+        ]}
+      />
+    </Page>
+  )
+}
+
+function installErrorText(err: any, running: boolean): string {
+  const msg = String(err && err.message ? err.message : err)
+  if (/409/.test(msg) || !running) {
+    return "插件没在运行，按钮点不动。先在插件管理器里启动它。"
+  }
+  if (/403/.test(msg)) {
+    return "这个操作没有暴露给面板（403）。"
+  }
+  return "装配失败：" + msg
+}
