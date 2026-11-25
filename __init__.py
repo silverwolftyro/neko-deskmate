@@ -2001,6 +2001,22 @@ class AgentDeskmatePlugin(NekoPluginBase):
         except Exception as exc:
             self.logger.error("写播报方式失败：{}", type(exc).__name__)
             return Err(SdkError("保存失败：{}".format(type(exc).__name__)))
+
+        # **必须当场改生效的那个对象**。``broadcast_speak`` 是建 Broadcaster
+        # 时读一次的，而 ``self.config.set()`` 从插件内部写配置**不会触发
+        # 宿主的 config_change 生命周期**（实测 2026-11-26：日志里
+        # "配置已变更" 一次都没出现）。于是配置写进去了、入口返回 Ok、
+        # 面板弹"已保存"，而下一轮播报照旧用旧值——**按钮在说谎**。
+        #
+        # 刻意不调 ``_reset_watch_state()``：那会重建适配器，而新适配器
+        # 把现有转录文件全当成"运行期新出现"从 0 开始读，等于把几个月历史
+        # 倒进来播一遍（B4 的 ``_seen_at_startup`` 是每实例一份）。
+        # 只翻这一个旗标：``Broadcaster.ai_behavior`` 是 property，
+        # 每条播报现读，下一次就生效；通知路也现读（``getattr(broadcaster,
+        # "speak")``）。不丢合并窗口里的通知，不重放历史。
+        if self._broadcaster is not None:
+            self._broadcaster.speak = want
+
         self.logger.info("播报方式已改为：{}",
                          "猫娘复述（respond）" if want else "只出文字（blind）")
         return Ok({
