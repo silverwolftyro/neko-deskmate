@@ -1527,7 +1527,21 @@ class AgentDeskmatePlugin(NekoPluginBase):
                     if kept is not None:
                         self._review_queue.append(kept)
                     continue
-                jobs.append(partial(broadcaster.broadcast, hit))
+                # 走到这儿就是"没有第二方确认"：要么没配 key / 没开审查
+                # （``reviewer is None``），要么这条本身不够格送审。
+                # **没有正面证据就不顶着「严重」**——理由同
+                # ``_downgrade_unconfirmed_critical``。
+                #
+                # 2026-11-27：用户说「这个功能理论上我就应该绑定 key 后可开」。
+                # 门本来就有（面板置灰 + 服务端返回 Err），但没 key 时
+                # 审查这条路整个不存在，"说不清"的 critical 就没有任何
+                # 降级机会——而**有** key 但审查失败时我反而会降。
+                # 同一个原则两种结果，这里补齐没 key 那一侧。
+                #
+                # 对非 critical、以及对真有危险目标在里面的 critical，
+                # 这个函数是恒等的，一格不动。
+                jobs.append(partial(broadcaster.broadcast,
+                                    _downgrade_unconfirmed_critical(hit)))
         for notice in notices:
             # 「这一轮跑完了」**要 Yui 说出来**（2026-11-26 用户要求）。
             #

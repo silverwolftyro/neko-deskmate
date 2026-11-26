@@ -880,3 +880,31 @@ def test_a_failed_review_downgrades_but_still_broadcasts() -> None:
     assert len(survivors) == 1                  # 没吞掉
     assert survivors[0].severity == "warn"       # 但不自称严重
     assert host._review_failed == 1
+
+
+def test_without_a_reviewer_an_opacity_critical_is_downgraded() -> None:
+    """没 key / 没开审查 → 没有第二方确认 → 不顶着「严重」。
+
+    2026-11-27 用户：「这个功能理论上我就应该绑定 key 后可开」。
+    门本来就有，但没 key 时审查这条路整个不存在，"说不清"的 critical
+    就没有任何降级机会——而**有** key 但审查失败时反而会降。
+    同一个原则两种结果，这里补齐没 key 那一侧。
+    """
+    from plugin.plugins.agent_deskmate import _downgrade_unconfirmed_critical
+
+    hit = _downgrade_unconfirmed_critical(_hit_of('rm -f "$MSG"'))
+    assert hit.severity == "warn"
+    assert "说不清严重程度" in hit.summary
+
+
+def test_the_downgrade_is_the_identity_for_everything_else() -> None:
+    """恒等性：非 critical、真灾难 critical，原样返回（同一个对象）。
+
+    这条钉的是"可以无条件调用"——路由处不挑形状，函数自己认。
+    """
+    from plugin.plugins.agent_deskmate import _downgrade_unconfirmed_critical
+
+    for command in ("rm -rf src", "rm -rf ~", "rm -rf /", "rm -rf D:/",
+                    "rm -rf *", "rm -rf C:/Windows/System32"):
+        original = _hit_of(command)
+        assert _downgrade_unconfirmed_critical(original) is original, command
