@@ -489,6 +489,68 @@ def is_delete_command(command: str) -> bool:
     return any(_segment_has_delete(segment) for segment in _segments(command))
 
 
+def _hides_by_substitution(target: str) -> bool:
+    """目标被 ``$VAR`` / 反引号 / ``%VAR%`` 藏住——**我们不知道路径**。
+
+    与"被无界通配符藏住"（``*`` / ``../*``）是两件事，必须分开：
+
+    - 替换：路径要从别处取，我们不知道它是什么。这是**不知道**。
+    - 无界通配符：我们明确知道它匹配一片没有边界的内容。
+      这是**知道它无界**——``rm -rf *`` 会抹掉整个工作目录。
+
+    只有前者够格让模型表态。把后者也放行，等于让模型给
+    "抹掉整个目录"开一张免罪牌。
+    """
+    text = str(target or "").strip().strip("'\"")
+    return bool(_SUBSTITUTION_RE.search(text))
+
+
+def opacity_is_the_only_reason(command: str,
+                               working_directory: str | None) -> bool:
+    """这条命令的"严重"**只**来自"目标说不清"吗。
+
+    用来决定一件事：B11 能不能送它。``critical`` 按成文规矩永不送审
+    （「极高危档强制常亮，永不递减」），而那条规矩的理由原话是
+    「连点 3 次删 node_modules 之后，第 4 次的 ``rm -rf ~`` 仍要整行红字」
+    ——它防的是**真的灾难**被模型放掉。
+
+    但 ``rm -rf "$MSG"`` 不是灾难，是**我们不知道**。B8 原话：
+    「不许拿【严重】冒充一个我们并不掌握的事实」。把这两类一起锁死的
+    后果：模型再认同前者是常规操作也压不掉——2026-11-26 真机一晚
+    57 条 critical，约 52 条是这一类。用户原话：「这个根本不严重，
+    它就只是正常的任务执行，这里却报了严重这个极其错误且荒谬的结论」，
+    以及「发一个两个对他来说是警示，发几十个，那对他来说就是麻木…
+    真正的严重警告需要有真实性，它不会被过多的严重警告所淹没」。
+
+    **critical 的价值来自稀缺。** 一晚 57 条的"严重"等于没有严重，
+    真出事时用户已经被训练得点掉了。
+
+    两道判据都要过：
+    1. 每个目标都必须是**被替换**藏住的。字面路径或无界通配符
+       （``rm -rf *``）自己就可能是危险的，不许借这条放行；
+    2. 拿掉"说不清"之后档位仍不是 extreme（双保险）。
+
+    **刻意不改档位本身**：档位同时喂审批闸门（``approval.py`` 三处按
+    EXTREME 特殊处理：不可恢复类、永不递减、强制警示）。改档位会让
+    ``rm -rf "$(curl evil)"`` 连审批卡都不弹——那比要解决的问题多得多。
+    这里只放开采播报的压制，闸门一格不让。
+    """
+    targets = delete_targets(command)
+    if not targets:
+        return False
+    for target in targets:
+        if _is_temp_path(target):
+            continue
+        if not _hides_by_substitution(target):
+            return False
+    try:
+        tier = target_tier(targets, working_directory=working_directory,
+                           unparseable=False)
+    except Exception:                  # noqa: BLE001 —— 判不出一律按"不只是说不清"
+        return False
+    return tier != TIER_EXTREME
+
+
 def delete_tier_for_command(command: str, working_directory: str | None) -> str:
     """删除类的目标档位，**删不出目标时抬到极高危**。
 

@@ -44,6 +44,7 @@ from plugin.plugins.agent_deskmate.rules import (
     Coalescer,
     RuleHit,
     evaluate_delete,
+    evaluate_delete_segments,
     evaluate_failure,
 )
 
@@ -736,3 +737,79 @@ def test_the_attempt_count_rides_along_with_the_trace() -> None:
     host = _bind()()
     host.run([_hit("rm -rf src")], _FakeReviewer([False], attempts=3))
     assert host._review_log[0]["attempts"] == 3
+
+
+# ── critical 里"只因为说不清而严重"的那一类，可以送审 ──────────────────
+#
+# 2026-11-26 真机：一晚 57 条 critical，约 52 条是"目标被变量藏住"——
+# 我们并不知道要删什么，却说它严重。用户两条原话：
+#
+#   「这个根本不严重，它就只是正常的任务执行，
+#     这里却报了严重这个极其错误且荒谬的结论」
+#   「发一个两个对他来说是警示，发几十个，那对他来说就是麻木……
+#     真正的严重警告需要有真实性，它不会被过多的严重警告所淹没」
+#
+# **critical 的价值来自稀缺。** 所以放行的仅仅是"我们不知道"，
+# "知道它无界"（rm -rf *）与"知道它灾难"（rm -rf ~）一格不让。
+
+
+def _hit_for(command: str):
+    return evaluate_delete_segments(command, agent="a", session="s",
+                                    source=SimpleNamespace(
+                                        requester="", requester_evidence="",
+                                        executor="", working_directory=WD,
+                                        session="s", tool="Bash"))[0]
+
+
+@pytest.mark.parametrize("command", [
+    'rm -f "$MSG"',
+    'rm -rf "$TARGET"',
+    'MSG=$(mktemp) && rm -rf "$MSG"',
+    # 注意 ``%TEMP%/x`` 不在这张表里：它早就是 notice（0.6.7 临时目录降档），
+    # 走的是普通的 warn/notice 通道，不需要这条特例。
+])
+def test_a_critical_whose_only_reason_is_opacity_is_reviewable(
+        command: str) -> None:
+    """我们不知道要删什么 → 让模型表态，别拿【严重】冒充。"""
+    from plugin.plugins.agent_deskmate import _reviewable_broadcast
+
+    hit = _hit_for(command)
+    assert hit.severity == "critical", command
+    assert _reviewable_broadcast(hit) is True, command
+
+
+@pytest.mark.parametrize("command", [
+    # 知道它灾难
+    "rm -rf ~",
+    "rm -rf $HOME",
+    "rm -rf /",
+    "rm -rf D:/",
+    "rm -rf C:/Windows/System32",
+    "rm -rf D:/other/x",
+    "rm -rf ../..",
+    "rm -rf ~/.ssh",
+    # 知道它无界
+    "rm -rf *",
+    "rm -rf ../*",
+    "rm -rf ./*",
+    # 混合：有一个不是"被替换藏住"的，整条不放行
+    'rm -rf "$MSG" *',
+    'rm -rf "$MSG" ~',
+])
+def test_a_genuinely_dangerous_critical_is_never_reviewable(
+        command: str) -> None:
+    """**安全边界，一条不让。** 成文规矩「极高危档强制常亮，永不递减」
+    防的就是这些——它们被模型放掉的后果是用户少知道一件真事。"""
+    from plugin.plugins.agent_deskmate import _reviewable_broadcast
+
+    hit = _hit_for(command)
+    assert hit.severity == "critical", command
+    assert _reviewable_broadcast(hit) is False, command
+
+
+def test_the_reviewable_set_is_still_not_configurable() -> None:
+    """范围是设计决定，不是旋钮——能开到 critical 的旋钮迟早被拧到底。"""
+    from plugin.plugins.agent_deskmate import _REVIEWABLE_SEVERITIES
+
+    assert "critical" not in _REVIEWABLE_SEVERITIES
+    assert set(_REVIEWABLE_SEVERITIES) == {"warn", "notice"}

@@ -112,6 +112,7 @@ from .commands import (
     COMMAND_DISPLAY_MAX,
     CONCLUSION_UNSURE,
     command_length,
+    opacity_is_the_only_reason,
 )
 from .events import (
     AGENT_CLAUDE_CODE,
@@ -596,10 +597,25 @@ _REVIEWABLE_SEVERITIES = frozenset({"warn", "notice"})
 def _reviewable_broadcast(hit: RuleHit) -> bool:
     """这条命中够格送模型审吗。纯函数。
 
-    只看严重度，不看规则名——和 ``auto_decide_gate`` 按动作类别排同一个
-    理由：规则名会随规则库增删而变，靠名字判迟早漏一条。
+    只看严重度与"严重的原因"，不看规则名——和 ``auto_decide_gate``
+    按动作类别排同一个理由：规则名会随规则库增删而变，靠名字判迟早漏一条。
+
+    ``critical`` 按成文规矩永不送审（「极高危档强制常亮，永不递减」），
+    那条规矩防的是**真的灾难**被模型放掉。但 2026-11-26 真机：一晚
+    57 条 critical 里约 52 条是"目标被变量/通配符藏住"——我们并不知道
+    要删什么，却说它严重。B8 原话「不许拿【严重】冒充一个我们并不掌握的
+    事实」。用户原话：「这个根本不严重，它就只是正常的任务执行」。
+
+    所以：**critical 里"只因为说不清而严重"的那一类可以送审**
+    （``commands.opacity_is_the_only_reason``）。有真的危险目标在里面的
+    （`~` / 盘根 / 系统目录 / 工作区外）一律不给送审，规矩一格没让。
     """
-    return hit.severity in _REVIEWABLE_SEVERITIES
+    if hit.severity in _REVIEWABLE_SEVERITIES:
+        return True
+    if hit.severity != "critical":
+        return False
+    command = hit.command or hit.summary
+    return opacity_is_the_only_reason(command, hit.working_directory)
 
 
 def _broadcast_reviewer(config: dict[str, Any]) -> AutoReviewer | None:
