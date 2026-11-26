@@ -38,6 +38,7 @@ from .commands import (
     TIER_SCOPE_UNKNOWN,
     basename,
     command_length,
+    delete_command_bodies,
     delete_tier_for_command,
     severity_for_tier,
     simple_commands,
@@ -224,8 +225,15 @@ def match_delete(command: str) -> str | None:
     curl …）：`echo "rm -rf 是危险操作"` 每张卡都顶红字，用户会被训练成
     无脑点确认，最后闸门真的失效。命令主体不认识时照旧兜——
     漏判是隐形的，误报至少能在 summary 里看见。
+
+    2026-11-26：兜底扫描从"段内所有 token"收窄到"**命令位** token"
+    （``commands._command_position_tokens``）。原来那句只读代码
+    ``print('allow 里带 rm 的:')`` 里的 rm 让整条命令被判成删除，
+    目标再被 ``perm.get('allow',[])`` 里的 ``[]`` 顶成极高危——
+    一条【严重】播报，而 critical 永不递减。段首/帮助/打印类那三层
+    豁免都还在，收窄的只是"哪些 token 算被执行的命令"。
     """
-    for body in simple_commands(command):
+    for body, position in delete_command_bodies(command):
         if not body or _is_help_only(body[1:]):
             continue
 
@@ -239,7 +247,7 @@ def match_delete(command: str) -> str | None:
             return head
 
         if head not in PRINT_ONLY_COMMANDS:
-            for token in body:
+            for token in position:
                 name = basename(token)
                 if name in DELETE_TOKENS:
                     return name

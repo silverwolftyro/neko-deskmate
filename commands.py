@@ -481,17 +481,12 @@ def is_delete_command(command: str) -> bool:
 
     与 ``rules.match_delete`` 的区别：那个还要管帮助豁免、打印类排除，
     返回命中的词；这个只回答"是不是删除"，给档位抬档与排序用。
+
+    **与 ``_segment_has_delete`` 就是同一个函数**（``delete_targets``
+    调的那个）。2026-11-26 之前这里按 ``simple_commands``（已剥噪音）看、
+    那边按 ``_segments``（未剥）看，同一句"什么叫删除"开了两个入口。
     """
-    for body in simple_commands(command):
-        if not body:
-            continue
-        for left, right in DELETE_PAIRS:
-            if left in body and right in body:
-                return True
-        for token in body:
-            if basename(token) in DELETE_TOKENS:
-                return True
-    return False
+    return any(_segment_has_delete(segment) for segment in _segments(command))
 
 
 def delete_tier_for_command(command: str, working_directory: str | None) -> str:
@@ -934,6 +929,16 @@ def strip_heredocs(command: str) -> str:
     return "\n".join(keep)
 
 
+def _command_bodies(command: str) -> list[list[tuple[str, str]]]:
+    """按段切、剥段首噪音，**原文跟着一起留**。
+
+    ``simple_commands`` 的带原文版。为什么需要它：命令位判定要按原文追引号
+    开合，而归一化会把收尾引号 strip 掉——按归一化后的文本永远等不到闭合，
+    整条命令会被吃光（``_normalise_pairs`` 里那段注释说的就是这件事）。
+    """
+    return [_normalise_pairs(segment) for segment in _segments(command)]
+
+
 def simple_commands(command: str) -> list[list[str]]:
     """按 `;` `|` `&` 换行切段，每段再切 token **并剥掉段首噪音**。
 
@@ -944,8 +949,7 @@ def simple_commands(command: str) -> list[list[str]]:
     那样拿到的是已经丢过引号的 token，引号配对就断了，
     ``VAR="a b" rm -rf x`` 会被吃成空段（实测踩过）。
     """
-    return [[norm for _, norm in _normalise_pairs(segment)]
-            for segment in _segments(command)]
+    return [[norm for _, norm in body] for body in _command_bodies(command)]
 
 
 def _normalise_pairs(segment: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -981,6 +985,109 @@ def _normalise_pairs(segment: list[tuple[str, str]]) -> list[tuple[str, str]]:
     return out
 
 
+# 段里出现过这些词，说明后面的引号串是**要执行的代码**，里面的每个词都在命令位：
+#   bash -c "sudo rm -rf /"       → rm 是真删除
+#   ssh host "sudo rm -rf /x"     → 尾参数是远端命令
+#   docker exec c sh -c 'rm -rf /'
+# 不在这里的（python / node / echo / git / grep / print…），引号串是**数据**。
+#
+# **不能直接复用 ``_EXEC_WRAPPERS``**：python 也在那一组里，而
+# ``python -c "print('allow 里带 rm 的:')"`` 的 rm 只是要打印的字符。
+# 2026-11-26 真机实测：那句只读代码让插件播了一条【严重】删除文件——
+# 而 critical 是"强制常亮、永不递减"的那一档。区别在于 bash 跑的是 shell、
+# python 跑的是 Python，只有前者的字符串里每个词都是命令。
+_CODE_STRING_OWNERS = frozenset({
+    "bash", "sh", "dash", "zsh", "fish", "ksh", "csh", "tcsh",
+    "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
+    "busybox", "at",
+    # 在别处跑 shell 的：尾参数或 -c 后面那一整串都是命令
+    "ssh", "docker", "podman", "kubectl", "vagrant", "winrs", "psexec", "plink",
+})
+
+
+def _is_quoted_word(raw: str) -> bool:
+    """整个 token 就是一整段带引号的词：``'rm'`` / ``"rm"`` / ``'a b'``。
+
+    与"引号开了但没闭合"（``'rm``、``"sudo``）是两回事——后者是一长串
+    引号内容的开头，前者本身已经是一个完整的值。
+    """
+    text = str(raw or "")
+    return (len(text) >= 2 and text[0] in "\"'`"
+            and text[-1] == text[0] and text[0] not in text[1:-1])
+
+
+def _command_position_tokens(body: list[tuple[str, str]]) -> list[str]:
+    """段里**shell 真的会当命令执行**的 token（归一化形式）。
+
+    2026-11-26 之前，"这段里有删除动作吗"的答案是"任一个 token 的
+    basename 等于删除词"。后果不只是多一条播报，是档位被顶到极高危：
+
+    .. code-block::
+
+        print('allow 里带 rm 的:')          # 一句只读代码
+          → 判成删除段
+          → delete_targets 把 perm.get('allow',[]) 里的 [] 也当目标
+          → _target_hides_scope 说"作用域被 glob 藏住了"
+          → target_tier(unparseable=True) 直接给 EXTREME
+          → 【严重】播报，而 critical 永不递减
+
+    判据换成"这个 token 在不在命令位"：
+
+    - **引号内部往后都是数据**：``echo "please rm this"``、
+      ``print('allow 里带 rm 的:')`` 里的 rm 是要打印/匹配的字符。
+    - **非命令位的整词引号是值**：``grep 'rm' file``、``if 'rm' in x``、
+      ``['rm']`` 里的 rm 是被比较的字符串。
+    - **命令位例外**：``"rm" -rf x``、``xargs "rm" -rf`` 整词被引号包住，
+      shell 照样执行。判据是"它是不是剥掉包装词之后的段首"
+      （``_normalise_pairs`` 已把 sudo / xargs / 赋值 吃掉，
+        真正的命令词会落到 stripped[0]）——不是"它在第几位"。
+    - **代码串主人不豁免**：见 ``_CODE_STRING_OWNERS``。
+
+    方向仍然是"宁可多报"：``git commit -m "rm the file"`` 的引号串以删除词
+    开头，开头那个 token 在命令位，照旧算删除。
+
+    ``body`` 要传**未剥段首噪音**的段——``bash -c "…"`` 里的 bash
+    会被 ``_normalise_pairs`` 连 ``-c`` 一起剥掉，事后再看就分不出
+    那是 bash 的代码串还是别的。
+    """
+    stripped = _normalise_pairs(body)
+    command_raw = stripped[0][0] if stripped else ""
+    quote = ""
+    code_string = False
+    out: list[str] = []
+    for raw, norm in body or []:
+        if not quote and basename(norm) in _CODE_STRING_OWNERS:
+            code_string = True
+        if code_string:
+            out.append(norm)
+        elif quote:
+            pass                    # 引号内部：数据，不是命令
+        elif _is_quoted_word(raw) and raw != command_raw:
+            pass                    # 非命令位的整词引号：值，不是命令名
+        else:
+            out.append(norm)
+        quote = _advance_quote(quote, raw)
+    return out
+
+
+def delete_command_bodies(command: str) -> list[tuple[list[str], list[str]]]:
+    """逐段给出 **（剥噪音后的命令主体, 命令位 token）**。
+
+    ``rules.match_delete`` 与 ``commands.is_delete_command`` 共用这一份，
+    对"哪个 token 在命令位"给出同一个答案——2026-11-26 之前那两处
+    各写一遍，而且都写错了（见 ``_command_position_tokens``）。
+
+    一次 ``_segments`` 出两个结果：``match_delete`` 两个都要用
+    （主体管段首/帮助豁免，命令位管兜底扫描），分两次算会让 watcher
+    每 3 秒把同一条命令的切分工作做两遍。
+    """
+    out: list[tuple[list[str], list[str]]] = []
+    for segment in _segments(command):
+        out.append(([norm for _, norm in _normalise_pairs(segment)],
+                    _command_position_tokens(segment)))
+    return out
+
+
 def basename(token: str) -> str:
     """`/bin/rm` → `rm`，`C:\\Windows\\System32\\del` → `del`。
 
@@ -1000,7 +1107,16 @@ def basename(token: str) -> str:
 
 def _quote_state(text: str) -> str:
     """扫一遍，返回**还没闭合**的引号字符；全部闭合则返回空串。"""
-    quote = ""
+    return _advance_quote("", text)
+
+
+def _advance_quote(quote: str, text: str) -> str:
+    """带着已开的引号状态扫一段文本，返回扫完后**还没闭合**的引号。
+
+    ``_quote_state`` 是它从闭合状态起扫的特例。两个都要有：
+    ``_normalise_pairs`` 只知道"这段之后闭没闭合"，
+    而命令位判定需要知道"这个 token **进来之前**闭没闭合"。
+    """
     for char in str(text or ""):
         if quote:
             if char == quote:
@@ -1049,18 +1165,29 @@ def _segment_targets(segment: list[tuple[str, str]]) -> tuple[str, ...]:
 
 
 def _segment_has_delete(body: list[tuple[str, str]]) -> bool:
-    """这一段里有没有删除类动作。判据与 ``is_delete_command`` 逐字一致。
+    """这一段里有没有删除类动作。**全项目唯一的删除判据**——
 
-    **必须是同一套**：``match_delete`` / ``is_delete_command`` / 这里三处
-    对"什么叫删除"给出不同答案，就会出现"播报说这条是删除、档位说它不是"。
+    ``rules.match_delete`` 的兜底、``is_delete_command``、这里三处
+    对"什么叫删除"给出不同答案，就会出现"播报说这条是删除、
+    档位说它不是"。
+
+    ``body`` 要传**未剥段首噪音**的段（``_segments`` 的直接产物）：
+    命令位判定要看到剥掉之前的 ``bash -c``，理由见 ``_CODE_STRING_OWNERS``。
+
+    成对动作（``git clean`` / ``drop table``）按**剥噪音后相邻**判，
+    与 ``rules.match_delete`` 逐字相同：那边按 stripped body 判相邻，
+    这边若按命令位 token 判"都在"，``mysql -e "drop table users"``
+    就会一个说删、一个说不删（``table`` 在引号里，命令位没有它）。
     """
     if not body:
         return False
-    norms = [norm for _, norm in body]
+    stripped = [norm for _, norm in _normalise_pairs(body)]
     for left, right in DELETE_PAIRS:
-        if left in norms and right in norms:
-            return True
-    return any(basename(token) in DELETE_TOKENS for token in norms)
+        for i in range(len(stripped) - 1):
+            if stripped[i] == left and stripped[i + 1] == right:
+                return True
+    return any(basename(token) in DELETE_TOKENS
+               for token in _command_position_tokens(body))
 
 
 def delete_targets(command: str) -> tuple[str, ...]:
