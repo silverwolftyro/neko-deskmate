@@ -237,7 +237,7 @@ def test_failure_severity_reaches_priority() -> None:
 # 真实事故：DSH spawn 的 claude -p 删了文件，播报说「claude-code 删除」，
 # 用户第一反应是"我什么时候让 Claude 删东西了？"
 
-CWD = r"C:\Users\alpha\AppData\Local\Temp"
+CWD = r"C:\Users\someone\AppData\Local\Temp"
 
 
 def _hit(**overrides):

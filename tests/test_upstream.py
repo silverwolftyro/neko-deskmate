@@ -37,7 +37,7 @@ DSH_CHAIN = [
     {"name": "pwsh.exe",
      "path": r"C:\Windows\System32\WindowsPowerShell\v1.0\pwsh.exe"},
     {"name": "node.exe",
-     "path": r"C:\Users\alpha\AppData\Local\Programs\DeepSeek Harness\node.exe"},
+     "path": r"C:\Users\someone\AppData\Local\Programs\DeepSeek Harness\node.exe"},
 ]
 # B5 之后纯 shell 层在展示时被滤掉，所以这条链显示出来只剩 node 那个节点。
 DSH_RENDERED = "node.exe（DeepSeek Harness）"
@@ -114,7 +114,7 @@ def test_chain_is_capped() -> None:
 def test_friendly_name_does_not_match_a_desktop_path() -> None:
     """``desk`` 不许命中 ``Desktop``——那是误报，比没有友好名更糟。"""
     assert describe_upstream(
-        [{"name": "foo.exe", "path": r"C:\Users\alpha\Desktop\foo.exe"}]
+        [{"name": "foo.exe", "path": r"C:\Users\someone\Desktop\foo.exe"}]
     ) == "foo.exe"
 
 

@@ -97,7 +97,7 @@ GATEWAY_OK_ROW = {
     "latency_ms": 25482,
     "status_code": 200,
     "total_cost_usd": "0.01736922",
-    "session_id": "547ea690-abd2-47e3-a7f5-c8ddd0e96ccc",
+    "session_id": "11111111-2222-3333-4444-555555555555",
     "created_at": 1795193997,
     "error_message": None,
 }
@@ -357,7 +357,7 @@ def test_gateway_ok_row_is_turn_end() -> None:
     # claude-code，不归一的话 tracker 的 (agent, session) 桶键会把一个会话
     # 劈成两半（2026-11-24 真机验收 §4.3）。
     assert event.agent == AGENT_CLAUDE_CODE
-    assert event.session == "547ea690-abd2-47e3-a7f5-c8ddd0e96ccc"
+    assert event.session == "11111111-2222-3333-4444-555555555555"
     assert "step-5-preview" in event.summary
     assert "200" in event.summary
     assert "$0.0174" in event.summary
@@ -555,7 +555,7 @@ def test_attribute_user_declared_is_case_insensitive_on_windows() -> None:
 
 
 def test_attribute_unknown_when_no_evidence() -> None:
-    event = attribute(_event(working_directory=r"C:\Users\alpha\AppData\Local\Temp"))
+    event = attribute(_event(working_directory=r"C:\Users\someone\AppData\Local\Temp"))
     assert event.requester is None
     assert event.requester_evidence == EVIDENCE_NONE
     assert event.attribution == ATTRIBUTION_UNKNOWN
@@ -567,7 +567,7 @@ def test_attribute_does_not_guess_from_process_tree_or_entrypoint() -> None:
     真实事故就是 DSH spawn 的 claude -p——那种会话从转录里看
     和用户手开的没有任何区别。宁可一律未知，也不要升格启发式。
     """
-    event = _event(working_directory=r"C:\Users\alpha\AppData\Local\Temp")
+    event = _event(working_directory=r"C:\Users\someone\AppData\Local\Temp")
     assert attribute(event, mine_roots=[]).attribution == ATTRIBUTION_UNKNOWN
     # 就算是"看起来像用户开的目录"，没声明也一样是未知
     assert attribute(_event(working_directory=r"D:\workspace")).attribution == ATTRIBUTION_UNKNOWN

@@ -62,9 +62,9 @@ def test_a_five_layer_chain_shows_the_harness_node() -> None:
     """
     chain = [
         {"name": "bash.exe", "path": r"C:\Program Files\Git\bin\bash.exe"},
-        {"name": "claude.exe", "path": r"C:\Users\alpha\.local\bin\claude.exe"},
+        {"name": "claude.exe", "path": r"C:\Users\someone\.local\bin\claude.exe"},
         {"name": "node.exe",
-         "path": r"C:\Users\alpha\AppData\Local\Programs\DeepSeek Harness\node.exe"},
+         "path": r"C:\Users\someone\AppData\Local\Programs\DeepSeek Harness\node.exe"},
         {"name": "pwsh.exe", "path": r"C:\Windows\System32\WindowsPowerShell\v1.0\pwsh.exe"},
         {"name": "WindowsTerminal.exe", "path": r"C:\Windows\System32\WindowsTerminal.exe"},
     ]
@@ -135,7 +135,7 @@ def test_the_card_line_reflects_the_filtering() -> None:
     # 纯 shell 层整条被滤掉 → 上游未知（不是显示一个 cmd.exe）
     (r"C:\Windows\System32\cmd.exe", UPSTREAM_UNKNOWN),
     # 目录名误判：词是 desk 的**一部分**，不算命中
-    (r"C:\Users\alpha\Desktop\foo.exe", "foo.exe"),
+    (r"C:\Users\someone\Desktop\foo.exe", "foo.exe"),
     (r"C:\app\nodesk\foo.exe", "foo.exe"),
     (r"C:\app\mydsh\foo.exe", "foo.exe"),
     # 下划线 / 点 / 连字符都算分隔：三种写法的答案必须一致
