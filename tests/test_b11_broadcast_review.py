@@ -813,3 +813,70 @@ def test_the_reviewable_set_is_still_not_configurable() -> None:
 
     assert "critical" not in _REVIEWABLE_SEVERITIES
     assert set(_REVIEWABLE_SEVERITIES) == {"warn", "notice"}
+
+
+# ── 没有正面证据，就不顶着「严重」 ─────────────────────────────────────
+#
+# 2026-11-27 用户定调：「我倾向于不接受误报……这个事情应该可以接入
+# DeepSeek 所采用的自动审核的偏离 prompt 判断」。
+#
+# 「说不清」的 critical 是规则猜的，不是事实。模型问不出话来时那个猜测
+# 没有第二方确认，这时仍播——但不该再自称严重。
+
+
+def _hit_of(command: str) -> RuleHit:
+    hits = evaluate_delete_segments(command, agent="a", session="s",
+                                    source=SimpleNamespace(
+                                        requester="", requester_evidence="",
+                                        executor="", working_directory=WD,
+                                        session="s", tool="Bash"))
+    assert hits, command
+    return hits[0]
+
+
+@pytest.mark.parametrize("command", [
+    'rm -f "$MSG"',
+    'rm -rf "$TARGET"',
+])
+def test_an_unconfirmed_opacity_critical_is_downgraded(command: str) -> None:
+    """降档**不降可见性**：照旧播，但不再自称严重。"""
+    from plugin.plugins.agent_deskmate import _downgrade_unconfirmed_critical
+
+    hit = _downgrade_unconfirmed_critical(_hit_of(command))
+    assert hit.severity == "warn"
+    assert "说不清严重程度" in hit.summary      # 说得出为什么降
+
+
+@pytest.mark.parametrize("command", [
+    "rm -rf ~",
+    "rm -rf /",
+    "rm -rf D:/",
+    "rm -rf C:/Windows/System32",
+    "rm -rf D:/other/x",
+    "rm -rf ../..",
+    "rm -rf *",
+])
+def test_a_genuinely_dangerous_critical_is_never_downgraded(command: str) -> None:
+    """真有危险目标在里面的，是已知事实，不靠模型确认——一格不降。"""
+    from plugin.plugins.agent_deskmate import _downgrade_unconfirmed_critical
+
+    hit = _downgrade_unconfirmed_critical(_hit_of(command))
+    assert hit.severity == "critical", command
+
+
+def test_a_non_critical_hit_passes_through_untouched() -> None:
+    from plugin.plugins.agent_deskmate import _downgrade_unconfirmed_critical
+
+    original = _hit_of("rm -rf src")
+    assert original.severity == "warn"
+    assert _downgrade_unconfirmed_critical(original) is original
+
+
+def test_a_failed_review_downgrades_but_still_broadcasts() -> None:
+    """端到端：审查没成 → 降成 warn → **照旧播**，一条不漏。"""
+    host = _bind()()
+    batch = [_hit_of('rm -f "$MSG"')]
+    survivors = host.run(batch, _FakeReviewer(None, "审查超时（8s）"))
+    assert len(survivors) == 1                  # 没吞掉
+    assert survivors[0].severity == "warn"       # 但不自称严重
+    assert host._review_failed == 1

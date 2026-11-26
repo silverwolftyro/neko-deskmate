@@ -618,6 +618,29 @@ def _reviewable_broadcast(hit: RuleHit) -> bool:
     return opacity_is_the_only_reason(command, hit.working_directory)
 
 
+def _downgrade_unconfirmed_critical(hit: RuleHit) -> RuleHit:
+    """「说不清」的 critical 在没得到模型确认时降成 warn。
+
+    2026-11-27 用户定调：「我倾向于不接受误报」。**没有正面证据就不该
+    顶着「严重」**——那个档位是规则猜的（"目标被变量藏住了"），不是事实。
+
+    降档**不降可见性**：照旧播、照旧上屏，用户少看到一个红字，
+    不会少知道一件事。summary 里补一句实话，让它看得出为什么降。
+
+    真有危险目标在里面的（`~` / 盘根 / 系统目录 / 工作区外）原样返回——
+    那是已知事实，不靠模型确认。
+    """
+    if hit.severity != "critical":
+        return hit
+    command = hit.command or hit.summary
+    if not opacity_is_the_only_reason(command, hit.working_directory):
+        return hit
+    return hit.model_copy(update={
+        "severity": "warn",
+        "summary": hit.summary + "；模型没审成，说不清严重程度，按警告处理",
+    })
+
+
 def _broadcast_reviewer(config: dict[str, Any]) -> AutoReviewer | None:
     """按配置造 B11 的审查客户端。**没配 / 没开 / 缺东西都返回 None**。
 
@@ -1627,7 +1650,21 @@ class AgentDeskmatePlugin(NekoPluginBase):
         if survives is None:
             self.logger.info("审查没成（问了 %d 遍），%d 条照旧播：%s",
                              attempts, len(batch), detail or "未知")
-            survivors = list(batch)
+            # **没有正面证据就不顶着「严重」。**
+            #
+            # 2026-11-27 用户定调：「我倾向于不接受误报……这个事情应该可以
+            # 接入 DeepSeek 所采用的自动审核的偏离 prompt 判断」。
+            #
+            # 「说不清」的 critical 是规则猜的，不是事实。模型问不出话来
+            # （超时 / 连不上 / 三遍都答歪）时，那个猜测就没有第二方确认，
+            # 这时仍播——**但不该再自称严重**。降成 warn，照旧上屏，
+            # 用户少看到一个红字，不会少知道一件事。
+            #
+            # 只降"严重 solely 来自说不清"的那一类。真有危险目标在里面的
+            # （`~` / 盘根 / 系统目录 / 工作区外）是已知事实，不靠模型确认，
+            # 一格不降——「极高危档强制常亮，永不递减」防的就是它们。
+            survivors = [_downgrade_unconfirmed_critical(hit)
+                         for hit in batch]
             self._review_failed += len(batch)
         else:
             survivors = [hit for hit, keep in zip(batch, survives) if keep]
