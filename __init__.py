@@ -820,6 +820,9 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._review_submitted = 0
         self._review_suppressed = 0
         self._review_failed = 0
+        # 实际问模型的遍数。**单独一个计数器**：它高说明模型在格式上很挣扎，
+        # 是该换模型还是该简化 prompt 的直接依据；混在 failed 里看不出来。
+        self._review_attempts = 0
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     # startup 用 async def、shutdown 用 def，刻意对齐官方 memo_reminder 的写法：
@@ -1479,23 +1482,27 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 "facts": _facts_for_hit(hit),
             })
         try:
-            survives, detail = reviewer.review_batch(items=items)
+            survives, detail, attempts = reviewer.review_batch(items=items)
         except Exception as exc:            # noqa: BLE001 —— 见文档字符串
-            survives, detail = None, f"审查抛异常（{type(exc).__name__}）"
+            survives, detail, attempts = None, f"审查抛异常（{type(exc).__name__}）", 0
+        # 重试次数单独记：它高说明模型在格式上很挣扎，是该换模型还是该
+        # 简化 prompt 的直接依据。混在 failed 里看不出来。
+        self._review_attempts += attempts
         if survives is None:
-            self.logger.info("审查没成，%d 条照旧播：%s", len(batch), detail or "未知")
+            self.logger.info("审查没成（问了 %d 遍），%d 条照旧播：%s",
+                             attempts, len(batch), detail or "未知")
             survivors = list(batch)
             self._review_failed += len(batch)
         else:
             survivors = [hit for hit, keep in zip(batch, survives) if keep]
             dropped = len(batch) - len(survivors)
             self._review_suppressed += dropped
-            self.logger.info("审查完成：%d 条不播，%d 条照旧播（累计压掉 %d）",
-                             dropped, len(survivors), self._review_suppressed)
+            self.logger.info("审查完成（问了 %d 遍）：%d 条不播，%d 条照旧播"
+                             "（累计压掉 %d）", attempts, dropped, len(survivors),
+                             self._review_suppressed)
         for hit in survivors:
             self._review_survivors.put(hit)
         return survivors
-
     @timer_interval(id="watch", seconds=3)
     async def watch_tick(self, **_):
         """每 3 秒扫一次观测源。
@@ -2071,6 +2078,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 "submitted": self._review_submitted,
                 "suppressed": self._review_suppressed,
                 "failed": self._review_failed,
+                "attempts": self._review_attempts,
             },
             authorized_scopes=scopes,
             explain_verbosity=str(approval_cfg.get("explain_verbosity") or "brief"),

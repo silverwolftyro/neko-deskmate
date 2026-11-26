@@ -709,8 +709,10 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                 defaultValue:
                   "Any hiccup broadcasts as usual: no key, cannot reach the"
                   + " model, malformed answer, or a \"medium\"/\"high\""
-                  + " verdict — all treated as \"no review happened\". Only"
-                  + " an explicit \"low risk + need not say\" suppresses. So"
+                  + " verdict — all treated as \"no review happened\". A"
+                  + " malformed answer is asked again as-is, up to 3 tries;"
+                  + " if all 3 fail the items broadcast as usual. Only an"
+                  + " explicit \"low risk + need not say\" suppresses. So"
                   + " turning it on never turns something that should be said"
                   + " into silence.",
               })}
@@ -720,7 +722,8 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                 {t("panel.settings.broadcast_review_stats", {
                   defaultValue:
                     "Since this start: {submitted} sent,"
-                    + " {suppressed} dropped, {failed} not reviewed.",
+                    + " {suppressed} dropped, {failed} not reviewed,"
+                    + " {attempts} model calls in total.",
                   submitted: String(
                     (state.broadcast_review_stats || {}).submitted || 0,
                   ),
@@ -729,6 +732,9 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                   ),
                   failed: String(
                     (state.broadcast_review_stats || {}).failed || 0,
+                  ),
+                  attempts: String(
+                    (state.broadcast_review_stats || {}).attempts || 0,
                   ),
                 })}
               </Text>

@@ -141,6 +141,7 @@ class WatcherHost:
         self._review_submitted = 0
         self._review_suppressed = 0
         self._review_failed = 0
+        self._review_attempts = 0
         self._advice_pool = None
 
 

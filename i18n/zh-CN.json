@@ -113,7 +113,7 @@
   "panel.settings.broadcast_review_help": "开着的时候，【警告】和【提示】两档会先送模型问一句「这事值不值得说」。它认为不值一提的就不再播，其余的照旧播。【严重】永远不送审。",
   "panel.settings.broadcast_review_scope": "压制的只有【警告】和【提示】。【严重】一条不动——删到家目录、删到工作区外、目标说不清的，照样整行红字。",
   "panel.settings.broadcast_review_cost": "要填 API key 才能用：送审走你自己的模型端点，每一批最多 5 条、每条一次请求。填了 key 的日常情况下，agent 在自己项目里清理这类不值一提的播报大部分会被压掉，不用你一条条点过去。没有 key 这条路整个不存在，播报照旧。",
-  "panel.settings.broadcast_review_failopen": "任何岔子都照旧播：没填 key、连不上模型、答得不像样、它判「中等」或「高风险」——全部当没审过。只有它明确说「低风险 + 可以不说」才不播。所以开着它不会让该说的变成不说。",
-  "panel.settings.broadcast_review_stats": "本次启动以来：送审 {submitted} 条，压掉 {suppressed} 条，没审成 {failed} 条。",
+  "panel.settings.broadcast_review_failopen": "任何岔子都照旧播：没填 key、连不上模型、答得不像样、它判「中等」或「高风险」——全部当没审过。答得不像样时会按原样再问，最多 3 遍；3 遍都答不齐就放弃，那几条照旧播。只有它明确说「低风险 + 可以不说」才不播。所以开着它不会让该说的变成不说。",
+  "panel.settings.broadcast_review_stats": "本次启动以来：送审 {submitted} 条，压掉 {suppressed} 条，没审成 {failed} 条，一共问了模型 {attempts} 遍。",
   "panel.settings.broadcast_review_need_key": "没填 API key，用不了——送审走你自己的模型端点。去下面填 key，日常那些不值一提的播报就能大部分压掉。"
 }

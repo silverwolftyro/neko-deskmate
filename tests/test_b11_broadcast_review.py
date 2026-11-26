@@ -200,14 +200,17 @@ def test_batch_is_capped() -> None:
 def test_unconfigured_reviewer_reports_failure(kwargs) -> None:
     """没开 / 缺 key / 缺 base_url / 缺 model → survives 是 None。"""
     reviewer = _reviewer(**kwargs)
-    survives, detail = reviewer.review_batch(items=[{"command": "rm -rf x"}])
+    survives, detail, attempts = reviewer.review_batch(
+        items=[{"command": "rm -rf x"}])
     assert survives is None
     assert detail
+    # 没配好时一遍都不问——那不是模型答歪，是根本不该发请求
+    assert attempts == 0
 
 
 def test_empty_batch_is_a_noop() -> None:
-    survives, detail = _reviewer().review_batch(items=[])
-    assert survives == [] and detail == ""
+    survives, detail, attempts = _reviewer().review_batch(items=[])
+    assert survives == [] and detail == "" and attempts == 0
 
 
 # ── 范围：critical 永远不送审 ────────────────────────────────────────────
@@ -265,14 +268,15 @@ def test_the_reviewable_set_is_not_configurable() -> None:
 class _FakeReviewer:
     """不发起网络，直接给结论。``survives`` 为 None 模拟"审查没成"。"""
 
-    def __init__(self, survives, detail: str = "") -> None:
+    def __init__(self, survives, detail: str = "", attempts: int = 1) -> None:
         self.survives = survives
         self.detail = detail
+        self.attempts = attempts
         self.seen: list[dict] = []
 
     def review_batch(self, *, items):
         self.seen.extend(items)
-        return self.survives, self.detail
+        return self.survives, self.detail, self.attempts
 
 
 class _Host:
@@ -290,6 +294,7 @@ class _Host:
         self._review_submitted = 0
         self._review_suppressed = 0
         self._review_failed = 0
+        self._review_attempts = 0
 
     def run(self, batch, reviewer):
         return self._run_review_batch(batch, reviewer)
@@ -375,6 +380,19 @@ def test_a_reviewer_that_raises_broadcasts_everything() -> None:
     batch = [_hit("rm -rf src")]
     assert host.run(batch, _Boom()) == batch
     assert host._review_survivors.items == batch
+    assert host._review_attempts == 0        # 抛异常时没有遍数可记
+
+
+def test_the_attempt_count_is_tracked_separately() -> None:
+    """重试遍数单独记——它高说明模型在格式上很挣扎。
+
+    混在 failed 里看不出来：一批 5 条问 3 遍，failed 是 5 还是 15？
+    两个数回答的是不同问题（"压掉了多少" vs "模型多难伺候"）。
+    """
+    host = _bind()()
+    host.run([_hit("rm -rf src")], _FakeReviewer(None, "3 次都不合规", attempts=3))
+    assert host._review_failed == 1
+    assert host._review_attempts == 3
 
 
 def test_the_prompt_gets_the_full_command_not_the_clipped_summary() -> None:
@@ -445,3 +463,135 @@ def test_broadcast_after_coalescing_still_goes_out() -> None:
     outcome = broadcaster.broadcast(kept, already_coalesced=True)
     assert outcome == "sent"
     assert len(pushed) == 1
+
+
+# ── 重试：「偏离就继续审查」 ─────────────────────────────────────────────
+#
+# 用户提的：「遵从 prompt 的情况下允许，偏离就继续审查」。
+# 这里钉三件事：① 偏离会重试；② 重试**不放宽**严格性；
+# ③ 链路失败不重试（那不是模型答歪，是接不上）。
+
+
+class _StubTransport:
+    """替掉 ``_post``，按脚本返回 ``(正文, 错误)``。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt, *, system, max_tokens):
+        self.prompts.append(prompt)
+        return self.script.pop(0) if self.script else ("", "脚本用尽了")
+
+
+def _reviewer_with(monkeypatch, script):
+    reviewer = _reviewer()
+    transport = _StubTransport(script)
+    monkeypatch.setattr(reviewer, "_post", transport)
+    return reviewer, transport
+
+
+ITEMS = [{"command": "rm -rf build", "cwd": WD, "rule": "delete",
+          "severity": "warn", "matched": "rm", "facts": "build：目录"}]
+
+
+def test_a_deviating_answer_is_retried(monkeypatch) -> None:
+    """答歪一次 → 按原样再问，第二次答对就用第二次的。"""
+    reviewer, transport = _reviewer_with(monkeypatch, [
+        ("好的，结果如下：" + _verdicts((0, "low", "allow")), ""),   # 多说了句话
+        (_verdicts((0, "low", "allow")), ""),                        # 第二次合规
+    ])
+    survives, detail, attempts = reviewer.review_batch(items=ITEMS)
+    assert survives == [False]
+    assert detail == ""
+    assert attempts == 2
+    assert len(transport.prompts) == 2
+
+
+def test_the_retry_prompt_carries_a_correction(monkeypatch) -> None:
+    """重试的 prompt 必须带纠正说明，否则只是把同一个问题再问一遍。"""
+    reviewer, transport = _reviewer_with(monkeypatch, [
+        ("```json\n" + _verdicts((0, "low", "allow")) + "\n```", ""),
+        (_verdicts((0, "low", "allow")), ""),
+    ])
+    reviewer.review_batch(items=ITEMS)
+    assert "上一次的回答不合规" in transport.prompts[1]
+    # 第一次不带纠正说明
+    assert "上一次的回答不合规" not in transport.prompts[0]
+
+
+def test_retrying_does_not_loosen_the_parser(monkeypatch) -> None:
+    """**重试不放宽严格性**：三遍都答歪 → 照旧播，不替它抠 JSON。
+
+    这是本次改动最容易被做错的地方：为了"让重试有用"而顺手加一点容错，
+    就等于把"模型多说一句话"变成能改变结果的口子。
+    """
+    reviewer, transport = _reviewer_with(monkeypatch, [
+        ("好的，" + _verdicts((0, "low", "allow")), ""),
+        ("```\n" + _verdicts((0, "low", "allow")) + "\n```", ""),
+        ("我觉得这条可以说：" + _verdicts((0, "low", "allow")), ""),
+    ])
+    survives, detail, attempts = reviewer.review_batch(items=ITEMS)
+    assert survives is None
+    assert attempts == 3
+    assert "3 次都不合规" in detail
+    assert len(transport.prompts) == 3
+
+
+@pytest.mark.parametrize("error", [
+    "审查超时（8s）",
+    "HTTP 401",
+    "审查网络失败：Connection refused",
+    "审查响应不是 JSON",
+    "审查响应里没有正文",
+])
+def test_a_transport_failure_is_not_retried(monkeypatch, error: str) -> None:
+    """链路失败不重试：那不是模型答歪，再问三遍只是让用户多等 24 秒。"""
+    reviewer, transport = _reviewer_with(monkeypatch, [("", error)])
+    survives, detail, attempts = reviewer.review_batch(items=ITEMS)
+    assert survives is None
+    assert attempts == 1
+    assert error in detail
+    assert len(transport.prompts) == 1
+
+
+def test_a_retry_that_succeeds_reports_the_attempt_count(monkeypatch) -> None:
+    """第二遍就对时，attempts 记 2——面板据此看出模型多难伺候。"""
+    reviewer, _ = _reviewer_with(monkeypatch, [
+        (_verdicts((0, "high", "allow")), ""),      # 不合法组合
+        (_verdicts((0, "medium", "deny")), ""),     # 合规，且不压制
+    ])
+    survives, detail, attempts = reviewer.review_batch(items=ITEMS)
+    assert survives == [True]
+    assert attempts == 2
+
+
+def test_the_retry_note_names_the_exact_contract(monkeypatch) -> None:
+    """纠正提示要说清格式要求，不能只说"你答错了"。"""
+    from plugin.plugins.agent_deskmate.auto_review import _RETRY_NOTE
+
+    note = _RETRY_NOTE.format(count=5)
+    assert "verdicts" in note and "5" in note
+    assert "low" in note and "high" in note
+    assert "markdown" in note
+
+
+def test_the_prompt_shows_an_example_of_the_exact_shape() -> None:
+    """系统提示里带输出样例——第一遍就答对才是主要杠杆，重试只是安全网。"""
+    from plugin.plugins.agent_deskmate.auto_review import REVIEW_BATCH_SYSTEM_PROMPT
+
+    assert '"i":0' in REVIEW_BATCH_SYSTEM_PROMPT
+    assert "输出样例" in REVIEW_BATCH_SYSTEM_PROMPT
+    # 样例本身必须是合法的（否则是教模型答歪）
+    import re
+    sample = REVIEW_BATCH_SYSTEM_PROMPT.split("输出样例")[1]
+    match = re.search(r'\{"verdicts":.*\}', sample)
+    assert match is not None
+    assert parse_batch_review(match.group(0), 3) == [False, True, True]
+
+
+def test_attempts_are_bounded() -> None:
+    """重试次数必须有硬顶，否则一次坏端点能让 survivor 永远不到。"""
+    from plugin.plugins.agent_deskmate.auto_review import REVIEW_BATCH_ATTEMPTS
+
+    assert REVIEW_BATCH_ATTEMPTS == 3

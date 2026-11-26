@@ -202,6 +202,7 @@ class _Host:
         self._review_submitted = 0
         self._review_suppressed = 0
         self._review_failed = 0
+        self._review_attempts = 0
         # 这些测试不送审：没有 reviewer（_broadcast_reviewer 返回 None），
         # 所以 _maybe_submit_review 直接返回。_advice_pool 留着 None 即可。
         self._advice_pool = None

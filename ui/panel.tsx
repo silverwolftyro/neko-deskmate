@@ -690,6 +690,8 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                 defaultValue:
                   "任何岔子都照旧播：没填 key、连不上模型、答得不像样、"
                   + "它判「中等」或「高风险」——全部当没审过。"
+                  + "答得不像样时会按原样再问，最多 3 遍；3 遍都答不齐"
+                  + "就放弃，那几条照旧播。"
                   + "只有它明确说「低风险 + 可以不说」才不播。"
                   + "所以开着它不会让该说的变成不说。",
               })}
@@ -699,7 +701,8 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                 {t("panel.settings.broadcast_review_stats", {
                   defaultValue:
                     "本次启动以来：送审 {submitted} 条，"
-                    + "压掉 {suppressed} 条，没审成 {failed} 条。",
+                    + "压掉 {suppressed} 条，没审成 {failed} 条，"
+                    + "一共问了模型 {attempts} 遍。",
                   submitted: String(
                     (state.broadcast_review_stats || {}).submitted || 0,
                   ),
@@ -708,6 +711,9 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                   ),
                   failed: String(
                     (state.broadcast_review_stats || {}).failed || 0,
+                  ),
+                  attempts: String(
+                    (state.broadcast_review_stats || {}).attempts || 0,
                   ),
                 })}
               </Text>
