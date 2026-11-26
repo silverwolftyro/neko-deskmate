@@ -745,10 +745,16 @@ def broadcast_notice(push: Callable[..., dict], notice: Notice, *, source: str,
     但 ``Notice.detail`` 将来会装 ``WAITING`` 的自由文本理由——等
     ``PendingApproval → WAITING`` 桥接上之前，**必须先在桥接处过 redact()**，
     否则 agent 的等待理由能把任何东西带出来。见任务书待办。
+
+    **成功也打一行 INFO**（2026-11-26 补）。此前只有失败才打日志，于是
+    "跑完提醒到底响没响"在日志里无法回答——真机上用户说没看到提醒，
+    而我 grep 遍日志只能得出"没有记录"，分不清是没播还是播了没痕迹。
+    规则层的 ``Broadcaster.broadcast`` 一向有成功日志，通知层没有，
+    两层可观测性不一样。这一行让通知层和规则层对齐。
     """
     text = "\n".join(notice.lines())
     key = _light_key(notice.light)
-    return push_text(
+    outcome = push_text(
         push, text,
         source=source,
         priority=NOTICE_PRIORITY.get(key, 5),
@@ -760,6 +766,15 @@ def broadcast_notice(push: Callable[..., dict], notice: Notice, *, source: str,
         # 只给删除类开 speak 会得到一个半成品。
         ai_behavior=ai_behavior,
     )
+    if outcome == "sent":
+        # 通知的第一行就是 headline（谁、怎么了），detail 是第二行。
+        # 两行都落——detail 里有"第几轮、共几步、用了什么"，
+        # 那正是判断"跑完提醒有没有真的带信息"的依据。
+        # ``ai_behavior`` 也落：``respond`` 才是"她开口了"，
+        # ``blind`` 只上文字。没有这一项就分不清"说了"和"写了"。
+        logger.info("已播通知 [{}/{}] {}（{}）", key, ai_behavior,
+                    notice.headline, for_log(text, log_commands=True))
+    return outcome
 
 
 # ── 让她「念」台词（2026-11-26，手法照抄侦查笔记结论 5） ──────────────────

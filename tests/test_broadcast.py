@@ -15,6 +15,7 @@ from plugin.plugins.agent_deskmate.broadcast import (
     RESPOND_COOLDOWN,
     Broadcaster,
     NoticeMerger,
+    broadcast_notice,
     coalesce_same_workspace,
     for_log,
     priority_for,
@@ -1139,3 +1140,48 @@ def test_force_does_not_disturb_the_plain_path():
     b = Broadcaster(RecordingPush(), FakeLogger(), source="s", speak=False)
     b.resolve_ai_behavior(now=1000.0, force=True)
     assert b.resolve_ai_behavior(now=1100.0) == "blind"
+
+
+def test_a_successful_notice_leaves_a_log_line():
+    """**通知层也要可观测**——此前只有失败才打日志。
+
+    2026-11-26 真机：用户说跑完提醒没响，而我 grep 遍日志只能得出
+    "没有记录"，分不清是没播、还是播了没痕迹。规则层的
+    ``Broadcaster.broadcast`` 一向有成功日志，通知层没有——
+    两层可观测性不一样，而排查的人只有日志可看。
+
+    这一行同时带 ``ai_behavior``：``respond`` 才是"她开口了"，
+    ``blind`` 只上文字。没有这一项就分不清"说了"和"写了"。
+    """
+    from plugin.plugins.agent_deskmate.progress import Role
+    from plugin.plugins.agent_deskmate.tracker import Notice
+
+    logger = FakeLogger()
+    notice = Notice(role=Role.BOUNDARY, light=Light.IDLE, agent="a",
+                    session="s", who="claude-code",
+                    headline="claude-code 这一轮跑完了",
+                    detail="第 1 轮，共 3 步（Bash 2 次）",
+                    at=1000.0, fingerprint="f")
+    assert broadcast_notice(RecordingPush(), notice, source="s",
+                            logger=logger, ai_behavior="respond") == "sent"
+    lines = [text for _level, text in logger.lines if "已播通知" in text]
+    assert len(lines) == 1
+    assert "respond" in lines[0]
+    assert "这一轮跑完了" in lines[0]
+    assert "Bash 2 次" in lines[0]
+
+
+def test_a_blind_notice_says_so_in_the_log():
+    """没 key 时降级成 blind，日志要能看出来——否则会以为她说话了。"""
+    from plugin.plugins.agent_deskmate.progress import Role
+    from plugin.plugins.agent_deskmate.tracker import Notice
+
+    logger = FakeLogger()
+    notice = Notice(role=Role.BOUNDARY, light=Light.IDLE, agent="a",
+                    session="s", who="claude-code",
+                    headline="claude-code 这一轮跑完了",
+                    detail="第 1 轮，共 3 步", at=1000.0, fingerprint="f")
+    broadcast_notice(RecordingPush(), notice, source="s", logger=logger,
+                     ai_behavior="blind")
+    assert any("blind" in text
+               for _level, text in logger.lines if "已播通知" in text)
