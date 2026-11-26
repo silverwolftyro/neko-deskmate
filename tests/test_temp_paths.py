@@ -46,7 +46,10 @@ from plugin.plugins.agent_deskmate.commands import (
     target_unparseable,
     tier_for_command,
 )
-from plugin.plugins.agent_deskmate.rules import evaluate_delete
+from plugin.plugins.agent_deskmate.rules import (
+    evaluate_delete,
+    evaluate_delete_segments,
+)
 
 WD = r"D:\workspace\proj"
 BS = chr(92)
@@ -211,3 +214,85 @@ def test_the_fourth_false_positive_does_not_come_back() -> None:
 def test_temp_and_a_real_target_in_one_command() -> None:
     """一条命令删两个路径，取最坏的一档——临时目录不许把真目标一起降了。"""
     assert _tier("rm -rf %TEMP% D:/other/x") == TIER_EXTREME
+
+
+# ── 同命令赋值：变量不再一律顶成极高危 ─────────────────────────────────
+#
+# 2026-11-26 真机：`MSG=/tmp/x && … && rm -f "$MSG"` 被判【严重】，
+# 而这一类占 critical 播报的绝大多数——几乎全是脚本清理自己的临时文件。
+# 用户原话：「其中很大部分还是误报，根本就没必要报告的事情」。
+#
+# 赋值就在同一条命令里写着，读它不是猜。**只读字面值**：
+# 值自身要替换的（`$(mktemp)` / `$HOME`）一律不读，照旧按最坏的猜。
+
+
+def _sev(command: str) -> str:
+    hit = evaluate_delete(command, agent="a", session="s")
+    return hit.severity if hit else "不命中"
+
+
+def test_a_literal_assignment_downgrades_a_variable_target() -> None:
+    """``MSG=/tmp/x && rm -f "$MSG"`` → notice，不是 critical。"""
+    assert _sev('MSG=/tmp/x && git commit -F "$MSG" && rm -f "$MSG"') == "notice"
+
+
+def test_braced_reference_is_expanded_too() -> None:
+    assert _sev('MSG=/tmp/x && rm -rf "${MSG}"') == "notice"
+
+
+def test_a_substituting_value_is_never_read() -> None:
+    """值自身要替换 → 我们不知道它是什么 → 照旧最坏。
+
+    ``MSG=$(mktemp)`` 展开成什么只有 shell 知道；猜一个值比不猜危险。
+    """
+    assert _sev('MSG=$(mktemp) && rm -rf "$MSG"') == "critical"
+    assert _sev('X=$(rm -rf /) && rm -rf "$X"') == "critical"
+    assert _sev('MSG=$HOME && rm -rf "$MSG"') == "critical"
+
+
+def test_a_resolved_dangerous_target_stays_dangerous() -> None:
+    """展开出来是危险的，一样顶格——读取赋值不是放水。"""
+    assert _sev('MSG=/ && rm -rf "$MSG"') == "critical"
+    assert _sev('MSG=/etc && rm -rf "$MSG/passwd"') == "critical"
+    # 展开之后再逃逸：归一化会把它折回 /etc
+    assert _sev('MSG=/tmp && rm -rf "$MSG/../../etc"') == "critical"
+
+
+def test_an_unset_variable_stays_unparseable() -> None:
+    """换不出来就原样留下，随后按"藏住了"判——方向是安全的。"""
+    assert _sev('rm -rf "$UNSET"') == "critical"
+
+
+def test_one_unresolvable_target_keeps_the_whole_command_dangerous() -> None:
+    """多个目标里有一个说不清，整条就说不清（与 target_tier 取最坏同向）。"""
+    assert _sev('MSG=/tmp/a && rm -rf "$MSG" "$UNSET"') == "critical"
+
+
+def test_variable_names_are_case_sensitive() -> None:
+    """shell 的 ``$msg`` 与 ``$MSG`` 是两个变量。宽松匹配会误放水。"""
+    assert _sev('MSG=/tmp/a && rm -rf "$msg"') == "critical"
+
+
+def test_the_displayed_summary_keeps_the_original_text() -> None:
+    """定档用展开后的文本，**展示用原文**——用户要确认的是自己敲的那行。"""
+    hit = evaluate_delete('MSG=/tmp/x && rm -f "$MSG"', agent="a", session="s")
+    assert hit is not None
+    assert hit.severity == "notice"
+    # 目标仍是 ``"$MSG"``，没有被替换成 ``/tmp/x``
+    assert hit.summary.endswith('rm -f "$MSG"')
+    assert '"/tmp/x"' not in hit.summary
+
+
+def test_the_assignment_may_live_in_another_segment() -> None:
+    """**真机那个形状**：赋值在段 0，删除在段 N，逐段判也要能看见它。
+
+    0.6.16 只在 ``delete_targets`` 内部展开，而 ``evaluate_delete_segments``
+    是按段定档的——段 N 看不见段 0 的赋值，于是照样顶 critical。
+    """
+    command = ('MSG=/tmp/neko-commit-msg.txt && cat > "$MSG" <<\'EOF\'\n'
+               'body\nEOF\n'
+               'git commit -F "$MSG" | tail -3 && rm -f "$MSG"')
+    hits = evaluate_delete_segments(command, agent="a", session="s")
+    assert hits, "这条命令里有一个删除段"
+    assert [h.severity for h in hits] == ["notice"]
+    assert 'rm -f "$MSG"' in hits[0].summary

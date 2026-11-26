@@ -514,7 +514,17 @@ _SYSTEM_DIRS = (
 
 
 def _is_system_path(target: str) -> bool:
-    lowered = target.lower().replace("/", "\\")
+    # **必须用 ``_norm`` 归一化后再比**（2026-11-27 修）。
+    #
+    # 老实现直接 `target.lower().replace("/", "\\")`，于是
+    # `/tmp/../../etc` 比不出来——它折起来是 `\etc`（系统目录），
+    # 而原始串是 `\tmp\..\..\etc`，不以任何系统前缀开头。
+    #
+    # 这个洞一直都在，只是够不到：那种形状以前会被变量藏着
+    # （`MSG=/tmp && rm -rf "$MSG/../../etc"` → 判"目标藏住了" → EXTREME），
+    # 所以看不出问题。同命令赋值展开之后它就露出来了——**修一个洞
+    # 会露出下一个洞，所以每个"更聪明"的改动都要往危险方向回归一遍**。
+    lowered = _norm(target)
     return any(lowered.startswith(prefix.replace("/", "\\"))
                for prefix in _SYSTEM_DIRS)
 
@@ -1236,11 +1246,78 @@ def delete_targets(command: str) -> tuple[str, ...]:
     ``D:/other/x.txt`` 不能变成 ``d:/other/x.txt``。
     """
     found: list[str] = []
+    assignments = _literal_assignments(command)
     for segment in _segments(command):
         if not _segment_has_delete(segment):
             continue
-        found.extend(_segment_targets(segment))
+        for target in _segment_targets(segment):
+            found.append(_expand_literals(target, assignments))
     return tuple(found)
+
+
+# ``$VAR`` / ``${VAR}`` / ``%VAR%`` 三种引用形态。
+# 只认"合法的 shell 标识符"——``$1`` / ``$@`` 这类位置参数不认，
+# 它们的值我们永远不知道。
+_VAR_REF_RE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}"
+    r"|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+    r"|%(?P<pct>[A-Za-z_][A-Za-z0-9_]*)%")
+
+
+def _literal_assignments(command: str) -> dict[str, str]:
+    """同一条命令里的 ``VAR=字面值`` 赋值。**只收不含替换的值**。
+
+    shell 脚本的惯用形状是"先赋值、再用"::
+
+        MSG=/tmp/x && git commit -F "$MSG" && rm -f "$MSG"
+
+    老实现看到 ``rm -f "$MSG"`` 判定"目标被变量藏住了"→
+    ``target_tier(unparseable=True)`` 直接给 EXTREME → 【严重】播报。
+    2026-11-26 真机：这一类占 critical 播报的绝大多数，而它们几乎全是
+    脚本清理自己的临时文件。**"永不递减"的那一档被耗光了**——
+    用户原话：「其中很大部分还是误报，根本就没必要报告的事情」。
+
+    赋值就在同一条命令里写着，读它不是猜。
+
+    **只收字面值**：值里含 ``$`` / 反引号 / ``%NAME%`` 的一律不收——
+    那说明值本身要从别处取，我们不知道它是什么，按最坏的猜
+    （与 ``_target_hides_scope`` 同一条理由）。``X=$(rm -rf /)`` 这类
+    因此仍然落 EXTREME。
+    """
+    out: dict[str, str] = {}
+    for segment in _segments(command):
+        for raw, _norm in segment:
+            if not is_assignment(raw):
+                continue
+            name, _, value = raw.partition("=")
+            name = name.strip()
+            value = value.strip().strip("\"'")
+            if not name or not value:
+                continue
+            if _SUBSTITUTION_RE.search(value):
+                continue          # 值自身要替换 → 我们不知道它是什么
+            out[name] = value
+    return out
+
+
+def _expand_literals(target: str, assignments: dict[str, str]) -> str:
+    """把目标里的 ``$VAR`` / ``${VAR}`` / ``%VAR%`` 换成已知字面值。
+
+    换不出来就**原样返回**——调用方随后会按"藏住了"判，方向是安全的
+    （漏判才危险，多判只是吵）。
+
+    **大小写敏感**：shell 的 ``$msg`` 与 ``$MSG`` 是两个变量。
+    宽松匹配会把一条本来无害的命令（``$msg`` 展开成空）误判成已知路径，
+    也可能把危险的误判成安全的——严格才是对的。
+    """
+    if not assignments:
+        return target
+
+    def _sub(match: "re.Match[str]") -> str:
+        name = match.group("braced") or match.group("bare") or match.group("pct")
+        return assignments.get(name, match.group(0))
+
+    return _VAR_REF_RE.sub(_sub, str(target or ""))
 
 
 def _looks_like_path(token: str) -> bool:

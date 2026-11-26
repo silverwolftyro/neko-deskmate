@@ -36,6 +36,8 @@ from .commands import (
     DELETE_TOKENS,
     PRINT_ONLY_COMMANDS,
     TIER_SCOPE_UNKNOWN,
+    _expand_literals,
+    _literal_assignments,
     basename,
     command_length,
     delete_command_bodies,
@@ -280,14 +282,26 @@ def evaluate_delete_segments(command: str, *, agent: str = "", session: str = ""
 
     段文由 ``commands.delete_segment_texts`` 给——那走的是同一个
     ``_segments`` 切分，不是第二套判据。
+
+    **定档用展开后的段文，展示用原文**（2026-11-26 真机）：shell 的惯用
+    形状是"先赋值、再用"，而赋值往往在**另一段**——
+
+        MSG=/tmp/x && git commit -F "$MSG" && rm -f "$MSG"
+
+    逐段判之后，``rm -f "$MSG"`` 那段看不见前一段的 ``MSG=…``，
+    于是仍然判"目标被变量藏住了"→ EXTREME → 【严重】。
+    所以这里先把**整条命令**的赋值收集起来，展开段文再定档。
+    展示仍用原文：用户在卡片上要确认的是自己敲的那一行，
+    不是我们替它展开后的那一行。
     """
     working_dir = _working_dir_of(source)
+    assignments = _literal_assignments(command)
     out: list[RuleHit] = []
     for index, segment in enumerate(delete_segment_texts(command)):
         matched = match_delete(segment)
         if matched is None:
             continue
-        tier = delete_tier(segment, working_dir)
+        tier = delete_tier(_expand_literals(segment, assignments), working_dir)
         summary = f"删除文件：{_clip(segment)}"
         if tier == TIER_SCOPE_UNKNOWN:
             # B8：范围未知时必须**明说**，不许拿【严重】冒充一个我们并不掌握的
