@@ -24,11 +24,13 @@ import asyncio
 import hashlib
 import html as _html
 import os
+import queue
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from pydantic import BaseModel, Field
@@ -88,11 +90,12 @@ from .approval import (
     build_result_html,
     explain_request,
     is_known_advice_state,
+    local_facts_for,
     safe_conclusion,
     warning_key,
     warning_mode_for_tier,
 )
-from .auto_review import AutoReviewer
+from .auto_review import REVIEW_BATCH_MAX, AutoReviewer
 from .broadcast import (
     NOTICE_MERGE_SECONDS,
     Broadcaster,
@@ -513,6 +516,56 @@ def _reviewer_from_config(config: dict[str, Any]) -> AutoReviewer | None:
 _REVIEWER_GAP: list[str] = [""]
 
 
+# ── B11：播报压制审查 ──────────────────────────────────────────────────────
+
+#: 只有这两档**有资格**送审。**critical 永远不在内**——不是配置项，
+#: 是设计决定：极高危档在 approval.warning_mode_for_tier 里被钉成
+#: 「强制常亮，永不递减」，理由原话是"连点 3 次删 node_modules 之后，
+#: 第 4 次的 rm -rf ~ 仍要整行红字"。让模型压掉 critical 等于把那条约
+#: 递减到零，比它明令禁止的还远。而且转录观测到的删除**没有审批卡片**，
+#: 压掉播报就是用户根本不知道它删了东西。
+#:
+#: 写成常量而不是读配置：一个能把它开到 critical 的旋钮，
+#: 迟早会被当成"减少打扰"拧到底。
+_REVIEWABLE_SEVERITIES = frozenset({"warn", "notice"})
+
+
+def _reviewable_broadcast(hit: RuleHit) -> bool:
+    """这条命中够格送模型审吗。纯函数。
+
+    只看严重度，不看规则名——和 ``auto_decide_gate`` 按动作类别排同一个
+    理由：规则名会随规则库增删而变，靠名字判迟早漏一条。
+    """
+    return hit.severity in _REVIEWABLE_SEVERITIES
+
+
+def _broadcast_reviewer(config: dict[str, Any]) -> AutoReviewer | None:
+    """按配置造 B11 的审查客户端。**没配 / 没开 / 缺东西都返回 None**。
+
+    复用 ``[agent_deskmate.auto_review]`` 那一整节——同一个模型端点、
+    同一份 key、同一个开关。不另起一节的理由：那是两个开关管同一件事，
+    用户开了 B9 以为 B11 也跟着开（或反过来），而面板要多解释一遍。
+
+    返回 None 时 B11 这条路整个不存在，播报照旧——**这就是 fail-open**。
+    """
+    return _reviewer_from_config(config)
+
+
+def _facts_for_hit(hit: RuleHit) -> str:
+    """给模型的「目标本地事实」（B10 第 3 类输入）。复用审批那一份。
+
+    刻意不自己写第二套：``approval.local_facts_for`` 已经只做四件事
+    （存在 / 文件或目录 / 多大 / 在不在工作目录内），且**不看内容**。
+    再写一份就等于给"给模型看什么"开第二个口子。
+    """
+    record = SimpleNamespace(request=SimpleNamespace(
+        full_command=hit.command or "", working_directory=hit.working_directory or ""))
+    try:
+        return local_facts_for(record)
+    except Exception as exc:            # noqa: BLE001 —— 事实说不清就别给
+        return f"（本地事实取不到：{type(exc).__name__}）"
+
+
 def _mine_roots(config: dict[str, Any]) -> list[Path]:
     """读用户声明的"这些目录里的会话是我自己开的"（``[agent_deskmate.mine].roots``）。
 
@@ -708,6 +761,15 @@ class AgentDeskmatePlugin(NekoPluginBase):
             self.logger.warning(
                 "重载时丢弃 %d 条压在合并窗口里的通知（最晚晚 %gs，"
                 "跨批次合并的代价）", len(held), self._merge_window)
+        # B11：在飞的一批审查。**它回来的结论没人接了**——queue 和 future
+        # 都要重建。必须留一行：用户少看到几条播报，而这里是她唯一能查到
+        # 原因的地方。方向上是 fail-closed（丢了），但范围只有 warn/notice，
+        # 且窗口只有一次审查的时间（最坏 8 秒）。
+        in_flight = getattr(self, "_review_future", None)
+        if in_flight is not None and not in_flight.done():
+            self.logger.warning(
+                "重载时有一批 %d 条播报正在审查，其结论将无人接收"
+                "（那几条不会补播）", len(getattr(self, "_review_queue", ()) or ()))
         self._watch_paths = None
         self._transcript_adapter = None
         self._gateway_adapter = None
@@ -741,6 +803,23 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # 同一张卡只释放一次（snapshot 会留着已了结记录一小时）。
         # 审批网关起不起来都不影响它（起不来时这本账永远是空的）。
         self._gate_released: dict[str, float] = {}
+
+        # ── B11：播报压制审查的状态 ──────────────────────────────────────
+        # 三个容器分工是刻意的：
+        #   _review_queue      本轮排队等送审的命中
+        #   _review_future     正在飞的那一批（None = 闲着）
+        #   _review_survivors  审查说"要播"的，等下一轮 tick 取走
+        # **survivors 用 Queue 不用 list**：它由线程池写、tick 读，
+        # 而 list 的 append/extend 虽然在 GIL 下不会撕裂，读的时候
+        # 可能只看到一半——那会让一条播报凭空消失，而这种故障在日志里
+        # 什么都不留。Queue 的锁是显式的。
+        self._review_queue: list[RuleHit] = []
+        self._review_future: Future | None = None
+        self._review_survivors: queue.SimpleQueue = queue.SimpleQueue()
+        # 三个计数器只进日志与面板，用来回答"这东西花了多少 key"。
+        self._review_submitted = 0
+        self._review_suppressed = 0
+        self._review_failed = 0
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     # startup 用 async def、shutdown 用 def，刻意对齐官方 memo_reminder 的写法：
@@ -1306,8 +1385,22 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # fingerprint 去过重、按窗口合并，天然稀疏，晚 3 秒无感。
         jobs: list[Callable[[], str]] = list(self._pending_pushes)
         self._pending_pushes = []
+
+        # B11：上一轮送去审查的结论先落地。** survivor 排在 pending 之后、
+        # 新事件之前**——它是上一轮就该发的，不该被这一轮的新事件挤掉位置。
+        for hit in self._drain_review_survivors():
+            jobs.append(partial(broadcaster.broadcast, hit, already_coalesced=True))
+
+        reviewer = _broadcast_reviewer(config)
         for event in events:
             for hit in _hits_for_event(event, mine_roots):
+                if reviewer is not None and _reviewable_broadcast(hit):
+                    # 送审前**必须先合并**：不合并的话同一条命令在窗口内
+                    # 每轮重新排一次队，每轮都多花一次用户的 key。
+                    kept = broadcaster.coalesce(hit)
+                    if kept is not None:
+                        self._review_queue.append(kept)
+                    continue
                 jobs.append(partial(broadcaster.broadcast, hit))
         for notice in notices:
             jobs.append(partial(broadcast_notice, self.push_message, notice,
@@ -1336,7 +1429,72 @@ class AgentDeskmatePlugin(NekoPluginBase):
             self._pending_pushes = overflow
             self.logger.info("本轮推送已达上限 {} 条，余下 {} 条下一轮接着发",
                              MAX_BROADCAST_PER_TICK, len(overflow))
+
+        # B11：把排队送审。放在**最后**——这一轮的推送先发完，别让送审
+        # 把 tick 占住（审查最坏 8 秒，而 tick 是 3 秒一拍）。
+        self._maybe_submit_review(reviewer)
         return outcomes
+
+    # ── B11：播报压制审查 ─────────────────────────────────────────────────
+
+    def _drain_review_survivors(self) -> list[RuleHit]:
+        """取走审查说"要播"的那批。线程安全（队列自带锁）。"""
+        out: list[RuleHit] = []
+        while True:
+            try:
+                out.append(self._review_survivors.get_nowait())
+            except queue.Empty:
+                return out
+
+    def _maybe_submit_review(self, reviewer: AutoReviewer | None) -> None:
+        """队列非空就送一批去审。**不在 tick 里等结果**。"""
+        if reviewer is None or self._review_future is not None:
+            return
+        batch = self._review_queue[:REVIEW_BATCH_MAX]
+        if not batch:
+            return
+        del self._review_queue[:len(batch)]
+        self._review_submitted += len(batch)
+        self._review_future = self._advice_pool.submit(
+            self._run_review_batch, batch, reviewer)
+        self.logger.info("送审 %d 条播报（累计 %d 条，队列余 %d）",
+                         len(batch), self._review_submitted, len(self._review_queue))
+
+    def _run_review_batch(self, batch: list[RuleHit],
+                          reviewer: AutoReviewer) -> list[RuleHit]:
+        """跑在线程池里。**任何异常都变成"全部照旧播"**，永不抛。
+
+        这是 B11 的 fail-open 落点。压制的反面是"用户少知道一件事"，
+        所以它必须由模型**明确**说 low+allow 触发；而放行的反面是
+        "多问用户一次"，所以 B9 失败时是交给人——两个方向别抄反。
+        """
+        items = []
+        for hit in batch:
+            items.append({
+                "command": hit.command or hit.summary,
+                "cwd": hit.working_directory or "",
+                "rule": hit.rule,
+                "severity": hit.severity,
+                "matched": hit.matched,
+                "facts": _facts_for_hit(hit),
+            })
+        try:
+            survives, detail = reviewer.review_batch(items=items)
+        except Exception as exc:            # noqa: BLE001 —— 见文档字符串
+            survives, detail = None, f"审查抛异常（{type(exc).__name__}）"
+        if survives is None:
+            self.logger.info("审查没成，%d 条照旧播：%s", len(batch), detail or "未知")
+            survivors = list(batch)
+            self._review_failed += len(batch)
+        else:
+            survivors = [hit for hit, keep in zip(batch, survives) if keep]
+            dropped = len(batch) - len(survivors)
+            self._review_suppressed += dropped
+            self.logger.info("审查完成：%d 条不播，%d 条照旧播（累计压掉 %d）",
+                             dropped, len(survivors), self._review_suppressed)
+        for hit in survivors:
+            self._review_survivors.put(hit)
+        return survivors
 
     @timer_interval(id="watch", seconds=3)
     async def watch_tick(self, **_):
@@ -1909,6 +2067,11 @@ class AgentDeskmatePlugin(NekoPluginBase):
             roots=roots,
             api_key_set=bool(api_key.strip()),
             auto_review_enabled=bool(review_cfg.get("enabled")),
+            broadcast_review_stats={
+                "submitted": self._review_submitted,
+                "suppressed": self._review_suppressed,
+                "failed": self._review_failed,
+            },
             authorized_scopes=scopes,
             explain_verbosity=str(approval_cfg.get("explain_verbosity") or "brief"),
             warning_emphasis=str(approval_cfg.get("warning_emphasis") or "first_n"),
@@ -2032,6 +2195,64 @@ class AgentDeskmatePlugin(NekoPluginBase):
             "message": ("已保存。下一次播报生效；"
                         + ("猫娘会用她自己的话复述一遍，原文照旧上屏。"
                            if want else "只出文字，角色不开口。")),
+        })
+
+    @ui.action(id="settings_set_broadcast_review",
+               label=tr("entry.settings_set_broadcast_review.name",
+                        default="保存审查设置"))
+    @plugin_entry(
+        id="settings_set_broadcast_review",
+        name=tr("entry.settings_set_broadcast_review.name",
+                default="保存审查设置"),
+        description=tr(
+            "entry.settings_set_broadcast_review.description",
+            default="开之后，【警告】与【提示】两档会先送模型审一句，"
+                    "它认为不值一提的就不再播。【严重】永远不送审。",
+        ),
+    )
+    async def settings_set_broadcast_review(self, enabled: bool = False,
+                                            _ctx: dict | None = None):
+        """写 ``[agent_deskmate.auto_review].enabled``（B11 的开关）。
+
+        **复用 auto_review 那一节，不另起一节**：两个功能共用同一个模型端点、
+        同一份 key。分成两节的后果是用户开了 B9 以为 B11 也跟着开
+        （或反过来），而面板要多解释一遍"这两个开关的关系"。
+
+        **没配 api_key 时不许开**：红线 3，零 key 只跑 L0。这时返回 Err
+        让面板说明原因，而不是保存成功、下一次静默不生效。
+
+        **这里不热改任何对象**：``_broadcast_reviewer`` 是每一轮
+        ``_poll_once`` 现读配置造的，所以写进配置就生效，没有
+        "配置写进去了、对象还是旧的"那种断层。
+        """
+        want = bool(enabled)
+        if want:
+            config = await self._plugin_config()
+            model_cfg = config.get("model") if isinstance(
+                config.get("model"), dict) else {}
+            review_cfg = config.get("auto_review") if isinstance(
+                config.get("auto_review"), dict) else {}
+            key = str(review_cfg.get("api_key") or model_cfg.get("api_key")
+                      or config.get("api_key") or "")
+            if not key.strip():
+                return Err(SdkError(
+                    "没配 API key，送审需要模型接一轮——那是花 key 的。"
+                    "先在插件管理器的「配置」页填 key，再来开这个。"))
+        try:
+            await self.config.set("agent_deskmate.auto_review.enabled",
+                                  want, timeout=5.0)
+        except Exception as exc:
+            self.logger.error("写审查开关失败：{}", type(exc).__name__)
+            return Err(SdkError("保存失败：{}".format(type(exc).__name__)))
+
+        self.logger.info("播报审查已{}：{}", "开启" if want else "关闭",
+                         "【警告】与【提示】先送审" if want else "全部照旧播")
+        return Ok({
+            "enabled": want,
+            "message": ("已保存。下一次播报生效；"
+                        + ("【警告】与【提示】会先送模型审一句，"
+                           "它说不值一提的就不再播。【严重】永远不送审。"
+                           if want else "所有档位照旧播，不花 key。")),
         })
 
     @ui.action(id="speak_test",

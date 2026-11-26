@@ -104,5 +104,16 @@
   "panel.tab.status": "状态",
   "panel.title": "同桌猫",
   "plugin.description": "替你看着本机的编码 Agent：需要审批、完成、出错、卡住时播报与解释，并在 N.E.K.O 里完成同意/拒绝。",
-  "plugin.name": "同桌猫"
+  "plugin.name": "同桌猫",
+  "entry.settings_set_broadcast_review.name": "保存审查设置",
+  "entry.settings_set_broadcast_review.description": "开之后，【警告】与【提示】两档会先送模型审一句，它认为不值一提的就不再播。【严重】永远不送审。",
+  "panel.settings.broadcast_review": "先审一遍再播",
+  "panel.settings.broadcast_review.on": "让模型先审一遍",
+  "panel.settings.broadcast_review.off": "全部照旧播",
+  "panel.settings.broadcast_review_help": "开着的时候，【警告】和【提示】两档会先送模型问一句「这事值不值得说」。它认为不值一提的就不再播，其余的照旧播。【严重】永远不送审。",
+  "panel.settings.broadcast_review_scope": "压制的只有【警告】和【提示】。【严重】一条不动——删到家目录、删到工作区外、目标说不清的，照样整行红字。",
+  "panel.settings.broadcast_review_cost": "花你的 key：每一批最多 5 条，每条一次模型请求。拿不准的时候模型一律判「要讲」，所以压掉的多半真是小事，但这不是保证。",
+  "panel.settings.broadcast_review_failopen": "任何岔子都照旧播：没配 key、超时、模型答得不像样、它判「中等」或「高风险」——全部当没审过。只有它明确说「低风险 + 可以不说」才不播。",
+  "panel.settings.broadcast_review_stats": "本次启动以来：送审 {submitted} 条，压掉 {suppressed} 条，没审成 {failed} 条。",
+  "panel.settings.broadcast_review_need_key": "没配 API key，开不了——送审要模型接一轮，那是花 key 的。去下面填 key。"
 }

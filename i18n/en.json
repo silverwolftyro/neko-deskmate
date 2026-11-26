@@ -104,5 +104,16 @@
   "panel.tab.status": "Status",
   "panel.title": "Deskmate",
   "plugin.description": "Watches your local coding agents: broadcasts and explains when approval, completion, failure or a stall happens, and lets you approve or reject inside N.E.K.O.",
-  "plugin.name": "Neko Deskmate"
+  "plugin.name": "Neko Deskmate",
+  "entry.settings_set_broadcast_review.name": "Save review setting",
+  "entry.settings_set_broadcast_review.description": "When on, warn and notice broadcasts are sent to the model first; the ones it calls not worth mentioning are dropped. Critical never goes to review.",
+  "panel.settings.broadcast_review": "Review before broadcasting",
+  "panel.settings.broadcast_review.on": "Let the model review first",
+  "panel.settings.broadcast_review.off": "Broadcast everything",
+  "panel.settings.broadcast_review_help": "When on, warn and notice items are sent to the model with one question: is this worth mentioning? The ones it calls not worth it are dropped; everything else is broadcast as before. Critical never goes to review.",
+  "panel.settings.broadcast_review_scope": "Only warn and notice can be suppressed. Critical is untouched — home directory, outside the workspace, unparseable targets all still get full red text.",
+  "panel.settings.broadcast_review_cost": "Costs your key: up to 5 items per batch, one model request each. When unsure the model always says \"worth telling\", so what gets dropped is mostly genuinely minor — but that is not a guarantee.",
+  "panel.settings.broadcast_review_failopen": "Any hiccup broadcasts as usual: no key, timeout, malformed answer, or a \"medium\"/\"high\" verdict — all treated as \"no review happened\". Only an explicit \"low risk + need not say\" suppresses.",
+  "panel.settings.broadcast_review_stats": "Since this start: {submitted} sent, {suppressed} dropped, {failed} not reviewed.",
+  "panel.settings.broadcast_review_need_key": "No API key, so this cannot be enabled — review needs one model round-trip and costs your key. Fill in a key below."
 }

@@ -30,6 +30,7 @@ def build_panel_state(
     roots: list[str],
     api_key_set: bool,
     auto_review_enabled: bool,
+    broadcast_review_stats: dict[str, int] | None = None,
     authorized_scopes: list[str],
     explain_verbosity: str,
     warning_emphasis: str,
@@ -201,6 +202,16 @@ def build_panel_state(
         # 而不是"能点、点了不生效"——那正是假控件的定义。
         "speak": bool(speak),
         "speak_available": bool(speak) or api_key_set,
+        # B11：播报审查。**``broadcast_review_available`` 单独一个字段**，
+        # 理由同 speak_available——没配 key 时送审走不了（红线 3），
+        # 控件必须置灰并说清缺什么，而不是"能点、点了不生效"。
+        # 已经开着的要一直显示成可用：用户开着的时候把 key 删了，
+        # 控件不该当场变灰，那会让人以为设置丢了。
+        "broadcast_review": bool(auto_review_enabled),
+        "broadcast_review_available": bool(auto_review_enabled) or api_key_set,
+        # 三个计数回答"这东西花了多少 key"。只增不减，重载归零——
+        # 面板显示时说明是本次启动以来的量，别让它冒充历史总量。
+        "broadcast_review_stats": dict(broadcast_review_stats or {}),
         "session_count": len(sessions),
         "sessions": session_rows,
         "attention": attention,

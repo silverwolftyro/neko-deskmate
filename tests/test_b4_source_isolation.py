@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import sqlite3
 import time
 from pathlib import Path
@@ -105,6 +106,10 @@ class WatcherHost:
     _is_gate_caused = AgentDeskmatePlugin._is_gate_caused
     _adapter_status = AgentDeskmatePlugin._adapter_status
     _ADAPTER_SOURCES = AgentDeskmatePlugin._ADAPTER_SOURCES
+    # B11：播报压制审查。真插件 _reset_watch_state 建状态，这里手搭一份。
+    _drain_review_survivors = AgentDeskmatePlugin._drain_review_survivors
+    _maybe_submit_review = AgentDeskmatePlugin._maybe_submit_review
+    _run_review_batch = AgentDeskmatePlugin._run_review_batch
     def __init__(self) -> None:
         self._broadcaster = None
         self._transcript_adapter = None
@@ -128,6 +133,15 @@ class WatcherHost:
         # 隔离，通知要当轮就看到，不该被合并窗口拖着。
         self._merger = NoticeMerger(window=0.0)
         self._merge_window = 0.0
+        # B11：三个容器 + 三个计数器。没有 reviewer，所以 _maybe_submit_review
+        # 直接返回；_advice_pool 留 None 即可。
+        self._review_queue: list = []
+        self._review_future = None
+        self._review_survivors = queue.SimpleQueue()
+        self._review_submitted = 0
+        self._review_suppressed = 0
+        self._review_failed = 0
+        self._advice_pool = None
 
 
 def _tool_line(command: str, session: str = "sess-1") -> str:

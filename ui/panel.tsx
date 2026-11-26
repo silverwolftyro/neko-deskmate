@@ -107,6 +107,12 @@ type DeskmateState = {
   // 前端不该自己去推这个结论（推错了就是"能点、点了不生效"）。
   speak?: boolean
   speak_available?: boolean
+  // B11：播报审查。``broadcast_review_available`` 同 speak_available 的理由——
+  // 后端算好，前端不自己推。已经开着的一直显示可用（用户开着时把 key 删了，
+  // 控件不该当场变灰，那会让人以为设置丢了）。
+  broadcast_review?: boolean
+  broadcast_review_available?: boolean
+  broadcast_review_stats?: Record<string, number>
   session_count?: number
   last_broadcast_at?: number
   sessions?: SessionRow[]
@@ -170,6 +176,7 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
   )
   const [savingRoots, setSavingRoots] = useLocalState("saving_roots", false)
   const [savingSpeak, setSavingSpeak] = useLocalState("saving_speak", false)
+  const [savingReview, setSavingReview] = useLocalState("saving_review", false)
   const [speakDraft, setSpeakDraft] = useLocalState("speak_draft", "")
   const [speaking, setSpeaking] = useLocalState("speaking", false)
   // Tabs 的 activeId 是受控的：状态页的「去声明」要能把它切到设置页。
@@ -229,8 +236,24 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
     }
   }
 
-  const onSetSpeak = async (want: boolean) => {
-    setSavingSpeak(true)
+  const onSetBroadcastReview = async (want: boolean) => {
+    setSavingReview(true)
+    try {
+      await props.api.call(
+        "settings_set_broadcast_review",
+        { enabled: want },
+        { userInitiated: true },
+      )
+      await props.api.refresh()
+      toast.success(t("panel.settings.saved", { defaultValue: "已保存" }))
+    } catch (err: any) {
+      toast.error(String(err && err.message ? err.message : err))
+    } finally {
+      setSavingReview(false)
+    }
+  }
+
+  const onSetSpeak = async (want: boolean) => {    setSavingSpeak(true)
     try {
       await props.api.call(
         "settings_set_speak",
@@ -574,6 +597,130 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
           />
         </Stack>
       </Card>
+
+      {/* B11：让模型先过一遍，不值一提的就不播。
+          设计依据（2026-11-26 实测 120 条删除命中）：L0 判出 69 条【警告】，
+          其中 59 条目标是工作区内的相对路径——agent 在自己项目里清理。
+          这类播报每条都要人看一眼，看多了就是"见到红条就点确认"。
+          铁律：只有模型明确说 low+allow 才不播；任何失败照旧播；
+          【严重】永远不送审。 */}
+      {hasAction("settings_set_broadcast_review") ? (
+        <Card
+          title={t("panel.settings.broadcast_review", {
+            defaultValue: "先审一遍再播",
+          })}
+        >
+          <Stack gap="sm">
+            <Inline gap="sm">
+              <Button
+                tone={state.broadcast_review ? "default" : "primary"}
+                disabled={
+                  !running ||
+                  savingReview ||
+                  state.broadcast_review === false
+                }
+                onClick={() => {
+                  onSetBroadcastReview(false)
+                }}
+              >
+                {t("panel.settings.broadcast_review.off", {
+                  defaultValue: "全部照旧播",
+                })}
+              </Button>
+              <Button
+                tone={state.broadcast_review ? "primary" : "default"}
+                disabled={
+                  !running ||
+                  savingReview ||
+                  !state.broadcast_review_available
+                }
+                onClick={() => {
+                  onSetBroadcastReview(true)
+                }}
+              >
+                {t("panel.settings.broadcast_review.on", {
+                  defaultValue: "让模型先审一遍",
+                })}
+              </Button>
+            </Inline>
+            <StatusBadge
+              tone={state.broadcast_review ? "success" : "default"}
+              label={
+                state.broadcast_review
+                  ? t("panel.settings.broadcast_review.on", {
+                      defaultValue: "让模型先审一遍",
+                    })
+                  : t("panel.settings.broadcast_review.off", {
+                      defaultValue: "全部照旧播",
+                    })
+              }
+            />
+            <Text>
+              {t("panel.settings.broadcast_review_help", {
+                defaultValue:
+                  "开着的时候，【警告】和【提示】两档会先送模型问一句"
+                  + "「这事值不值得说」。它认为不值一提的就不再播，"
+                  + "其余的照旧播。【严重】永远不送审。",
+              })}
+            </Text>
+            {/* 三个必须说清的点，缺一个就是假控件。 */}
+            <Alert
+              tone="info"
+              message={t("panel.settings.broadcast_review_scope", {
+                defaultValue:
+                  "压制的只有【警告】和【提示】。【严重】一条不动——"
+                  + "删到家目录、删到工作区外、目标说不清的，照样整行红字。",
+              })}
+            />
+            <Alert
+              tone="warning"
+              message={t("panel.settings.broadcast_review_cost", {
+                defaultValue:
+                  "花你的 key：每一批最多 5 条，每条一次模型请求。"
+                  + "拿不准的时候模型一律判「要讲」，所以压掉的多半真是小事，"
+                  + "但这不是保证。",
+              })}
+            />
+            <Alert
+              tone="info"
+              message={t("panel.settings.broadcast_review_failopen", {
+                defaultValue:
+                  "任何岔子都照旧播：没配 key、超时、模型答得不像样、"
+                  + "它判「中等」或「高风险」——全部当没审过。"
+                  + "只有它明确说「低风险 + 可以不说」才不播。",
+              })}
+            />
+            {state.broadcast_review ? (
+              <Text>
+                {t("panel.settings.broadcast_review_stats", {
+                  defaultValue:
+                    "本次启动以来：送审 {submitted} 条，"
+                    + "压掉 {suppressed} 条，没审成 {failed} 条。",
+                  submitted: String(
+                    (state.broadcast_review_stats || {}).submitted || 0,
+                  ),
+                  suppressed: String(
+                    (state.broadcast_review_stats || {}).suppressed || 0,
+                  ),
+                  failed: String(
+                    (state.broadcast_review_stats || {}).failed || 0,
+                  ),
+                })}
+              </Text>
+            ) : null}
+            {!state.broadcast_review_available ? (
+              <Alert
+                tone="warning"
+                message={t("panel.settings.broadcast_review_need_key", {
+                  defaultValue:
+                    "没配 API key，开不了——送审要模型接一轮，那是花 key 的。"
+                    + "去下面填 key。",
+                })}
+              />
+            ) : null}
+          </Stack>
+        </Card>
+      ) : null}
 
       {/* 语音链调试入口。存在的理由：插件能自主触发的播报只有规则命中，
           那条路的文本永远是「事件报告：<命令>」形状，指示会被包在里面，

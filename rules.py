@@ -125,6 +125,12 @@ class RuleHit(AttributionFields):
     # （老实现正是那么干的，于是同一条命令有两个字数：120 vs 268）。
     command_length: int | None = Field(
         default=None, description="完整命令字数；非命令类规则为 None")
+    # B11：完整命令原文。**summary 是按 80 字截过的**（``_clip``），而上面
+    # ``command_length`` 的存在本身就是"不能从 summary 反推命令"的记功碑——
+    # 现在播报压制要把命令送模型审（B10 第 2 类输入），没有原文就只能送截的，
+    # 而截在中间的 `--exclude=…` 恰好是判断"值不值得说"的关键。
+    # 默认空串：失败类 / 下派类没有命令。
+    command: str = Field(default="", description="完整命令原文；非命令类规则为空")
 
     # 播报层归因（2026-11-21 决策记录 §5）：
     # chain_id 委托链根，**今天恒等于 session**。等将来 worker 自己的日志也可观测时，
@@ -289,6 +295,7 @@ def evaluate_delete(command: str, *, agent: str = "", session: str = "",
         # 归因**不进**合并键（决策记录 §3）：合并按动作算，归因是显示层的事。
         coalesce_key=f"{RULE_DELETE}|{session}|{agent}|{matched}|{_fingerprint(command)}",
         command_length=command_length(command),
+        command=command,
         **_attribution_of(source),
     )
 

@@ -72,6 +72,8 @@ def test_events_registered() -> None:
     # 所以不进这张集合；它供的是设置面板的 state。
     # ``settings_set_roots`` 是面板的第一个写入口（面板没有写配置的能力）。
     # ``settings_set_speak`` 是第二个——切播报方式，同样只能走入口。
+    # ``settings_set_broadcast_review`` 是第三个——B11 的审查开关，
+    # 复用 ``[agent_deskmate.auto_review]`` 那一节，所以它写的是 enabled。
     assert set(registered) == {
         "startup", "shutdown", "config_change", "status", "dump_events", "scan_now",
         "watch", "approval", "approval_decide", "approval_explain",
@@ -79,6 +81,7 @@ def test_events_registered() -> None:
         "model_test",
         "pending_list", "audit_list",
         "settings_set_roots", "settings_set_speak", "speak_test",
+        "settings_set_broadcast_review",
     }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"
     assert registered["shutdown"].event_type == "lifecycle"

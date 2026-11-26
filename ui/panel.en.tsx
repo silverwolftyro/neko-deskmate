@@ -115,6 +115,13 @@ type DeskmateState = {
   // 前端不该自己去推这个结论（推错了就是"能点、点了不生效"）。
   speak?: boolean
   speak_available?: boolean
+  // B11: broadcast review. broadcast_review_available follows the same
+  // reasoning as speak_available — the backend decides, the frontend does
+  // not infer. Once enabled it stays available: deleting the key while it
+  // is on must not grey the control out and suggest the setting was lost.
+  broadcast_review?: boolean
+  broadcast_review_available?: boolean
+  broadcast_review_stats?: Record<string, number>
   session_count?: number
   last_broadcast_at?: number
   sessions?: SessionRow[]
@@ -178,6 +185,7 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
   )
   const [savingRoots, setSavingRoots] = useLocalState("saving_roots", false)
   const [savingSpeak, setSavingSpeak] = useLocalState("saving_speak", false)
+  const [savingReview, setSavingReview] = useLocalState("saving_review", false)
   const [speakDraft, setSpeakDraft] = useLocalState("speak_draft", "")
   const [speaking, setSpeaking] = useLocalState("speaking", false)
   // Tabs 的 activeId 是受控的：状态页的「去声明」要能把它切到设置页。
@@ -234,6 +242,23 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
       toast.error(String(err && err.message ? err.message : err))
     } finally {
       setSavingRoots(false)
+    }
+  }
+
+  const onSetBroadcastReview = async (want: boolean) => {
+    setSavingReview(true)
+    try {
+      await props.api.call(
+        "settings_set_broadcast_review",
+        { enabled: want },
+        { userInitiated: true },
+      )
+      await props.api.refresh()
+      toast.success(t("panel.settings.saved", { defaultValue: "Saved" }))
+    } catch (err: any) {
+      toast.error(String(err && err.message ? err.message : err))
+    } finally {
+      setSavingReview(false)
     }
   }
 
@@ -582,6 +607,138 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
           />
         </Stack>
       </Card>
+
+      {/* B11: let the model take one pass, and drop what is not worth
+          mentioning. Design basis (measured 2026-11-26 over 120 delete
+          hits): L0 called 69 of them warn, and 59 of those target
+          relative paths inside the workspace — the agent cleaning up its
+          own project. Each of those costs the user a look, and enough of
+          them trains "see red, click confirm". Iron rule: only an
+          explicit low+allow suppresses; any failure broadcasts; critical
+          never goes to review. */}
+      {hasAction("settings_set_broadcast_review") ? (
+        <Card
+          title={t("panel.settings.broadcast_review", {
+            defaultValue: "Review before broadcasting",
+          })}
+        >
+          <Stack gap="sm">
+            <Inline gap="sm">
+              <Button
+                tone={state.broadcast_review ? "default" : "primary"}
+                disabled={
+                  !running ||
+                  savingReview ||
+                  state.broadcast_review === false
+                }
+                onClick={() => {
+                  onSetBroadcastReview(false)
+                }}
+              >
+                {t("panel.settings.broadcast_review.off", {
+                  defaultValue: "Broadcast everything",
+                })}
+              </Button>
+              <Button
+                tone={state.broadcast_review ? "primary" : "default"}
+                disabled={
+                  !running ||
+                  savingReview ||
+                  !state.broadcast_review_available
+                }
+                onClick={() => {
+                  onSetBroadcastReview(true)
+                }}
+              >
+                {t("panel.settings.broadcast_review.on", {
+                  defaultValue: "Let the model review first",
+                })}
+              </Button>
+            </Inline>
+            <StatusBadge
+              tone={state.broadcast_review ? "success" : "default"}
+              label={
+                state.broadcast_review
+                  ? t("panel.settings.broadcast_review.on", {
+                      defaultValue: "Let the model review first",
+                    })
+                  : t("panel.settings.broadcast_review.off", {
+                      defaultValue: "Broadcast everything",
+                    })
+              }
+            />
+            <Text>
+              {t("panel.settings.broadcast_review_help", {
+                defaultValue:
+                  "When on, warn and notice items are sent to the model with"
+                  + " one question: is this worth mentioning? The ones it"
+                  + " calls not worth it are dropped; everything else is"
+                  + " broadcast as before. Critical never goes to review.",
+              })}
+            </Text>
+            {/* Three things that must be spelled out — miss one and this
+                is a fake control. */}
+            <Alert
+              tone="info"
+              message={t("panel.settings.broadcast_review_scope", {
+                defaultValue:
+                  "Only warn and notice can be suppressed. Critical is"
+                  + " untouched — home directory, outside the workspace,"
+                  + " unparseable targets all still get full red text.",
+              })}
+            />
+            <Alert
+              tone="warning"
+              message={t("panel.settings.broadcast_review_cost", {
+                defaultValue:
+                  "Costs your key: up to 5 items per batch, one model"
+                  + " request each. When unsure the model always says"
+                  + " \"worth telling\", so what gets dropped is mostly"
+                  + " genuinely minor — but that is not a guarantee.",
+              })}
+            />
+            <Alert
+              tone="info"
+              message={t("panel.settings.broadcast_review_failopen", {
+                defaultValue:
+                  "Any hiccup broadcasts as usual: no key, timeout,"
+                  + " malformed answer, or a \"medium\"/\"high\" verdict"
+                  + " — all treated as \"no review happened\". Only an"
+                  + " explicit \"low risk + need not say\" suppresses.",
+              })}
+            />
+            {state.broadcast_review ? (
+              <Text>
+                {t("panel.settings.broadcast_review_stats", {
+                  defaultValue:
+                    "Since this start: {submitted} sent,"
+                    + " {suppressed} dropped, {failed} not reviewed.",
+                  submitted: String(
+                    (state.broadcast_review_stats || {}).submitted || 0,
+                  ),
+                  suppressed: String(
+                    (state.broadcast_review_stats || {}).suppressed || 0,
+                  ),
+                  failed: String(
+                    (state.broadcast_review_stats || {}).failed || 0,
+                  ),
+                })}
+              </Text>
+            ) : null}
+            {!state.broadcast_review_available ? (
+              <Alert
+                tone="warning"
+                message={t("panel.settings.broadcast_review_need_key", {
+                  defaultValue:
+                    "No API key, so this cannot be enabled — review needs"
+                    + " one model round-trip and costs your key. Fill in a"
+                    + " key below.",
+                })}
+              />
+            ) : null}
+          </Stack>
+        </Card>
+      ) : null}
 
       {/* 语音链调试入口。存在的理由：插件能自主触发的播报只有规则命中，
           那条路的文本永远是「事件报告：<命令>」形状，指示会被包在里面，

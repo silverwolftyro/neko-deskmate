@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import queue
 import time
 from datetime import datetime, timezone
 
@@ -163,6 +164,10 @@ class _Host:
     _released_gate_sessions = AgentDeskmatePlugin._released_gate_sessions
     _record_gate_stopped = AgentDeskmatePlugin._record_gate_stopped
     _is_gate_caused = AgentDeskmatePlugin._is_gate_caused
+    # B11：播报压制审查。真插件 _reset_watch_state 建状态，这里手搭一份。
+    _drain_review_survivors = AgentDeskmatePlugin._drain_review_survivors
+    _maybe_submit_review = AgentDeskmatePlugin._maybe_submit_review
+    _run_review_batch = AgentDeskmatePlugin._run_review_batch
 
     def __init__(self, events=(), progress=None) -> None:
         self.logger = _ListLogger()
@@ -190,6 +195,16 @@ class _Host:
         # 的是别的东西（状态机、闸门、静音），不该被合并窗口拖着。
         self._merger = NoticeMerger()
         self._merge_window = NOTICE_MERGE_SECONDS
+        # B11：三个容器 + 三个计数器。真插件建在 _reset_watch_state 里。
+        self._review_queue: list = []
+        self._review_future = None
+        self._review_survivors = queue.SimpleQueue()
+        self._review_submitted = 0
+        self._review_suppressed = 0
+        self._review_failed = 0
+        # 这些测试不送审：没有 reviewer（_broadcast_reviewer 返回 None），
+        # 所以 _maybe_submit_review 直接返回。_advice_pool 留着 None 即可。
+        self._advice_pool = None
 
     def _push(self, **kwargs):
         self.pushed.append(kwargs)

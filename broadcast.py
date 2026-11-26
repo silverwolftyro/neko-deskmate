@@ -461,9 +461,31 @@ class Broadcaster:
         self._last_respond_at = stamp
         return "respond"
 
-    def broadcast(self, hit: RuleHit) -> str:
-        """播一条。返回 ``sent`` / ``coalesced`` / 拒绝原因，永不抛异常。"""
-        if self._coalescer is not None:
+    def coalesce(self, hit: RuleHit) -> RuleHit | None:
+        """只过合并器，不播。返回 None 表示窗口内重复，调用方该丢掉。
+
+        B11 需要它：送审之前必须先合并，否则同一条命令在窗口内每轮都
+        重新排一次队，**每一轮都多花一次用户的 key**。而"已合并"这个
+        计数也必须在这里记——不记的话面板上"合并掉多少条"会莫名少一截。
+
+        与 ``broadcast`` 分开而不是加个 ``dry_run`` 参数：那个参数会
+        同时意味着"别记 sent/rejected"和"别推送"，两种语义混在一个
+        布尔里，将来一定有人传错。
+        """
+        if self._coalescer is None:
+            return hit
+        kept = self._coalescer.offer(hit)
+        if kept is None:
+            self.coalesced += 1
+        return kept
+
+    def broadcast(self, hit: RuleHit, *, already_coalesced: bool = False) -> str:
+        """播一条。返回 ``sent`` / ``coalesced`` / 拒绝原因，永不抛异常。
+
+        ``already_coalesced`` 给 B11 用：那条已经过 ``coalesce`` 了
+        （送审前合并），再合并一次会被自己刚记的窗口挡掉，永远发不出去。
+        """
+        if not already_coalesced and self._coalescer is not None:
             kept = self._coalescer.offer(hit)
             if kept is None:
                 self.coalesced += 1
