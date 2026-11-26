@@ -733,9 +733,16 @@ def _segments(command: str) -> list[list[tuple[str, str]]]:
     **heredoc 正文在这里整段丢掉**（见 ``strip_heredocs``）——这是所有判定的
     唯一共同上游（``simple_commands`` 与 ``delete_targets`` 都走这里），
     所以放这一处就够，不会出现"词典剥了、闸门没剥"的两套判据。
+
+    **重定向也在这里整段丢掉**（见 ``_REDIRECT_RE``）——同一个理由：
+    ``rm -f x > /dev/null`` 里 ``/dev/null`` 不是 ``rm`` 的参数，
+    不剥的话它会被当成删除目标，而它是绝对路径且在工作区外，
+    于是**任何带 ``> /dev/null`` 的 rm 都顶【严重】**。
     """
+    text = strip_heredocs(str(command or ""))
+    text = _REDIRECT_RE.sub(" ", text)
     out: list[list[tuple[str, str]]] = []
-    for part in _SIMPLE_SPLIT.split(strip_heredocs(str(command or ""))):
+    for part in _SIMPLE_SPLIT.split(text):
         pairs = [(raw, normalise_token(raw)) for raw in _raw_tokens(part)]
         if pairs:
             out.append(pairs)
@@ -745,6 +752,30 @@ def _segments(command: str) -> list[list[tuple[str, str]]]:
 #: heredoc 开头：``<<EOF`` / ``<<-EOF`` / ``<<'EOF'`` / ``<<"EOF"``。
 #: 结束标记可以是引号包着的，也可以不包；``<<-`` 只是允许正文行首有 Tab。
 _HEREDOC_OPEN = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+
+#: shell 重定向：**操作符 + 它指向的那个文件名**，一起丢掉。
+#:
+#: 覆盖的形态：``> f`` / ``>> f`` / ``< f`` / ``<< f``（herestring）、
+#: ``2> f`` / ``2>> f``（带 fd）、``&> f`` / ``&>> f``、以及
+#: ``2>&1`` / ``>&2`` / ``<&0`` 这种复制描述符的。
+#:
+#: **为什么必须剥（2026-11-26 第六条误报，实测最严重的一条）**：
+#: 重定向的目标**不是命令的参数**。``rm -f x > /dev/null`` 里 ``rm``
+#: 的参数只有 ``-f x``，``/dev/null`` 归 shell 管。而 ``_SEPARATORS``
+#: 把 ``<>`` 当分隔符，于是操作符自己消失了、**文件名留在 token 流里**，
+#: 被 ``delete_targets`` 当成删除目标。``/dev/null`` 是绝对路径且在工作区外
+#: → 直接判 extreme → 【严重】。实测本机 6 次。
+#:
+#: 同理 ``2>/dev/null`` 还会多带一个 ``2``（fd 号）进目标集合。
+#:
+#: 已知边界：引号**里面**的 ``>`` 也会被剥掉（``echo "a > b"`` → ``echo "a``）。
+#: 这是故意的——那种段落的命令主体是 echo/printf 这类打印命令，
+#: ``match_delete`` 本来就不看它的参数；而真要写一套引号感知的扫描器，
+#: 复杂度比它防住的问题大得多。方向上是"多剥"而不是"漏剥"。
+_REDIRECT_RE = re.compile(
+    r"""(?:\d+|&)?>{1,2}\s*(?:&\d+|"[^"]*"|'[^']*'|[^\s|;&<>]+)"""
+    r"""|<{1,2}\s*(?:&\d+|"[^"]*"|'[^']*'|[^\s|;&<>]+)"""
+)
 
 
 def strip_heredocs(command: str) -> str:

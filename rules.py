@@ -12,11 +12,16 @@
 误报在 summary 里一眼可辨（用户能看到那是 echo），漏判却是隐形的。
 
 严重度阶梯（失败类，我来定）：
-  critical  status >= 500      服务端在崩，全线不可用
-  warn      400 <= status < 500 客户端/配置问题，范围有限
-  notice    status == 429       限流，Agent 会自己重试
+  notice    429 / 502 / 503 / 504  瞬态：限流或上游临时不可用，Agent 会自己重试
+  critical  status >= 500 且非瞬态  服务端真的出了错（500 / 501 …），全线不可用
+  warn      400 <= status < 500     客户端/配置问题，范围有限
   warn      无 status / 坏值 / 转录 error
 `info` 不产生规则命中，预留给非失败的一般状态变化。
+
+**2026-11-26 第五条误报**：老口径一句 `status >= 500 → critical`，实测今晚
+连报 4 条【严重】全是网关侧 502。502/503/504 说的是"上游临时接不上"，
+不是"全线不可用"——用【严重】喊它，等于拿一个我们不掌握的事实去训练用户
+看到红字就点掉。详见 ``severity_for_status``。
 """
 
 from __future__ import annotations
@@ -48,6 +53,12 @@ SEVERITY_NOTICE = "notice"
 SEVERITY_WARN = "warn"
 SEVERITY_CRITICAL = "critical"
 SEVERITIES = (SEVERITY_INFO, SEVERITY_NOTICE, SEVERITY_WARN, SEVERITY_CRITICAL)
+
+#: **瞬态** HTTP 状态码：上游临时不可用，Agent 自己会重试。
+#: 与 429 同一类处理（notice），理由见 ``severity_for_status``。
+#: 只收这三个，**500 / 501 不在内**——那两个不是"稍后再来"，
+#: 是服务端真的出了错或端点根本不支持。
+TRANSIENT_STATUS = frozenset({502, 503, 504})
 
 RULE_DELETE = "delete"
 RULE_FAILURE = "failure"
@@ -310,10 +321,34 @@ def _to_int(value: Any) -> int | None:
 
 
 def severity_for_status(status_code: Any) -> str | None:
-    """把 HTTP 状态码映射成严重度；2xx/3xx 返回 None（不算失败）。"""
+    """把 HTTP 状态码映射成严重度；2xx/3xx 返回 None（不算失败）。
+
+    **502 / 503 / 504 是 notice 不是 critical**（2026-11-26 真机，第五条误报）。
+    实测今晚连报 4 条【严重】，全是网关侧 502：
+
+        【严重】请求失败（状态 502）：模型 step-5-preview；状态 50…
+
+    老口径一句 ``status >= 500 → critical``，理由写的是"服务端在崩，全线不可用"。
+    但那三个码说的不是这件事：
+
+        502 Bad Gateway          上游/代理临时接不上
+        503 Service Unavailable  明确声明"稍后再来"，常带 Retry-After
+        504 Gateway Timeout      上游超时
+
+    它们全是**瞬态**，和 429 同一类——Agent 自己会重试，多数下一轮就好。
+    而 500（服务端真的出了错）、501（端点不支持）不是瞬态，照旧 critical。
+
+    这不是"把 5xx 看轻"，是**不再用【严重】冒充一个我们不掌握的事实**：
+    我们看到的是一次 502，不是"全线不可用"。红字看多了就等于没有，
+    而这里被训练成的后果是用户对真正的 500 也顺手点掉。
+
+    信息一点没少：notice 照样播、照样带状态码，只是不再顶红字。
+    """
     status = _to_int(status_code)
     if status is None:
         return SEVERITY_WARN  # 无状态码但已知失败
+    if status in TRANSIENT_STATUS:
+        return SEVERITY_NOTICE
     if status >= 500:
         return SEVERITY_CRITICAL
     if status == 429:

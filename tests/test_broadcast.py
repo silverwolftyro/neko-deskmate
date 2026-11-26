@@ -215,20 +215,32 @@ def test_distinct_deletions_each_reach_push() -> None:
 # ── 规则 → 播报 的接线（M0-lite-4 把 3a 的规则接到 SDK 上） ────────────────
 
 def test_failure_severity_reaches_priority() -> None:
-    """5xx 必须用 critical 的 priority，否则用户在聊天窗里看不出严重程度。"""
+    """失败类的严重度必须真的走到 priority，否则用户在聊天窗里看不出严重程度。
+
+    2026-11-26：502/503/504 降成 notice（瞬态，Agent 自己会重试），
+    所以这里拆成两半——**非瞬态 5xx 照旧顶格，瞬态的不再顶格**。
+    老版本这条用 503 钉 priority 9，那正是第五条误报的来源。
+    """
     push = RecordingPush()
-    hit = evaluate_failure(status_code=503, error_message="overloaded",
+    hit = evaluate_failure(status_code=500, error_message="internal",
                            agent="claude", session="s1")
     Broadcaster(push, FakeLogger(), source=SOURCE).broadcast(hit)
     assert push.calls[0]["priority"] == 9
-    assert "503" in push.calls[0]["parts"][0]["text"]
+    assert "500" in push.calls[0]["parts"][0]["text"]
 
     push2 = RecordingPush()
-    hit2 = evaluate_failure(status_code=429, error_message="rate limited",
+    hit2 = evaluate_failure(status_code=503, error_message="overloaded",
                             agent="claude", session="s1")
     Broadcaster(push2, FakeLogger(), source=SOURCE).broadcast(hit2)
-    assert push2.calls[0]["priority"] == 4        # notice，不按 critical 打扰人
-    assert push2.calls[0]["ai_behavior"] == "blind"
+    assert push2.calls[0]["priority"] == 4        # notice，不再是 9
+    assert "503" in push2.calls[0]["parts"][0]["text"]
+
+    push3 = RecordingPush()
+    hit3 = evaluate_failure(status_code=429, error_message="rate limited",
+                            agent="claude", session="s1")
+    Broadcaster(push3, FakeLogger(), source=SOURCE).broadcast(hit3)
+    assert push3.calls[0]["priority"] == 4        # notice，不按 critical 打扰人
+    assert push3.calls[0]["ai_behavior"] == "blind"
 
 
 # ── 归因文案：四种模版（2026-11-21 决策记录 §1/§2） ─────────────────────────
@@ -344,9 +356,14 @@ def test_warn_severity_may_name_the_visible_agent() -> None:
 
 
 def test_critical_never_guesses_even_for_failures() -> None:
-    """5xx 是 critical：同样不把主语交给推测。"""
+    """非瞬态 5xx 是 critical：同样不把主语交给推测。
+
+    这条测的是"critical 不猜归因"，与具体哪个状态码无关，所以 hit 是手搭的。
+    2026-11-26 起 502/503/504 不再产生 critical（瞬态，见
+    ``severity_for_status``），这里换成 500——它才是"服务端真的出了错"。
+    """
     hit = _hit(rule="failure", severity=SEVERITY_CRITICAL,
-               summary="请求失败（状态 503）：overloaded", matched="503")
+               summary="请求失败（状态 500）：internal", matched="500")
     assert "发起者未知" in render_text(hit)
 
 

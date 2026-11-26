@@ -25,6 +25,7 @@ from plugin.plugins.agent_deskmate.rules import (
     SEVERITY_CRITICAL,
     SEVERITY_NOTICE,
     SEVERITY_WARN,
+    TRANSIENT_STATUS,
     Coalescer,
     _attribution_of,
     evaluate_delegation,
@@ -147,9 +148,17 @@ def test_evaluate_delete_none_on_safe() -> None:
     (403, SEVERITY_WARN),
     (404, SEVERITY_WARN),
     (429, SEVERITY_NOTICE),   # 限流会自己重试，不该按 critical 打扰人
+    # 2026-11-26 第五条误报：502/503/504 与 429 同类，全是瞬态。
+    # 实测连报 4 条【严重】都是网关侧 502，而它说的是"上游临时接不上"，
+    # 不是老文档写的"全线不可用"。
+    (502, SEVERITY_NOTICE),
+    (503, SEVERITY_NOTICE),
+    (504, SEVERITY_NOTICE),
+    # **非瞬态的 5xx 照旧 critical**：这条是这次改动的安全边界。
+    # 500 是服务端真的出了错，501 是端点不支持，都不是"稍后再来"。
     (500, SEVERITY_CRITICAL),
-    (502, SEVERITY_CRITICAL),
-    (503, SEVERITY_CRITICAL),
+    (501, SEVERITY_CRITICAL),
+    (505, SEVERITY_CRITICAL),
     (None, SEVERITY_WARN),    # 无状态码但已知失败
     ("abc", SEVERITY_WARN),   # 坏值不值得比真 5xx 更严重
 ])
@@ -157,15 +166,39 @@ def test_severity_for_status(status: object, expected: str | None) -> None:
     assert severity_for_status(status) == expected
 
 
+def test_only_the_three_transient_codes_are_downgraded() -> None:
+    """瞬态集合必须正好是这三个，一个不多一个不少。
+
+    写宽了（把 500 也算瞬态）会把服务端真的崩了说成"稍后再来"，
+    那是最危险的方向；写窄了只是多几条红字。
+    """
+    assert set(TRANSIENT_STATUS) == {502, 503, 504}
+
+
 def test_failure_hit_for_server_error() -> None:
+    """失败类的 summary / matched 形状。
+
+    用 503 而不是 500：这条测的是**字段形状**（状态码与原文都进 summary），
+    不是严重度——严重度由 ``test_severity_for_status`` 那张表管。
+    2026-11-26 起 503 是 notice（瞬态），钉它会和那张表打架。
+    """
     hit = evaluate_failure(status_code=503, error_message="service_unavailable: overloaded",
                            agent="claude", session="s1")
     assert hit is not None
     assert hit.rule == RULE_FAILURE
-    assert hit.severity == SEVERITY_CRITICAL
+    assert hit.severity == SEVERITY_NOTICE
     assert "503" in hit.summary
     assert "overloaded" in hit.summary
     assert hit.matched == "503"
+
+
+def test_a_real_server_error_is_still_critical() -> None:
+    """500 不是瞬态：服务端真的出了错，照旧顶格。"""
+    hit = evaluate_failure(status_code=500, error_message="internal error",
+                           agent="claude", session="s1")
+    assert hit is not None
+    assert hit.severity == SEVERITY_CRITICAL
+    assert "500" in hit.summary
 
 
 def test_failure_none_on_success() -> None:
