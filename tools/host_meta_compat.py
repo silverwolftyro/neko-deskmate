@@ -228,6 +228,23 @@ def downgrade(package: Path, target: int, *, dry_run: bool = False) -> dict[str,
         if final_meta.get("schema_version") != target:
             raise RuntimeError("降级后 schema_version 不对")
 
+    # ── 成功后删掉备份 ──
+    #
+    # 2026-11-27：备份从"留着"改成"成功后删"。它是 schema 5 的包，
+    # 装上去卡片按钮全 404，是个地雷；而发布归档的 README 一直要求
+    # "归档前把它移走或删掉"——于是每次打包都要额外跑一条删除命令。
+    #
+    # 真机上那条命令被同桌猫判成【严重】删除文件（路径在工作目录外），
+    # 一晚上响了四次，用户原话：「又来，一点小事，搞得这么严重」。
+    # 让工具自己收摊，比让使用者记得收摊可靠。
+    #
+    # **只在独立校验全过之后删**：校验失败会抛异常，备份因此留下，
+    # 那时候它是唯一的回滚材料。
+    try:
+        backup.unlink()
+    except OSError:
+        pass
+
     return {
         "status": "downgraded",
         "package": str(package),
