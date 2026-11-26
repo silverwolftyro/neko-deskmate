@@ -39,6 +39,7 @@ from .commands import (
     basename,
     command_length,
     delete_command_bodies,
+    delete_segment_texts,
     delete_tier_for_command,
     severity_for_tier,
     simple_commands,
@@ -261,6 +262,115 @@ def _working_dir_of(source: UnifiedEvent | None) -> str | None:
     value = getattr(source, "working_directory", None)
     text = str(value or "").strip()
     return text or None
+
+
+def evaluate_delete_segments(command: str, *, agent: str = "", session: str = "",
+                             ts: str = "",
+                             source: UnifiedEvent | None = None) -> list[RuleHit]:
+    """**逐删除段**判删除类。纯函数，不碰 I/O。
+
+    2026-11-26 新增。``evaluate_delete`` 一条命令只产一条命中，后果不只是
+    "少播几条"——审查（B11）也只有一个项，模型对整批点头就把每一段一起压掉，
+    包括里面那个 ``config.yaml``。逐段判才能让模型对每段各自表态。
+
+    **档位的语义没变**：``evaluate_delete``（整条）的档位是各段取最坏，
+    而这里每段各自的档位。两条路都要留在——闸门与卡片看整条（"这条命令
+    整体有多危险"），播报与审查看分段（"每一段分别值不值得说"）。
+    调用方取 ``max`` 就回到整条的答案，不会有两套档位。
+
+    段文由 ``commands.delete_segment_texts`` 给——那走的是同一个
+    ``_segments`` 切分，不是第二套判据。
+    """
+    working_dir = _working_dir_of(source)
+    out: list[RuleHit] = []
+    for index, segment in enumerate(delete_segment_texts(command)):
+        matched = match_delete(segment)
+        if matched is None:
+            continue
+        tier = delete_tier(segment, working_dir)
+        summary = f"删除文件：{_clip(segment)}"
+        if tier == TIER_SCOPE_UNKNOWN:
+            # B8：范围未知时必须**明说**，不许拿【严重】冒充一个我们并不掌握的
+            # 事实。与 evaluate_delete 同一句文案。
+            summary += "；这条记录没带工作目录，说不清在不在工作区外"
+        out.append(RuleHit(
+            rule=RULE_DELETE,
+            severity=severity_for_tier(tier),
+            summary=summary,
+            matched=matched,
+            agent=agent,
+            session=session,
+            ts=ts,
+            # 合并键带**段序号**：同一条命令的各段若共用一个键，
+            # 合并器会把后几段当重复吃掉——那正是要修的东西。
+            coalesce_key=(f"{RULE_DELETE}|{session}|{agent}|{matched}"
+                          f"|{index}|{_fingerprint(segment)}"),
+            command_length=command_length(command),
+            command=command,
+            **_attribution_of(source),
+        ))
+    return out
+
+
+def merge_multi_delete(hits: list[RuleHit]) -> list[RuleHit]:
+    """同一条命令的多个删除，合成一条播报——**``critical`` 除外**。
+
+    2026-11-26 用户要求按"合成一条"走（``rm -rf a; rm -rf b; rm -rf c``
+    播一条「删了 3 个路径」，而不是三条不相干的事），同时要求：
+    **真的有危险的、或模型判"不遵从 prompt"的，必须独立报告。**
+
+    所以这里只做一半，另一半在调用方：
+
+    - ``critical`` **一律不合成**，原样返回。它是"强制常亮、永不递减"的
+      那一档，合成它等于把红字降级成一句话。
+    - 合成只发生在 warn/notice 之间。合出来的那条取**最坏的档位**——
+      三个里有一个是 warn，合成的就是 warn，不会因为另外两个是 notice 而降。
+    - 调用方只在**没有审查**时调本函数。有审查时每条各自送审：模型对哪条
+      不点头，哪条自己播；先合成再送审会把那个"不"稀释掉。
+
+    这不是"少说几条"，是把"一条命令删了 N 个路径"说完整。
+    """
+    if not hits:
+        return []
+    groups: list[list[RuleHit]] = [[]]
+    for hit in hits:
+        if hit.rule != RULE_DELETE:
+            groups.append([hit])
+            continue
+        if hit.severity == "critical" or not groups[-1] or \
+                groups[-1][-1].command != hit.command:
+            groups.append([hit])
+            continue
+        groups[-1].append(hit)
+
+    out: list[RuleHit] = []
+    for group in groups:
+        if not group:
+            # 起始占位的空组（第一个 hit 是非删除类时留下的）。别让它
+            # 走到下面的 group[0]——那是 IndexError。
+            continue
+        if len(group) == 1:
+            out.append(group[0])
+            continue
+        first = group[0]
+        targets = ", ".join(
+            _clip(hit.summary.split("：", 1)[-1], 40) for hit in group)
+        # 合成的取最坏的档位：三个里有一个是 warn，合成的就是 warn，
+        # 不会因为另外两个是 notice 而降。
+        # **刻意不引 ``broadcast.SEVERITY_PRIORITY``**：broadcast 已经 import
+        # 本模块，反向 import 会成环；而这里只可能在 warn/notice 之间取
+        # （critical 在上面就被排除），四档阶梯写明白比引一张表更难漂。
+        if any(hit.severity == "warn" for hit in group):
+            worst = "warn"
+        elif any(hit.severity == "critical" for hit in group):
+            worst = "critical"
+        else:
+            worst = group[0].severity
+        out.append(first.model_copy(update={
+            "severity": worst,
+            "summary": f"删除文件：一条命令里删了 {len(group)} 处（{targets}）",
+        }))
+    return out
 
 
 def delete_tier(command: str, working_directory: str | None = None) -> str:

@@ -1070,6 +1070,31 @@ def _command_position_tokens(body: list[tuple[str, str]]) -> list[str]:
     return out
 
 
+def delete_segment_texts(command: str) -> list[str]:
+    """把命令拆成**含删除动作的段**的原文。
+
+    2026-11-26：一条 Bash 里 ``rm -rf a; rm -rf b; rm -rf c`` 只产一条命中，
+    于是审查也只有一个项——模型对整批点头，三条一起被压掉，包括里面那个
+    ``config.yaml``。逐段判才能让模型对每段各自表态。
+
+    走 ``_segments`` 而不是自己按 ``;|&`` 切：那份切法已经处理了 heredoc 与
+    重定向，自己再写一套就会和它对不上——"``is_delete_command`` 说不是删除、
+    这里说有一段是删除"正是要消灭的那类事。
+
+    段文由**原文 token** 用空格拼回：归一化会 strip 引号并转小写，
+    拼回去用户就认不出自己敲的那个路径了（``D:/other/x.txt`` 变
+    ``d:/other/x.txt`` 正是 ``_raw_tokens`` 的 docstring 要避免的那件事）。
+    """
+    out: list[str] = []
+    for segment in _segments(command):
+        if not _segment_has_delete(segment):
+            continue
+        text = " ".join(raw for raw, _ in segment if raw).strip()
+        if text:
+            out.append(text)
+    return out
+
+
 def delete_command_bodies(command: str) -> list[tuple[list[str], list[str]]]:
     """逐段给出 **（剥噪音后的命令主体, 命令位 token）**。
 

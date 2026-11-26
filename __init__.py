@@ -150,9 +150,10 @@ from .rules import (
     Coalescer,
     RuleHit,
     evaluate_delegation,
-    evaluate_delete,
+    evaluate_delete_segments,
     evaluate_failure,
     evaluate_transcript_error,
+    merge_multi_delete,
 )
 from .tracker import DEFAULT_CONFIG, Notice, ProgressTracker, TrackerConfig
 from .warncount import COUNTS_FILENAME
@@ -661,13 +662,15 @@ def _hits_for_event(event: UnifiedEvent, mine_roots: list[Path] = ()) -> list[Ru
             if hit is not None:
                 hits.append(hit)
         elif attributed.command:
-            hit = evaluate_delete(
+            # **逐删除段**判（2026-11-26）。一条 Bash 里
+            # ``rm -rf a; rm -rf b; rm -rf c`` 只产一条命中的后果不只是
+            # "少播几条"——审查也只有一个项，模型对整批点头就把三条一起
+            # 压掉，包括里面那个 config.yaml。逐段判才能让它对每段各自表态。
+            hits.extend(evaluate_delete_segments(
                 attributed.command,
                 agent=attributed.agent, session=attributed.session, ts=attributed.ts,
                 source=attributed,
-            )
-            if hit is not None:
-                hits.append(hit)
+            ))
 
     elif attributed.event == "error":
         if attributed.source_type == "proxy_request_logs":
@@ -1433,7 +1436,18 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
         reviewer = _broadcast_reviewer(config)
         for event in events:
-            for hit in _hits_for_event(event, mine_roots):
+            event_hits = _hits_for_event(event, mine_roots)
+            # **没有审查时才合成多条删除**（2026-11-26 用户要求按"合成一条"走）。
+            #
+            # 有审查时**不合成**：每条各自送审，模型对哪条不点头，哪条自己播。
+            # 先合成再送审，那个"不"就被稀释成一条"删了 3 处"——而其中一处
+            # 正是模型觉得不该说的那个。用户原话：「如果这个事情真的是有危险，
+            # 或者被自动审查判断为不是遵从 prompt 的情况下，他应该独立报告」。
+            #
+            # 合成也永远不碰 ``critical``（见 merge_multi_delete 的文档）。
+            if reviewer is None:
+                event_hits = merge_multi_delete(event_hits)
+            for hit in event_hits:
                 if reviewer is not None and _reviewable_broadcast(hit):
                     # 送审前**必须先合并**：不合并的话同一条命令在窗口内
                     # 每轮重新排一次队，每轮都多花一次用户的 key。

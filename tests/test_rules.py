@@ -27,12 +27,15 @@ from plugin.plugins.agent_deskmate.rules import (
     SEVERITY_WARN,
     TRANSIENT_STATUS,
     Coalescer,
+    RuleHit,
     _attribution_of,
     evaluate_delegation,
     evaluate_delete,
+    evaluate_delete_segments,
     evaluate_failure,
     evaluate_transcript_error,
     match_delete,
+    merge_multi_delete,
     severity_for_status,
 )
 
@@ -427,3 +430,105 @@ def test_delegation_carries_attribution() -> None:
     assert hit.requester == "session:800257f3-aaaa"
     assert hit.requester_evidence == EVIDENCE_MCP_DELEGATION
     assert hit.chain_id == source.session
+
+
+# ── 一条命令里的多个删除：合成一条，但危险的独立 ────────────────────────
+#
+# 2026-11-26 用户要求按"合成一条"走，同时要求：
+# 「如果这个事情真的是有危险，或者被自动审查判断为不是遵从 prompt 的情况下，
+#   他应该独立报告。」
+#
+# 所以合成只做一半：critical 一律不合成（调用方也不在送审前合成）。
+
+
+def _seg(command: str, index: int) -> RuleHit:
+    hits = evaluate_delete_segments(command, agent="a", session="s")
+    assert len(hits) > index, f"{command!r} 只有 {len(hits)} 段"
+    return hits[index]
+
+
+def test_one_command_yields_one_hit_per_delete_segment() -> None:
+    """逐段判——审查才能对每段各自表态。
+
+    老实现一条命令一条命中，模型对整批点头就把三条一起压掉，
+    包括里面那个 config.yaml。
+    """
+    assert len(evaluate_delete_segments("rm -rf a; rm -rf b; rm -rf c",
+                                        agent="a", session="s")) == 3
+
+
+def test_each_segment_gets_its_own_coalesce_key() -> None:
+    """合并键必须带段序号。
+
+    共用一个键的后果：合并器把后几段当重复吃掉——那正是要修的东西。
+    """
+    hits = evaluate_delete_segments("rm -rf a; rm -rf b", agent="a", session="s")
+    assert hits[0].coalesce_key != hits[1].coalesce_key
+
+
+def test_each_segment_gets_its_own_tier() -> None:
+    """分段各自定档——``a`` 在工作目录内，``~/x`` 不是。"""
+    hits = evaluate_delete_segments("rm -rf a; rm -rf ~/x", agent="a",
+                                    session="s")
+    assert [h.severity for h in hits] == ["warn", "critical"]
+
+
+def test_the_whole_command_tier_is_still_worst_across_segments() -> None:
+    """整条的档位没变——各段取最坏。
+
+    这条钉的是"没有第二套档位"：闸门与卡片看整条，播报与审查看分段，
+    两条路都对，且能互相还原。
+    """
+    hit = evaluate_delete("rm -rf a; rm -rf ~/x", agent="a", session="s")
+    assert hit is not None and hit.severity == "critical"
+
+
+def test_three_routine_deletes_merge_into_one_line() -> None:
+    hits = evaluate_delete_segments("rm -rf a; rm -rf b; rm -rf c",
+                                    agent="a", session="s")
+    merged = merge_multi_delete(hits)
+    assert len(merged) == 1
+    assert "删了 3 处" in merged[0].summary
+    assert merged[0].severity == "warn"
+
+
+def test_a_critical_segment_is_never_merged() -> None:
+    """**安全边界**：红的自己播，不折进一句话里。"""
+    hits = evaluate_delete_segments("rm -rf a; rm -rf ~/x", agent="a",
+                                    session="s")
+    merged = merge_multi_delete(hits)
+    assert len(merged) == 2
+    assert [h.severity for h in merged] == ["warn", "critical"]
+
+
+def test_merging_takes_the_worst_severity() -> None:
+    """合成后取最坏的档——不会因为另外几个是 notice 就降。"""
+    hits = evaluate_delete_segments("rm -rf build; rm -rf src", agent="a",
+                                    session="s")
+    assert {h.severity for h in hits} == {"notice", "warn"}
+    merged = merge_multi_delete(hits)
+    assert len(merged) == 1
+    assert merged[0].severity == "warn"
+
+
+def test_different_commands_are_not_merged_together() -> None:
+    """只合同一条命令内的段。两条不同的命令是两件事。"""
+    hits = (evaluate_delete_segments("rm -rf a", agent="a", session="s")
+            + evaluate_delete_segments("rm -rf b", agent="a", session="s"))
+    assert len(merge_multi_delete(hits)) == 2
+
+
+def test_a_single_delete_passes_through_unchanged() -> None:
+    hits = evaluate_delete_segments("rm -rf a", agent="a", session="s")
+    assert merge_multi_delete(hits) == hits
+
+
+def test_merge_leaves_non_delete_hits_alone() -> None:
+    """失败类命中不是删除，原样返回——别把它算进"删了几处"。"""
+    failure = evaluate_failure(status_code=400, agent="a", session="s")
+    assert failure is not None
+    assert merge_multi_delete([failure]) == [failure]
+
+
+def test_merging_an_empty_list_is_a_noop() -> None:
+    assert merge_multi_delete([]) == []

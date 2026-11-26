@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import queue
 import time
+from collections import deque
 from datetime import datetime, timezone
 
 import pytest
@@ -26,6 +27,7 @@ import plugin.plugins.agent_deskmate as plugin_module
 from plugin.plugins.agent_deskmate import (
     MAX_BROADCAST_PER_TICK,
     MAX_PENDING_PUSHES,
+    REVIEW_LOG_LIMIT,
     SOURCE,
     AgentDeskmatePlugin,
     _has_model_key,
@@ -206,6 +208,8 @@ class _Host:
         self._review_suppressed = 0
         self._review_failed = 0
         self._review_attempts = 0
+        # B11 压掉了什么的痕迹。真插件 _reset_watch_state 建，这里手搭一份。
+        self._review_log: deque = deque(maxlen=REVIEW_LOG_LIMIT)
         # 这些测试不送审：没有 reviewer（_broadcast_reviewer 返回 None），
         # 所以 _maybe_submit_review 直接返回。_advice_pool 留着 None 即可。
         self._advice_pool = None
@@ -507,13 +511,32 @@ def test_the_overflow_queue_has_a_hard_ceiling_and_says_so() -> None:
     assert any("超过硬顶" in line for line in host.logger.lines)
 
 
+class _FakeHit:
+    """长得像 RuleHit 的桩，只带 ``merge_multi_delete`` 会碰的三个字段。
+
+    ``__str__`` 返回 ``"hit"`` 是为了让 ``_TaggingBroadcaster`` 的
+    ``f"rule:{hit}"`` 保持原样——这个测试要断言的是**条数与顺序**，
+    不是 RuleHit 的形状。``command`` 各不同，免得被合并成一条
+    （那就测不到条数上限了）。
+    """
+
+    def __init__(self, index: int) -> None:
+        self.rule = "delete"
+        self.severity = "warn"
+        self.command = f"rm -rf x{index}"
+
+    def __str__(self) -> str:
+        return "hit"
+
+
 def test_rule_hits_go_out_before_progress_notices(monkeypatch) -> None:
     """撞上条数上限时，该被推迟的是进度播报，不是"它刚删了文件"。"""
     sink: list[str] = []
     host = _Host([_failed_step(_now() - 300)])
     host._broadcaster = _TaggingBroadcaster(sink)                # noqa: SLF001
     monkeypatch.setattr(plugin_module, "_hits_for_event",
-                        lambda event, roots: ["hit"] * MAX_BROADCAST_PER_TICK)
+                        lambda event, roots: [
+                            _FakeHit(i) for i in range(MAX_BROADCAST_PER_TICK)])
     host.poll()
     assert sink == ["rule:hit"] * MAX_BROADCAST_PER_TICK
     assert host.pushed == []                                      # 通知整批推迟
@@ -1107,3 +1130,85 @@ def test_other_notices_do_not_get_the_forced_voice() -> None:
         if "这一轮跑完了" in call["parts"][0]["text"]:
             continue
         assert call["ai_behavior"] == "blind", call["parts"][0]["text"][:40]
+
+
+# ── 一条命令多个删除：没有审查时才合成 ─────────────────────────────────
+#
+# 用户原话：「如果这个事情真的是有危险，或者被自动审查判断为不是遵从
+# prompt 的情况下，他应该独立报告。」
+#
+# 所以合成只发生在**没有审查**的路上。有审查时每条各自送审——模型对哪条
+# 不点头，哪条自己播；先合成再送审会把那个"不"稀释成一句"删了 3 处"。
+
+
+class _DeleteHost(_Host):
+    """喂一条转录删除命令的 _Host。"""
+
+    def __init__(self, command) -> None:
+        super().__init__([_delete_step(_now() - 10, command)])
+
+
+class _StubReviewer:
+    """不发起网络的审查客户端：一律 low+allow（全部压掉）。"""
+
+    def review_batch(self, *, items):
+        return [False] * len(items), "", 1
+
+
+def _delete_step(at: float, command: str) -> UnifiedEvent:
+    return UnifiedEvent(agent=AGENT, session="sess-1", event=EVENT_TOOL_USE,
+                        tool="Bash", command=command, summary=command,
+                        ts=_iso(at))
+
+
+def _no_reviewer(config):
+    return None
+
+
+def _stub_reviewer(config):
+    return _StubReviewer()
+
+
+def test_three_deletes_without_a_reviewer_become_one_line(monkeypatch) -> None:
+    """没审查（没 key / 没开）→ 一条命令删了 N 处合成一条。"""
+    monkeypatch.setattr(plugin_module, "_broadcast_reviewer", _no_reviewer)
+    host = _DeleteHost("rm -rf a; rm -rf b; rm -rf c")
+    host.poll()
+    assert len(host.pushed) == 1
+    assert "删了 3 处" in host.pushed[0]["parts"][0]["text"]
+
+
+def test_three_deletes_with_a_reviewer_stay_separate(monkeypatch) -> None:
+    """有审查 → **不合成**。三条各自送审，各自被压掉或各自播。"""
+    monkeypatch.setattr(plugin_module, "_broadcast_reviewer", _stub_reviewer)
+    host = _DeleteHost("rm -rf a; rm -rf b; rm -rf c")
+    host._advice_pool = _StubPool()               # noqa: SLF001
+    host.poll(times=3)
+    # 桩审查一律 low+allow → 三条全压掉，一条都不播
+    assert host.pushed == []
+    assert host._review_submitted == 3            # noqa: SLF001 三条都送了审
+
+
+def test_a_critical_segment_is_never_sent_for_review(monkeypatch) -> None:
+    """``critical`` 永不递减——它连审查都不进，直接自己播。"""
+    monkeypatch.setattr(plugin_module, "_broadcast_reviewer", _stub_reviewer)
+    host = _DeleteHost("rm -rf a; rm -rf ~/Documents")
+    host._advice_pool = _StubPool()               # noqa: SLF001
+    host.poll(times=3)
+    texts = [p["parts"][0]["text"] for p in host.pushed]
+    assert any("~/Documents" in t for t in texts)
+    assert host._review_submitted == 1            # noqa: SLF001 只有 a 送了审
+    assert host._review_suppressed == 1           # noqa: SLF001
+
+
+class _StubPool:
+    """立刻跑完的假线程池。"""
+
+    def submit(self, fn, *args):
+        fn(*args)
+        return _Done()
+
+
+class _Done:
+    def done(self) -> bool:
+        return True
