@@ -101,6 +101,7 @@ from .commands import (
     conclusion_for,
     delete_targets,
     fact_line,
+    path_is_under,
     severity_for_tier,
     tier_for_command,
     translate,
@@ -356,12 +357,19 @@ def local_facts_for(record: Any) -> str:
 
 
 def _is_under(path: Path, root: str) -> bool:
-    try:
-        resolved = path.resolve()
-        base = Path(root).resolve()
-    except OSError:
-        return False
-    return resolved == base or base in resolved.parents
+    """路径是否在 root 之内。**转交 commands.path_is_under**（2026-11-26）。
+
+    原来这里自己写了一份 ``Path.resolve()`` 版。两个问题：
+
+    1. ``resolve()`` 对**相对路径按进程当前目录**解，而 N.E.K.O 的进程目录
+       与会话工作目录没有关系——于是每条相对路径的删除，卡片都说
+       "在工作目录外"；
+    2. 更根本的：闸门（``commands._under``）与卡片这里是**两份判据**，
+       而同一条命令两个答案，用户只能不信其中一边。
+
+    现在只有 ``commands.path_is_under`` 一份。改 containment 改那里。
+    """
+    return path_is_under(str(path), root)
 
 
 def effective_max_severity(configured: str) -> str:

@@ -19,6 +19,7 @@ SQL / git 好几套语法，按动词列必定漏（规格 §16.1「覆盖 §5.2
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -523,11 +524,34 @@ def _is_system_path(target: str) -> bool:
                for prefix in _SYSTEM_DIRS)
 
 
+def _norm(path: str) -> str:
+    """归一化成可比较的形式：统一分隔符、小写、折叠 ``.`` 与 ``..``。
+
+    **折叠 ``..`` 是 2026-11-26 补的**：老实现只做小写 + 替换分隔符，
+    于是 ``_under("../x", "D:\\\\proj")`` 拿 ``"../x"`` 去比前缀，永远不匹配。
+    更糟的是 ``_tier_of_one`` 在调用它之前就用
+    ``if not _is_absolute(target): return TIER_NORMAL`` 把相对路径整个放过了，
+    所以 ``rm -rf ../../..`` 一路被判成 normal/warn——
+    **删到工作区外三级，比删 ``D:/other/x``（critical）判得还轻**。
+    """
+    return os.path.normpath(str(path or "").replace("/", "\\")).replace("/", "\\").lower()
+
+
 def _under(path: str, root: str) -> bool:
+    """路径是否在 root 之内。**相对路径按 root 解析**（不是按进程 cwd）。
+
+    审批卡片那一侧（``approval._is_under``）也用这一个函数：
+    它原来自己 ``Path.resolve()``，而 ``resolve()`` 对相对路径是按**进程
+    当前目录**解的——N.E.K.O 的进程目录和会话工作目录没有关系。于是同一
+    条 ``rm -rf src``，卡片说"在工作目录外"，闸门说 normal，两边都对不上。
+    """
     if not root:
         return False
-    normal_root = root.replace("/", "\\").rstrip("\\").lower()
-    normal_path = path.replace("/", "\\").lower()
+    normal_root = _norm(root)
+    if not normal_root:
+        return False
+    candidate = path if _is_absolute(path) else os.path.join(str(root), str(path))
+    normal_path = _norm(candidate)
     return normal_path == normal_root or normal_path.startswith(normal_root + "\\")
 
 
@@ -610,22 +634,77 @@ _RECOVERABLE_MARKERS = (
 # 目标集合算不出来的形态：命令替换、环境变量、通配符。
 # `rm -rf $(cat list)` / `rm -rf *` / `rm -rf $HOME` 的破坏面都大于
 # 任何单一路径，所以一律按最坏的档处理（B2 表：含通配符或无法解析的目标）。
-#: 「目标可能被藏起来」的特征。命中即认为解析不出目标，
-#: 删除类调用方会把它抬到极高危（``delete_tier_for_command``）。
-#:
-#: **2026-11-26 实测删掉了 ``%``**：原正则含 ``%``，于是
-#: ``date +%H:%M:%S && rm -f x`` 被判"目标不可解析" → 删除类抬到
-#: extreme → 【严重】删除文件。而 ``%`` 从来不藏路径：
-#:   - ``date``/``printf`` 的格式符（``%H``/``%s``）
-#:   - ``${var%pattern}`` / ``${var%%pattern}`` 的后缀删除——但那个的 ``$``
-#:     已经在这里抓到了，``%`` 是纯多余的
-#:   - 文件名里字面意义的 ``%``
-#: 留着它的代价是**任何带 % 的命令加上一个 rm 都爆红字**，
-#: 而红字看多了就等于没有——正是 B2 要消灭的那个失效模式。
-#:
-#: 留下的六个都确实能藏目标：``$`` 与 ``` ` ``` 是变量/命令替换，
-#: ``*`` ``?`` 是通配，``[`` ``]`` 是字符类。
-_UNPARSEABLE_RE = re.compile(r"[$`*?\[\]]")
+#: 通配符：``*`` ``?`` 与字符类 ``[ ]``。
+_GLOB_CHARS_RE = re.compile(r"[*?\[\]]")
+#: 变量 / 命令替换。替换出来的值完全不可知，所以它藏得住目标。
+_SUBSTITUTION_RE = re.compile(r"[$`]")
+
+
+def _target_hides_scope(target: str) -> bool:
+    """这个**目标 token** 藏住了作用域吗。
+
+    2026-11-26 重写。老实现是一条正则搜**整条命令串**：
+
+        _UNPARSEABLE_RE = re.compile(r"[$`*?\\[\\]]")
+        return bool(_UNPARSEABLE_RE.search(strip_heredocs(command)))
+
+    实测（35 个转录 / 3245 次 Bash / 119 条删除命中）它把 **47 条**抬到
+    极高危，其中 **24 条只由通配符触发**，20 条真的因此从【严重】掉下来——
+    也就是全部【严重】的 28%。三类误报，全是"字符在一条命令里出现过"：
+
+        rm -rf build --exclude="*.log"   目标只有 build，* 在开关值里
+        rm -rf dist && echo "*"           * 在另一条 && 段里
+        rm -rf build/*                    * 在有字面前缀的目标里
+
+    删掉 ``%``（同一天，第四条误报）贴的正是这道伤口的第二张创可贴：
+    ``date +%H:%M:%S && rm -f x`` 与 ``--exclude='*.log'`` 是同一类病。
+
+    ## 新判据：只看目标，且区分「有目录前缀的通配」与「光板通配」
+
+    1. 含 ``$``` ` `` → 藏（替换值不可知）；
+    2. 一个通配符都没有 → 不藏（字面路径）；
+    3. 通配符**之前**有字面目录（``build/``、``/tmp/``）→ 不藏，
+       作用域被那个目录圈住了，按它判档即可；
+    4. 通配符之前没有目录，或只有 ``.``/``..``/分隔符 → 藏。
+       ``*.log`` / ``a?b`` / ``f[0-9].txt`` / ``*`` / ``./*`` / ``../*``
+       的作用域说不清，按最坏的猜。
+
+    第 4 条是刻意保留的收敛：``rm -rf ./*`` 与 ``rm -rf *`` 语义等价，
+    放过它就等于放过后者。而 ``build/*`` 与 ``*`` 不是一回事——
+    前者圈在 ``build`` 里，而 ``build`` 本来就在可恢复词表上。
+    """
+    text = str(target or "").strip().strip("'\"")
+    if not text:
+        return True
+    if _SUBSTITUTION_RE.search(text):
+        return True
+    match = _GLOB_CHARS_RE.search(text)
+    if match is None:
+        return False
+    prefix = text[: match.start()]
+    if not any(sep in prefix for sep in ("/", "\\")):
+        return True
+    return prefix.strip("/\\. ") in ("", ".", "..")
+
+
+def target_unparseable(command: str) -> bool:
+    """目标集合算不算得出来。算不出来 → 调用方必须按最坏的档处理。
+
+    **同样要先剥 heredoc**：这个函数看的是原始命令串，而
+    ``_segments`` 已经剥过了。两边看不用的文本，就会出现
+    "``is_delete_command`` 说不是删除、``target_unparseable`` 却说目标藏起来了"
+    这种自相矛盾——正是"两套判据"要避免的那件事。
+
+    **逐目标判，不再整条搜**（2026-11-26，见 ``_target_hides_scope``）：
+    只要有一个目标藏住作用域，整条就算不可解析——一条命令删两个路径，
+    说不清的那个说了算（与 ``target_tier`` 的取最坏同向）。
+    """
+    targets = delete_targets(command)
+    if not targets:
+        # 没有目标不是"藏起来了"，是"没有"——那由 tier_for_command 的
+        # 待定分支处理，删除类调用方会再抬到极高危。两边不许抢同一件事。
+        return False
+    return any(_target_hides_scope(t) for t in targets)
 
 
 def is_assignment(token: str) -> bool:
@@ -846,12 +925,32 @@ def _segment_targets(segment: list[tuple[str, str]]) -> tuple[str, ...]:
                  if not norm.startswith("-") and not is_assignment(norm))
 
 
+def _segment_has_delete(body: list[tuple[str, str]]) -> bool:
+    """这一段里有没有删除类动作。判据与 ``is_delete_command`` 逐字一致。
+
+    **必须是同一套**：``match_delete`` / ``is_delete_command`` / 这里三处
+    对"什么叫删除"给出不同答案，就会出现"播报说这条是删除、档位说它不是"。
+    """
+    if not body:
+        return False
+    norms = [norm for _, norm in body]
+    for left, right in DELETE_PAIRS:
+        if left in norms and right in norms:
+            return True
+    return any(basename(token) in DELETE_TOKENS for token in norms)
+
+
 def delete_targets(command: str) -> tuple[str, ...]:
     """这条命令**要动哪些路径**。抽不出返回空元组。
 
-    只取命令主体之后、非开关、非赋值的 token；``cd`` / ``export`` 这类
+    只取**含删除动作那段**里的路径目标；``cd`` / ``export`` 这类
     只改 shell 自身状态的段整段跳过（见 ``_NAVIGATION_COMMANDS``）——
     `rm -rf a b` 要能取到 `a` 和 `b` 两个，漏一个就可能把档位判低。
+
+    **2026-11-26：非删除段整段丢掉。** 老实现对每一段都取目标，于是
+    ``rm -rf dist && echo "*"`` 的目标是 ``('dist', '*')``——那个 ``*``
+    是 ``echo`` 的参数，shell 一个文件都不会删，却把整条顶成【严重】。
+    "这条命令要动哪些路径"的答案只能来自会动路径的那几段。
 
     **刻意不用"停用词"过滤**：曾经用 `a` / `the` / `in` 之类筛掉"不像路径的
     token"，结果 `rm -rf a b` 只取到 `b`——单字母目录名被当成英文冠词丢掉了。
@@ -863,6 +962,8 @@ def delete_targets(command: str) -> tuple[str, ...]:
     """
     found: list[str] = []
     for segment in _segments(command):
+        if not _segment_has_delete(segment):
+            continue
         found.extend(_segment_targets(segment))
     return tuple(found)
 
@@ -880,17 +981,6 @@ def _looks_like_path(token: str) -> bool:
     if not text:
         return False
     return text.lower() not in _SHELL_KEYWORDS
-
-
-def target_unparseable(command: str) -> bool:
-    """目标集合算不算得出来。算不出来 → 调用方必须按最坏的档处理。
-
-    **同样要先剥 heredoc**：这个函数看的是原始命令串，而
-    ``_segments`` 已经剥过了。两边看不用的文本，就会出现
-    "``is_delete_command`` 说不是删除、``target_unparseable`` 却说目标藏起来了"
-    这种自相矛盾——正是"两套判据"要避免的那件事。
-    """
-    return bool(_UNPARSEABLE_RE.search(strip_heredocs(str(command or ""))))
 
 
 def is_recoverable_target(target: str) -> bool:
@@ -921,11 +1011,14 @@ def _tier_of_one(target: str, working_directory: str | None) -> str:
     if not working_directory:
         # B8：**拿不到工作目录 ≠ 最坏**。老实现这里返回极高危，于是转录里
         # 每条缺 cwd 的删除都顶【严重】，而审批卡片（hook payload 带 cwd）
-        # 对同一条命令说 notice——两边说的不是一件事，用户只能不信其中一边。
+        # 对同一条命令说 notice——两边说的不是一回事，用户只能不信其中一边。
         # 改成「范围未知」档：知道要删什么，不知道它在不在工作区外。
         return TIER_SCOPE_UNKNOWN
-    if not _is_absolute(target):
-        return TIER_NORMAL      # 相对路径：相对于会话工作目录，算在内
+    # **相对路径也走 containment**（2026-11-26）。老实现这里有一句
+    # `if not _is_absolute(target): return TIER_NORMAL`，本意是"相对路径
+    # 相对于会话工作目录，算在内"——但 `../..` 同样是相对路径，
+    # 它相对于工作目录的解算结果在**工作区外**。一句话同时放过
+    # `src`（该放过）和 `../../..`（不该放过），因为没真去解算。
     return TIER_NORMAL if _under(target, working_directory) else TIER_EXTREME
 
 
@@ -980,6 +1073,22 @@ NON_SPECIFIC_SCOPES = frozenset({
     "看不出它会影响哪些文件",
     "影响范围不止一个文件",
 })
+
+
+def path_is_under(path: str, root: str) -> bool:
+    """路径是否在 root 之内。**闸门与审批卡片共用这一个函数**。
+
+    2026-11-26 抽出来是为了消灭一处"两边说不一样的话"：审批卡片原来
+    自己写了一份 ``Path.resolve()`` 版的 containment，而 ``resolve()``
+    对相对路径是按**进程当前目录**解的。N.E.K.O 的进程目录和会话工作目录
+    没有关系，于是每条相对路径的删除，卡片都说"在工作目录外"，
+    闸门（当时还说 normal）说"在内"。同一份事实两个答案，
+    用户只能不信其中一边——那正是 B8 注释里要消灭的失效模式，
+    只是它换了个位置又长了一次。
+
+    现在只有这一份判据。要改 containment，改这里，两边一起变。
+    """
+    return _under(path, root)
 
 
 def scope_is_specific(scope: str) -> bool:
