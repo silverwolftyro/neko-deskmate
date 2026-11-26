@@ -295,6 +295,8 @@ class _Host:
         self._review_suppressed = 0
         self._review_failed = 0
         self._review_attempts = 0
+        # 真插件那边是 _advice_pool（max_workers=1）；这里换成记账用的假池
+        self._advice_pool = _Pool()
 
     def run(self, batch, reviewer):
         return self._run_review_batch(batch, reviewer)
@@ -306,6 +308,27 @@ class _Queue:
 
     def put(self, item) -> None:
         self.items.append(item)
+
+
+class _Future:
+    """假 future。``done`` 可配——槽位释放判的就是它。"""
+
+    def __init__(self, done: bool) -> None:
+        self._done = done
+
+    def done(self) -> bool:
+        return self._done
+
+
+class _Pool:
+    """记账用的假线程池：只记提交了几次，不真跑。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[RuleHit, ...]] = []
+
+    def submit(self, fn, *args):
+        self.calls.append(args)
+        return _Future(done=True)
 
 
 class _Logger:
@@ -416,6 +439,61 @@ def test_the_prompt_gets_the_local_facts() -> None:
     assert reviewer.seen[0]["rule"] == "delete"
     assert reviewer.seen[0]["severity"] == hit.severity
     assert reviewer.seen[0]["cwd"] == WD
+
+
+# ── 槽位：审完一批必须还回去，否则 B11 一辈子只审一批 ──────────────────
+
+
+def test_a_finished_batch_releases_the_slot_for_the_next_one() -> None:
+    """**B11 一辈子只审一批** 的回归测试。
+
+    ``_review_future`` 从提交起就一直非 None，而守卫写的是 ``is not None``
+    ——第一批审完之后槽位永不释放，后面每条可审播报都静默压进
+    ``_review_queue``：不送审、不播报、不打日志，面板上四个计数器
+    一个都不动。2026-11-26 真机实测：19:54 审掉一批，之后所有
+    warn 删除与失败事件全部无声消失，而日志干干净净什么都没报。
+    """
+    host = _bind()()
+    reviewer = _FakeReviewer([True])
+    host._review_queue.extend([_hit("rm -rf src"), _hit("rm -rf build")])
+    host._maybe_submit_review(reviewer)
+    assert host._review_submitted == 2
+    assert len(host._advice_pool.calls) == 1
+
+    # 上一批"审完了"（future.done() 为真）→ 槽位该还回去，第二批要能送
+    host._review_queue.append(_hit("rm -rf node_modules"))
+    host._maybe_submit_review(reviewer)
+    assert len(host._advice_pool.calls) == 2
+    assert host._review_submitted == 3
+
+
+def test_a_batch_still_in_flight_holds_the_slot() -> None:
+    """在飞的那批不许被第二批顶掉——``_advice_pool`` 只有 1 个 worker。
+
+    没有这条，第二个 tick 会把新一批也 submit 进去，而它只会在第一个
+    后面排队；届时"最多同时一批在审"这个前提没了， survivor 到达顺序
+    也不再保证。
+    """
+    host = _bind()()
+    host._advice_pool = _BlockingPool()
+    reviewer = _FakeReviewer([True])
+    host._review_queue.append(_hit("rm -rf src"))
+    host._maybe_submit_review(reviewer)
+    host._review_queue.append(_hit("rm -rf build"))
+    host._maybe_submit_review(reviewer)
+    assert len(host._advice_pool.calls) == 1
+    assert host._review_queue              # 没送的那条得还在队列里
+
+
+class _BlockingPool:
+    """submit 回来的 future 永远不 done——模拟审查还在飞。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[RuleHit, ...]] = []
+
+    def submit(self, fn, *args):
+        self.calls.append(args)
+        return _Future(done=False)
 
 
 # ── 合并：送审前必须先合并，否则每轮多花一次 key ─────────────────────────

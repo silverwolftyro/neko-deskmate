@@ -1451,8 +1451,20 @@ class AgentDeskmatePlugin(NekoPluginBase):
 
     def _maybe_submit_review(self, reviewer: AutoReviewer | None) -> None:
         """队列非空就送一批去审。**不在 tick 里等结果**。"""
-        if reviewer is None or self._review_future is not None:
+        if reviewer is None:
             return
+        # 上一批跑完了就把槽位还回去。
+        #
+        # **不清的后果是 B11 一辈子只审一批。** ``_review_future`` 从提交起
+        # 就一直非 None，而守卫写的是 ``is not None``——第一批审完之后
+        # 槽位永不释放，后面每条可审播报都静默压进 ``_review_queue``：
+        # 不送审、不播报、不打日志，面板上四个计数器一个都不动。
+        # 2026-11-26 真机实测：19:54 审掉一批，之后所有 warn 删除与失败
+        # 事件全部无声消失，而日志干干净净，什么都没报。
+        if self._review_future is not None:
+            if not self._review_future.done():
+                return
+            self._review_future = None
         batch = self._review_queue[:REVIEW_BATCH_MAX]
         if not batch:
             return
