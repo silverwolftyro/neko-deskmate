@@ -485,13 +485,22 @@ class ProgressTracker:
         detail = f"第 {state.rounds} 轮，共 {state.actions} 步"
         if tally:
             detail += f"（{tally}）"
+        # 会话短 id 也进 detail。**headline 只放 agent + 目录**：用户要的是
+        # "一眼认出是谁在哪干活"，UUID 全串没有辨认价值（0.6.13 真机反馈：
+        # 播报主语是一整个文件路径，用户根本看不出"这是我的会话跑完了"）。
+        # 但"哪个会话"仍然要可查——所以放 detail，不放 headline。
+        short = state.session[:8] if state.session else ""
+        if short:
+            detail += f" · 会话 {short}"
         state.round_kinds = {}
 
         notice = self._emit(
             state, signal.at,
             role=Role.BOUNDARY, light=Light.IDLE,
             fingerprint=f"round|{state.agent}|{state.session}|{state.rounds}",
-            headline=f"{self._who(state)} 这一轮跑完了",
+            # **agent 放在目录前面**。``_who`` 优先给 workspace（"用户认识目录"），
+            # 但对"跑完了"这件事，先问的是"谁跑的"——尤其是多个 Agent 同时在看时。
+            headline=f"{state.agent} · {self._who(state)} 这一轮跑完了",
             detail=detail,
         )
         state.light = Light.IDLE

@@ -99,8 +99,10 @@ from .approval import (
 from .auto_review import REVIEW_BATCH_MAX, AutoReviewer
 from .broadcast import (
     NOTICE_MERGE_SECONDS,
+    NOTICE_PRIORITY,
     Broadcaster,
     NoticeMerger,
+    _light_key,
     broadcast_notice,
     describe_actor,
     render_text,
@@ -157,6 +159,27 @@ from .rules import (
 )
 from .tracker import DEFAULT_CONFIG, Notice, ProgressTracker, TrackerConfig
 from .warncount import COUNTS_FILENAME
+
+
+def _speak_notice(push, notice, *, source: str, logger) -> str:
+    """把一条通知**让她念出来**（0.6.14 起：「这一轮跑完了」的正确形状）。
+
+    为什么不能给 ``broadcast_notice`` 传 ``ai_behavior="respond"`` 了事：
+    那个函数把原文推上 chat（``visibility=["chat"]``）**同时**打 respond，
+    形状是"让她评论一段已经显示出来的文字"——原文和她的回复各出现一次。
+    ``speak()`` 才是"让她把这段念出来"：respond 指示配 ``visibility=[]``
+    （指令不上屏），另发一条 blind 留底把精确文字留下。
+
+    返回 ``sent`` / 留底那条的结果，**永不抛异常**（``speak`` 自己兜住）。
+    """
+    spoken, kept = speak(
+        push, "\n".join(notice.lines()),
+        source=source, logger=logger,
+        priority=NOTICE_PRIORITY.get(_light_key(notice.light), 5),
+        tag=_light_key(notice.light),
+    )
+    return spoken if spoken == "sent" else kept
+
 
 # 聊天里显示的来源标签。红线 1：source 必须显式传，不能用默认空串。
 SOURCE = "agent_deskmate"
@@ -1471,13 +1494,23 @@ class AgentDeskmatePlugin(NekoPluginBase):
             # **有没有 key 是唯一门槛**（红线 3）：``respond`` 要主模型接一轮，
             # 没 key 就降级成 blind 只出文字——那也正是用户要的
             # "没填 key 就提供最简单的信息"。
-            if notice.role == ROLE_BOUNDARY and has_key:
-                behavior = broadcaster.resolve_ai_behavior(force=True)
+            #
+            # 0.6.14：**真要说的时候走 ``_speak_notice``，不是给
+            # ``broadcast_notice`` 传 respond**。后者把原文推上 chat 同时还打
+            # respond，原文和她的回复会各出现一次；``speak()`` 的形状才是
+            # "让她把这段念出来"（respond 指示配 visibility=[]，另发 blind 留底）。
+            # 真机上"没有结束播报"有一半是这个形状问题：通知确实发了，
+            # 但发成一条主语是文件路径的静默聊天行。
+            behavior = broadcaster.resolve_ai_behavior(
+                force=(notice.role == ROLE_BOUNDARY and has_key))
+            if notice.role == ROLE_BOUNDARY and has_key \
+                    and behavior == "respond":
+                jobs.append(partial(_speak_notice, self.push_message, notice,
+                                    source=SOURCE, logger=self.logger))
             else:
-                behavior = broadcaster.resolve_ai_behavior()
-            jobs.append(partial(broadcast_notice, self.push_message, notice,
-                                source=SOURCE, logger=self.logger,
-                                ai_behavior=behavior))
+                jobs.append(partial(broadcast_notice, self.push_message, notice,
+                                    source=SOURCE, logger=self.logger,
+                                    ai_behavior=behavior))
 
         outcomes: list[str] = []
         for job in jobs:

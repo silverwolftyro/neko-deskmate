@@ -145,7 +145,7 @@ class _TaggingBroadcaster:
         self._sink.append(f"rule:{hit}")
         return "sent"
 
-    def resolve_ai_behavior(self, now=None) -> str:
+    def resolve_ai_behavior(self, now=None, *, force=False) -> str:
         # 真 Broadcaster 才有冷却；桩只需要别让调用方炸。
         return "blind"
 
@@ -1063,17 +1063,31 @@ def test_has_model_key_reads_model_then_approval() -> None:
 
 
 def test_a_finished_round_speaks_when_a_key_is_set() -> None:
-    """填了 key → ``respond``，Yui 自己组织语言说"跑完了"。
+    """填了 key → 走 ``speak()``：respond 指示 + 一条 blind 留底。
 
     这就是用户要的"有 key 可以提供大概的简单结论"——内容由主模型生成，
     插件只给事实（谁、哪轮、几步、用了什么类别）。
+
+    **两条不是重复**：``speak()`` 的形状是 respond 指示配 ``visibility=[]``
+    （指令不上屏，用户只听到她说话），另发一条 blind 把精确文字留下。
+    给 ``broadcast_notice`` 直接传 respond 是错的形状——原文会推上 chat，
+    "她说的"和"原文"各出现一次（0.6.13 真机：没有结束播报，一半因为这个）。
     """
     at = _now() - 10
     host = _Host([_action_step(at, action_id="tu_1", kind="Bash"),
                   _boundary(at + 700)], model={"api_key": "k"})
     host.poll()
-    assert len(host.pushed) == 1
-    assert host.pushed[0]["ai_behavior"] == "respond"
+    spoken = [p for p in host.pushed if p["ai_behavior"] == "respond"]
+    kept = [p for p in host.pushed if p["ai_behavior"] == "blind"]
+    assert len(spoken) == 1
+    assert spoken[0]["visibility"] == []          # 指令不上屏
+    assert len(kept) == 1                          # 精确文字留底
+    text = kept[0]["parts"][0]["text"]
+    assert "这一轮跑完了" in text
+    # headline 指名 agent + 目录，detail 带会话短 id（0.6.13 真机反馈：
+    # 主语是一整个文件路径，用户根本看不出"这是我的会话跑完了"）
+    assert text.startswith("claude-code · ")
+    assert "会话 " in text
 
 
 def test_a_finished_round_is_text_only_without_a_key() -> None:
@@ -1115,7 +1129,13 @@ def test_a_finished_round_still_respects_the_cooldown() -> None:
     # 同一轮再喂一条 turn_end：冷却窗内，应该降级
     host._transcript_adapter._events.append(_boundary(at + 1400))  # noqa: SLF001
     host.poll()
-    assert [p["ai_behavior"] for p in host.pushed] == ["respond", "blind"]
+    behaviors = [p["ai_behavior"] for p in host.pushed]
+    # 第一条跑完：speak() 的一对——respond 指示（不上屏）+ blind 留底
+    assert behaviors[:2] == ["respond", "blind"]
+    # 第二条跑完：冷却窗内，降级成 broadcast_notice 的 blind，只一条
+    assert behaviors[2:] == ["blind"]
+    # 关键：respond 只有一次，没有连发
+    assert behaviors.count("respond") == 1
 
 
 def test_other_notices_do_not_get_the_forced_voice() -> None:
