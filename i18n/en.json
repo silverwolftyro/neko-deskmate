@@ -106,14 +106,14 @@
   "plugin.description": "Watches your local coding agents: broadcasts and explains when approval, completion, failure or a stall happens, and lets you approve or reject inside N.E.K.O.",
   "plugin.name": "Neko Deskmate",
   "entry.settings_set_broadcast_review.name": "Save review setting",
-  "entry.settings_set_broadcast_review.description": "When on, warn and notice broadcasts are sent to the model first; the ones it calls not worth mentioning are dropped. Critical never goes to review.",
+  "entry.settings_set_broadcast_review.description": "When on, warn and notice items are first sent to your own model with one question — is this worth mentioning? The ones it calls not worth it are dropped, so in day-to-day use most of the agent cleaning up inside its own project stops landing on you one by one. Critical never goes to review, and any hiccup broadcasts as usual. Needs an API key.",
   "panel.settings.broadcast_review": "Review before broadcasting",
   "panel.settings.broadcast_review.on": "Let the model review first",
   "panel.settings.broadcast_review.off": "Broadcast everything",
   "panel.settings.broadcast_review_help": "When on, warn and notice items are sent to the model with one question: is this worth mentioning? The ones it calls not worth it are dropped; everything else is broadcast as before. Critical never goes to review.",
   "panel.settings.broadcast_review_scope": "Only warn and notice can be suppressed. Critical is untouched — home directory, outside the workspace, unparseable targets all still get full red text.",
-  "panel.settings.broadcast_review_cost": "Costs your key: up to 5 items per batch, one model request each. When unsure the model always says \"worth telling\", so what gets dropped is mostly genuinely minor — but that is not a guarantee.",
-  "panel.settings.broadcast_review_failopen": "Any hiccup broadcasts as usual: no key, timeout, malformed answer, or a \"medium\"/\"high\" verdict — all treated as \"no review happened\". Only an explicit \"low risk + need not say\" suppresses.",
+  "panel.settings.broadcast_review_cost": "Needs an API key: review goes through your own model endpoint, up to 5 items per batch and one request each. With a key, most of the not-worth-mentioning broadcasts — the agent cleaning up inside its own project — get dropped instead of landing on you one by one. Without a key this path does not exist at all and everything is broadcast as before.",
+  "panel.settings.broadcast_review_failopen": "Any hiccup broadcasts as usual: no key, cannot reach the model, malformed answer, or a \"medium\"/\"high\" verdict — all treated as \"no review happened\". Only an explicit \"low risk + need not say\" suppresses. So turning it on never turns something that should be said into silence.",
   "panel.settings.broadcast_review_stats": "Since this start: {submitted} sent, {suppressed} dropped, {failed} not reviewed.",
-  "panel.settings.broadcast_review_need_key": "No API key, so this cannot be enabled — review needs one model round-trip and costs your key. Fill in a key below."
+  "panel.settings.broadcast_review_need_key": "No API key yet — review goes through your own model endpoint. Fill one in below and most of the not-worth-mentioning broadcasts stop landing on you."
 }

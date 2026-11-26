@@ -672,22 +672,26 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                   + "删到家目录、删到工作区外、目标说不清的，照样整行红字。",
               })}
             />
+            {/* 明说门槛：只有 key 与连通性。成本是事实不是警告——
+                要不要花是用户自己的取舍，不由插件替他紧张。 */}
             <Alert
-              tone="warning"
+              tone="info"
               message={t("panel.settings.broadcast_review_cost", {
                 defaultValue:
-                  "花你的 key：每一批最多 5 条，每条一次模型请求。"
-                  + "拿不准的时候模型一律判「要讲」，所以压掉的多半真是小事，"
-                  + "但这不是保证。",
+                  "要填 API key 才能用：送审走你自己的模型端点，"
+                  + "每一批最多 5 条、每条一次请求。填了 key 的日常情况下，"
+                  + "agent 在自己项目里清理这类不值一提的播报大部分会被压掉，"
+                  + "不用你一条条点过去。没有 key 这条路整个不存在，播报照旧。",
               })}
             />
             <Alert
               tone="info"
               message={t("panel.settings.broadcast_review_failopen", {
                 defaultValue:
-                  "任何岔子都照旧播：没配 key、超时、模型答得不像样、"
+                  "任何岔子都照旧播：没填 key、连不上模型、答得不像样、"
                   + "它判「中等」或「高风险」——全部当没审过。"
-                  + "只有它明确说「低风险 + 可以不说」才不播。",
+                  + "只有它明确说「低风险 + 可以不说」才不播。"
+                  + "所以开着它不会让该说的变成不说。",
               })}
             />
             {state.broadcast_review ? (
@@ -713,8 +717,8 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                 tone="warning"
                 message={t("panel.settings.broadcast_review_need_key", {
                   defaultValue:
-                    "没配 API key，开不了——送审要模型接一轮，那是花 key 的。"
-                    + "去下面填 key。",
+                    "没填 API key，用不了——送审走你自己的模型端点。"
+                    + "去下面填 key，日常那些不值一提的播报就能大部分压掉。",
                 })}
               />
             ) : null}

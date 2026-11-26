@@ -536,14 +536,14 @@
         "auto_review": {
           "type": "object",
           "title": "Automatic review (experimental, off by default)",
-          "description": "Let a model classify each request from four narrow inputs, and auto-allow only when it says low risk plus allow. The same switch also suppresses warn/notice broadcasts the model calls not worth mentioning. Critical never goes to review, and any failure broadcasts as usual. Off by default and needs its own authorization.",
+          "description": "Stated plainly: with an API key the experience is noticeably better. The same switch also sends warn/notice broadcasts to your own model with one question — is this worth mentioning? The ones it calls not worth it are dropped, which in day-to-day use is mostly the agent cleaning up inside its own project. The only gate is a key and connectivity; without one this path does not exist. Critical never goes to review, and any failure broadcasts as usual.",
           "x-title-i18n": {
             "en": "Automatic review (experimental, off by default)",
             "zh-CN": "自动审查档（实验性，默认关）"
           },
           "x-description-i18n": {
             "en": "Let a model classify each request from four narrow inputs, and auto-allow only when it says low risk plus allow. Off by default and needs its own authorization.",
-            "zh-CN": "让模型只看四类窄输入后给出风险分类，只在其判「低风险且允许」时替你放行。同一个开关还管「播报压制」：它判不值一提的【警告】/【提示】不再播。【严重】永远不送审，任何失败一律照旧播。默认关，且需单独签字。"
+            "zh-CN": "明说：填了 API key 会有明显更好的体验。同一个开关还管「播报压制」——【警告】/【提示】会先送你自己的模型问一句「这事值不值得说」，它认为不值一提的就不再播，日常被压掉的大半是 agent 在自己项目里清理那类。唯一的门槛是 key 与连通性，没有 key 这条路整个不存在。【严重】永远不送审，任何失败一律照旧播。"
           },
           "properties": {
             "enabled": {

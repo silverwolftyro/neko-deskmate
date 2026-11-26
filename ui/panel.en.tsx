@@ -687,24 +687,32 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                   + " unparseable targets all still get full red text.",
               })}
             />
+            {/* State the only gate plainly: a key and connectivity. Cost is
+                a fact, not a warning — whether it is worth it is the user's
+                own trade-off, not something the plugin should fret about. */}
             <Alert
-              tone="warning"
+              tone="info"
               message={t("panel.settings.broadcast_review_cost", {
                 defaultValue:
-                  "Costs your key: up to 5 items per batch, one model"
-                  + " request each. When unsure the model always says"
-                  + " \"worth telling\", so what gets dropped is mostly"
-                  + " genuinely minor — but that is not a guarantee.",
+                  "Needs an API key: review goes through your own model"
+                  + " endpoint, up to 5 items per batch and one request each."
+                  + " With a key, most of the not-worth-mentioning broadcasts"
+                  + " — the agent cleaning up inside its own project — get"
+                  + " dropped instead of landing on you one by one. Without a"
+                  + " key this path does not exist at all and everything is"
+                  + " broadcast as before.",
               })}
             />
             <Alert
               tone="info"
               message={t("panel.settings.broadcast_review_failopen", {
                 defaultValue:
-                  "Any hiccup broadcasts as usual: no key, timeout,"
-                  + " malformed answer, or a \"medium\"/\"high\" verdict"
-                  + " — all treated as \"no review happened\". Only an"
-                  + " explicit \"low risk + need not say\" suppresses.",
+                  "Any hiccup broadcasts as usual: no key, cannot reach the"
+                  + " model, malformed answer, or a \"medium\"/\"high\""
+                  + " verdict — all treated as \"no review happened\". Only"
+                  + " an explicit \"low risk + need not say\" suppresses. So"
+                  + " turning it on never turns something that should be said"
+                  + " into silence.",
               })}
             />
             {state.broadcast_review ? (
@@ -730,9 +738,9 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                 tone="warning"
                 message={t("panel.settings.broadcast_review_need_key", {
                   defaultValue:
-                    "No API key, so this cannot be enabled — review needs"
-                    + " one model round-trip and costs your key. Fill in a"
-                    + " key below.",
+                    "No API key yet — review goes through your own model"
+                    + " endpoint. Fill one in below and most of the"
+                    + " not-worth-mentioning broadcasts stop landing on you.",
                 })}
               />
             ) : null}

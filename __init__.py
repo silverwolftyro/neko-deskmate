@@ -2206,8 +2206,10 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 default="保存审查设置"),
         description=tr(
             "entry.settings_set_broadcast_review.description",
-            default="开之后，【警告】与【提示】两档会先送模型审一句，"
-                    "它认为不值一提的就不再播。【严重】永远不送审。",
+            default="开着之后，【警告】和【提示】两档会先送你自己的模型问一句"
+                    "「这事值不值得说」，它认为不值一提的就不再播——日常那些"
+                    " agent 在自己项目里清理的消息大部分可以不用你一条条点过去。"
+                    "【严重】永远不送审，任何岔子一律照旧播。要填 API key 才能用。",
         ),
     )
     async def settings_set_broadcast_review(self, enabled: bool = False,
