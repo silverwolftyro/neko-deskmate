@@ -294,11 +294,15 @@ def test_tool_summary_never_dumps_the_whole_input() -> None:
 # ── 风险判定（L0，不接模型） ────────────────────────────────────────────────
 
 def test_assess_risk_marks_delete_as_critical() -> None:
-    # 显式给工作目录：目标 `/tmp/x` 在它外面 → 极高危。
+    # 显式给工作目录：目标 `D:/other/x` 在它外面 → 极高危。
     # （不给工作目录时落「范围未知」档 = warn，见下面那条——
     #  B8 把"没有线索"和"确实在工作区外"分开了。）
+    #
+    # 2026-11-26：这里原来用 `/tmp/x`，而它现在按临时目录判 recoverable/notice
+    # （第七条误报：删临时文件被顶【严重】）。旧例子把那个误报当成了正确行为，
+    # 换成 `D:/other/x`——一个真正"在工作区外、又不是临时目录"的路径。
     severity, rule, action_class = assess_risk(
-        "Bash", {"command": "rm -rf /tmp/x"}, r"D:\workspace\proj")
+        "Bash", {"command": "rm -rf D:/other/x"}, r"D:\workspace\proj")
     assert severity == "critical"
     assert rule == "delete"
     # 类别才是门控认的那一维；规则名会随规则库变，类别不会（规格 §16.3 C3）

@@ -524,6 +524,78 @@ def _is_system_path(target: str) -> bool:
                for prefix in _SYSTEM_DIRS)
 
 
+#: **系统临时目录**：删了不可惜的地方。
+#:
+#: 2026-11-26 第七条误报。实测我自己删临时文件被顶【严重】：
+#:
+#:     【严重】删除文件：rm -f "C:/Users/alpha/AppData/Local/Temp/…"
+#:
+#: 档位判定本身没错——`AppData\Local\Temp` 确实在工作区外，于是
+#: `_tier_of_one` 给它 EXTREME。但 **extreme 的存在理由是"破坏面没有边界"**
+#: （家目录 / 盘根 / 系统目录），临时目录的破坏面明显有边界：就是临时文件。
+#: 删一个临时文件和删 `D:/other/x` 不是一回事。
+#:
+#: ## 为什么不能用 `_RECOVERABLE_MARKERS`
+#:
+#: 那是**子串匹配**。把 `"temp"` 加进去，`D:\workspace\templates\`、
+#: `D:\pkg\temporary\`、`src\TempStorage\` 全部会被误判成可恢复——
+#: 那是降档，是项目明令禁止的最危险方向（见 `_RECOVERABLE_MARKERS` 的注释）。
+#: 所以临时目录必须**单独一套精确前缀判断**，两个集合不许合并。
+#:
+#: ## 收录标准
+#:
+#: 只收**操作系统自己定义**的临时目录，不收"名字像临时"的目录：
+#:   - ``%TEMP%`` / ``%TMP%``（环境变量写法， unambiguously 是临时目录）
+#:   - ``C:\Users\<任意用户名>\AppData\Local\Temp``（每用户临时目录）
+#:   - ``/tmp`` / ``/var/tmp`` / ``/private/tmp``（POSIX）
+#:
+#: ## 刻意不收 `C:\Windows\Temp`
+#:
+#: 它在 `_SYSTEM_DIRS` 的 `c:\windows` 前缀内，会先被 `_is_system_path`
+#: 判成 EXTREME。那是刻意的保守：它确实在 Windows 目录底下，
+#: 而"系统目录里的东西"按最坏的猜是这个项目的一贯取向。
+#: 想清它得单独决定，不该搭这趟车。
+#: Windows 形态的临时目录，匹配**归一化之后**的路径（反斜杠、小写）。
+_TEMP_WIN_RE = re.compile(
+    r"^(?:"
+    r"%temp%(?:\\|$)"
+    r"|%tmp%(?:\\|$)"
+    r"|[a-z]:\\users\\[^\\]+\\appdata\\local\\temp(?:\\|$)"
+    r")",
+    re.IGNORECASE,
+)
+#: POSIX 形态。**同样匹配归一化之后的形式**（``/tmp/x`` → ``\tmp\x``）。
+#: 不在原文上匹配：Windows 的 ``\tmp\x`` 是盘根相对路径，不是 POSIX 的 /tmp，
+#: 两者混在一起就会随斜杠写法给出不同答案。
+_TEMP_POSIX_RE = re.compile(r"^\\(?:tmp|var\\tmp|private\\tmp)(?:\\|$)", re.IGNORECASE)
+
+
+def _is_temp_path(target: str) -> bool:
+    """这是操作系统定义的临时目录吗。精确前缀匹配，不是子串。
+
+    **先归一化再比**（``_norm``：统一反斜杠、小写、折叠 ``.`` 与 ``..``）：
+
+    1. 不统一分隔符，``C:/Users/…/Temp/x`` 与 ``C:\\Users\\…\\Temp\\x``
+       会得到不同答案——同一条命令两种 verdict，正是这个项目一直在消灭的病；
+    2. **不折叠 ``..`` 会开一个新洞**：``/tmp/../etc`` 的字面前缀是 ``/tmp``，
+       按前缀匹配会判成临时目录（notice），而它实际指向 ``/etc``。
+       这和 0.6.4 修掉的 `../` 逃逸是同一个错误换了个位置。
+
+    **带 ``..`` 的一律不认临时目录**：``%TEMP%/../notes`` 归一化后是 ``notes``，
+    前缀那点信息全是假的。这种目标交给 ``_target_hides_scope``——它含 ``%VAR%``，
+    会被判"藏住了作用域"，按最坏的猜。方向相反才是危险的。
+    """
+    raw = str(target or "").strip()
+    if not raw:
+        return False
+    if any(part == ".." for part in re.split(r"[\\/]+", raw)):
+        return False
+    normalised = _norm(raw)
+    if not normalised:
+        return False
+    return bool(_TEMP_WIN_RE.match(normalised) or _TEMP_POSIX_RE.match(normalised))
+
+
 def _norm(path: str) -> str:
     """归一化成可比较的形式：统一分隔符、小写、折叠 ``.`` 与 ``..``。
 
@@ -637,7 +709,18 @@ _RECOVERABLE_MARKERS = (
 #: 通配符：``*`` ``?`` 与字符类 ``[ ]``。
 _GLOB_CHARS_RE = re.compile(r"[*?\[\]]")
 #: 变量 / 命令替换。替换出来的值完全不可知，所以它藏得住目标。
-_SUBSTITUTION_RE = re.compile(r"[$`]")
+#:
+#: ``%NAME%`` 是 Windows 的环境变量写法（``%TEMP%`` / ``%USERPROFILE%``）。
+#: **必须是成对的两个 %**：单个 % 是格式符（``date +%H:%M:%S`` / ``printf '%s'``），
+#: 那个不藏路径——2026-11-26 把裸 ``%`` 从不可解析正则里删掉正是为这个，
+#: 别把它加回来。已知边界：``50%_done%.txt`` 这种文件名会被误判成变量，
+#: 方向上是多报不是漏报，可以接受。
+#:
+#: 为什么需要它：``%TEMP%/../notes`` 归一化之后是 ``notes``，看着像工作区内
+#: 的相对路径，于是被判 normal/warn——而它实际落在用户主目录。
+#: 根因是 ``_is_absolute`` 对 ``%VAR%…`` 返回 False，调用方就按工作目录
+#: 去拼它，可变量展开的结果跟工作目录根本没有关系。
+_SUBSTITUTION_RE = re.compile(r"[$`]|%[A-Za-z_][A-Za-z0-9_]*%")
 
 
 def _target_hides_scope(target: str) -> bool:
@@ -698,13 +781,22 @@ def target_unparseable(command: str) -> bool:
     **逐目标判，不再整条搜**（2026-11-26，见 ``_target_hides_scope``）：
     只要有一个目标藏住作用域，整条就算不可解析——一条命令删两个路径，
     说不清的那个说了算（与 ``target_tier`` 的取最坏同向）。
+
+    **临时目录跳过这一判**：``%TEMP%`` 含 ``%NAME%``，按替换规则算"藏住了"，
+    可我们**认识**它——它就是临时目录，不需要解析出什么。
+    不跳的后果是刚做的临时目录降档被自己顶回 extreme，白做。
     """
     targets = delete_targets(command)
     if not targets:
         # 没有目标不是"藏起来了"，是"没有"——那由 tier_for_command 的
         # 待定分支处理，删除类调用方会再抬到极高危。两边不许抢同一件事。
         return False
-    return any(_target_hides_scope(t) for t in targets)
+    for target in targets:
+        if _is_temp_path(target):
+            continue
+        if _target_hides_scope(target):
+            return True
+    return False
 
 
 def is_assignment(token: str) -> bool:
@@ -1036,6 +1128,12 @@ def _is_home_or_root(target: str) -> bool:
 def _tier_of_one(target: str, working_directory: str | None) -> str:
     """单个目标的档位。"""
     if is_recoverable_target(target):
+        return TIER_RECOVERABLE
+    # 临时目录排在 home/root 与 system **之前**：它要先于那两道拦下来，
+    # 否则 `%TEMP%` 会掉到 `_under` 里被判成"工作区内"（warn），
+    # 而它其实压根不在工作区——那是个错的宽松，不是对的宽松。
+    # `C:\Windows\Temp` 不受影响：它不在 `_TEMP_PATH_RE` 里，仍走 system 档。
+    if _is_temp_path(target):
         return TIER_RECOVERABLE
     if _is_home_or_root(target) or _is_system_path(target):
         return TIER_EXTREME
