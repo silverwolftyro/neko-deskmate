@@ -171,14 +171,24 @@ def _speak_notice(push, notice, *, source: str, logger) -> str:
     （指令不上屏），另发一条 blind 留底把精确文字留下。
 
     返回 ``sent`` / 留底那条的结果，**永不抛异常**（``speak`` 自己兜住）。
+
+    **念的与留底的是两句不同的话**（2026-11-26 真机逼出来的）：
+
+    - 念的用 ``notice.spoken``——短、能念、**没有路径没有 UUID**。
+      她把整条原文念出来的那次，用户原话是「他把这句话读出来了，
+      他真就读出来了」「特别是直接读路径，那个更不应该」。
+    - 留底的用 ``notice.lines()``——完整精确记录，给人复制粘贴查的。
+      语音只能算附赠，精确文字永远靠这条。
     """
-    spoken, kept = speak(
-        push, "\n".join(notice.lines()),
+    spoken = notice.spoken or notice.headline
+    said, kept = speak(
+        push, spoken,
         source=source, logger=logger,
         priority=NOTICE_PRIORITY.get(_light_key(notice.light), 5),
         tag=_light_key(notice.light),
+        keep="\n".join(notice.lines()),
     )
-    return spoken if spoken == "sent" else kept
+    return said if said == "sent" else kept
 
 
 # 聊天里显示的来源标签。红线 1：source 必须显式传，不能用默认空串。

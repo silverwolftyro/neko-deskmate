@@ -104,6 +104,17 @@ class Notice:
     # 无目录会话的共同退回值。P1c 的同目录合并必须只认真有目录的，
     # 否则会把一堆互不相干的会话揉成一条。
     workspace: str | None = None
+    # 给 Yui **念**的那一句。短、能念、**没有路径**。
+    #
+    # 2026-11-26 真机：她把 ``headline + detail`` 整条念了出来——
+    # 「claude-code · D:\\workspace\\…\\agent_deskmate 这一轮跑完了
+    #  第 1 轮，共 2 步（Bash 2 次） · 会话 7a75d333」。
+    # 用户原话：「他把这句话读出来了，他真就读出来了」
+    # 「特别是直接读路径，那个更不应该」。
+    #
+    # 路径与会话 id 是给人**复制粘贴**的，不是给人**听**的。
+    # 这一项空着表示"没有专门的口语句"，调用方退回 headline。
+    spoken: str = ""
 
     def lines(self) -> tuple[str, ...]:
         """固定三行，不加第四行（B12 P0-2 定稿）。"""
@@ -478,10 +489,10 @@ class ProgressTracker:
         # 这一轮用了什么。**只报类别**（见 SessionState.round_kinds 的说明）：
         # 「bash 7 次、edit 4 次」是有信息量的概括，也是 Yui 开口时
         # 唯一能凭的事实。按次数倒序，多的在前——用户先看到它主要在干什么。
-        tally = ", ".join(
-            f"{name} {count} 次"
-            for name, count in sorted(state.round_kinds.items(),
-                                      key=lambda kv: (-kv[1], kv[0]))[:4])
+        ranked = sorted(state.round_kinds.items(),
+                        key=lambda kv: (-kv[1], kv[0]))
+        tally = ", ".join(f"{name} {count} 次"
+                          for name, count in ranked[:4])
         detail = f"第 {state.rounds} 轮，共 {state.actions} 步"
         if tally:
             detail += f"（{tally}）"
@@ -492,6 +503,8 @@ class ProgressTracker:
         short = state.session[:8] if state.session else ""
         if short:
             detail += f" · 会话 {short}"
+        # 口语句要在清空**之前**从 ranked 拼（ranked 已是快照，清的是 dict）
+        spoken = _spoken_line(state.agent, state.actions, ranked)
         state.round_kinds = {}
 
         notice = self._emit(
@@ -502,6 +515,7 @@ class ProgressTracker:
             # 但对"跑完了"这件事，先问的是"谁跑的"——尤其是多个 Agent 同时在看时。
             headline=f"{state.agent} · {self._who(state)} 这一轮跑完了",
             detail=detail,
+            spoken=spoken,
         )
         state.light = Light.IDLE
         # 开不开由 extra_notify_roles 决定（2026-11-26 起产品默认开）：
@@ -532,11 +546,15 @@ class ProgressTracker:
 
     def _emit(self, state: SessionState, at: float, *, role: Role,
               light: Light, fingerprint: str, headline: str, detail: str,
-              kind: str = "", window: float | None = None) -> Notice | None:
+              kind: str = "", window: float | None = None,
+              spoken: str = "") -> Notice | None:
         """构造一条通知，过三道闸：默认开关、指纹去重。
 
         返回 None 表示"这条不该开口"。**三道闸任何一道挡住都返回 None**，
         调用方不许自己判断——否则去重逻辑会散到各处，然后某处漏掉。
+
+        ``spoken`` 是给 Yui 念的那一句（见 ``Notice.spoken``）。空表示
+        "没有专门的口语句"，调用方退回 headline。
         """
         if not (notify_enabled(role) or role in self._config.extra_notify_roles):
             return None
@@ -555,6 +573,7 @@ class ProgressTracker:
             workspace=state.workspace,
             headline=headline, detail=detail,
             at=at, fingerprint=fingerprint, kind=kind,
+            spoken=spoken,
         )
 
 
@@ -564,6 +583,31 @@ _HANDLERS = {
     Role.BOUNDARY: ProgressTracker._on_boundary,
     Role.WAITING: ProgressTracker._on_waiting,
 }
+
+
+def _spoken_line(agent: str, steps: int, ranked: list[tuple[str, int]]) -> str:
+    """给 Yui 念的那一句。**短、能念、没有路径、没有 UUID**。
+
+    2026-11-26 真机：她把 ``headline + detail`` 整条念了出来——
+
+        「claude-code · D:\\workspace\\…\\agent_deskmate 这一轮跑完了
+          第 1 轮，共 2 步（Bash 2 次） · 会话 7a75d333」
+
+    用户原话：「他把这句话读出来了，他真就读出来了」
+    「但是这么大、这么长一段，而且对于人类来说难以使用和读取的信息，
+      真的不能被用上」「特别是直接读路径，那个更不应该」。
+
+    所以念的这一句只用**说得出口**的部分：谁、跑完了、几步、主要干什么。
+    路径与会话 id 只进 detail（聊天里可复制可查），**不进语音**。
+
+    ``ranked`` 是 ``(kind, count)`` 按次数倒序的**快照**——调用方拼完 detail
+    就会清空 ``round_kinds``，所以这里不能再去读那个 dict。
+    """
+    top = ranked[0][0] if ranked else ""
+    text = f"{agent} 这一轮跑完了，共 {steps} 步"
+    if top:
+        text += f"，主要是 {top}"
+    return text + "。"
 
 
 def _elapsed(seconds: float) -> str:

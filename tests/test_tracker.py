@@ -930,3 +930,53 @@ def test_the_tally_never_carries_command_text() -> None:
     text = out[0].detail
     for banned in ("rm", "-rf", "/", "\\", ".."):
         assert banned not in text, banned
+
+
+# ── 念的那一句：短、能念、没有路径 ──────────────────────────────────────
+#
+# 2026-11-26 真机：Yui 把整条通知原文念了出来——
+# 「claude-code · D:\workspace\…\agent_deskmate 这一轮跑完了
+#  第 1 轮，共 2 步（Bash 2 次） · 会话 7a75d333」。
+# 用户原话：「他把这句话读出来了，他真就读出来了」
+# 「特别是直接读路径，那个更不应该」。
+#
+# 路径与会话 id 是给人复制粘贴的，不是给人听的。
+
+
+def test_the_spoken_line_has_no_path_and_no_uuid() -> None:
+    """**这次的真 bug**：念的那句不许带路径，也不许带会话 id。"""
+    from plugin.plugins.agent_deskmate.tracker import _spoken_line
+
+    line = _spoken_line("claude-code", 12, [("Bash", 7), ("Edit", 4)])
+    assert "\\" not in line and "/" not in line
+    assert ":" not in line                     # 盘符 / UUID 分隔符都带冒号
+    assert "workspace" not in line.lower()
+    assert line == "claude-code 这一轮跑完了，共 12 步，主要是 Bash。"
+
+
+def test_the_spoken_line_stays_short_without_a_tally() -> None:
+    """一个类别都没记到时也要能念——不能变成一句空话。"""
+    from plugin.plugins.agent_deskmate.tracker import _spoken_line
+
+    assert _spoken_line("claude-code", 3, []) == "claude-code 这一轮跑完了，共 3 步。"
+
+
+def test_the_boundary_notice_carries_a_spoken_line() -> None:
+    """notice 上要带口语句，否则调用方只能退回 headline（那带路径）。"""
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    tracker.feed(_action(kind="Bash"))
+    out = tracker.feed(_boundary(at=T0 + 3600))
+    assert out[0].spoken
+    assert "\\" not in out[0].spoken
+    assert "Bash" in out[0].spoken
+
+
+def test_the_detail_still_has_everything_the_voice_left_out() -> None:
+    """语音省掉的，留底一条不少——路径、会话 id、分类计数都在 detail 里。"""
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    tracker.feed(_action(kind="Bash"))
+    out = tracker.feed(_boundary(at=T0 + 3600))
+    assert "Bash 1 次" in out[0].detail
+    assert "会话 " in out[0].detail
+    assert WD in out[0].headline                 # 目录仍在 headline（给人看）
+    assert WD not in out[0].spoken               # 但不在语音里

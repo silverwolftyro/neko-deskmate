@@ -1232,3 +1232,36 @@ class _StubPool:
 class _Done:
     def done(self) -> bool:
         return True
+
+
+def test_the_spoken_line_and_the_record_are_different_texts() -> None:
+    r"""**0.6.16 的真 bug**：念的与留底的必须是两句不同的话。
+
+    0.6.15 及之前，``_speak_notice`` 把 ``notice.lines()`` 同时当台词和留底，
+    于是 Yui 把「claude-code · D:\workspace\…gent_deskmate 这一轮跑完了
+    第 1 轮，共 2 步（Bash 2 次） · 会话 7a75d333」整条念了出来。
+    用户原话：「他把这句话读出来了，他真就读出来了」
+    「特别是直接读路径，那个更不应该」。
+    """
+    at = _now() - 10
+    host = _Host([_action_step(at, action_id="tu_1", kind="Bash",
+                               working_directory=r"D:proj"),
+                  _boundary(at + 700)], model={"api_key": "k"})
+    host.poll()
+    directive = [p for p in host.pushed if p["ai_behavior"] == "respond"][0]
+    record = [p for p in host.pushed
+              if p["ai_behavior"] == "blind"][-1]
+    said = directive["parts"][0]["text"]
+    kept = record["parts"][0]["text"]
+
+    # 念的那句：短、能念、**没有路径**
+    assert "\\" not in said
+    assert r"D:proj" not in said
+    assert "这一轮跑完了" in said
+    assert len(said) < 120
+    # 留底那条：完整精确记录，一样不少
+    assert r"D:proj" in kept
+    assert "Bash 1 次" in kept
+    assert "会话 " in kept
+    # 两句确实不同
+    assert said != kept

@@ -2,7 +2,7 @@
 id = "agent_deskmate"
 name = "同桌猫"
 description = "替你看着本机的编码 Agent：在需要审批、完成、出错、卡住时按你可调的强度播报与解释，并在 N.E.K.O 里完成同意/拒绝，不必切进 Agent 界面。当前直接观测 Claude Code，网关侧可见走 cc-switch 的 Agent；面板「本机 Agent」会逐个说明其余的是看得见、有条件、还是暂无数据源。"
-version = "0.6.15"
+version = "0.6.16"
 type = "plugin"
 entry = "plugin.plugins.agent_deskmate:AgentDeskmatePlugin"
 

@@ -835,7 +835,8 @@ def read_instruction(text: str, *, lead: str = _LEAD_FILLER) -> str:
 def speak(push: Callable[..., dict], text: str, *, source: str, logger: Any,
           priority: int = 5, tag: str = "speak",
           lead: str = _LEAD_FILLER,
-          ai_behavior: str = "respond") -> tuple[str, str]:
+          ai_behavior: str = "respond",
+          keep: str | None = None) -> tuple[str, str]:
     """让她把 ``text`` 念出来，并发一条静默消息把精确文字留底。
 
     返回 ``(念那条的结果, 留底那条的结果)``，都是 ``sent`` / 拒绝原因，
@@ -844,12 +845,20 @@ def speak(push: Callable[..., dict], text: str, *, source: str, logger: Any,
     ``ai_behavior`` 默认 ``"respond"``。传 ``"blind"`` 就只发留底那条
     （念那条跳过）——用来在没配 key 时优雅降级：红线 3 是零 key 只跑 L0，
     而 ``respond`` 要主模型接一轮。
+
+    ``keep`` 是**留底那条**的文字，默认等于 ``text``。分开用的场合：
+    念的是一句短话（"跑完了，2 步"），留底的却是完整精确记录（带路径、
+    会话 id、分类计数）——后者能复制能查，但不该念出来。
+    2026-11-26 真机：她把整条通知原文念了一遍，路径和会话 UUID 全在
+    语音里。用户原话：「他把这句话读出来了，他真就读出来了」
+    「特别是直接读路径，那个更不应该」。
     """
+    record = text if keep is None else keep
     if ai_behavior != "respond":
         # 没配 key（或调用方明确不要）：只发留底，不起了。
         # 红线 3——零 key 只跑 L0，而 respond 要主模型接一轮。
         return "skipped", push_text(
-            push, text, source=source, priority=priority, logger=logger,
+            push, record, source=source, priority=priority, logger=logger,
             tag=tag, ai_behavior="blind",
         )
 
@@ -865,6 +874,6 @@ def speak(push: Callable[..., dict], text: str, *, source: str, logger: Any,
     )
     # ② 再发留底。精确文字永远靠这条，语音只能算附赠。
     return spoken, push_text(
-        push, text, source=source, priority=priority, logger=logger,
+        push, record, source=source, priority=priority, logger=logger,
         tag=tag, ai_behavior="blind",
     )
