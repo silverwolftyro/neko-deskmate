@@ -225,6 +225,20 @@
               "minimum": 60,
               "maximum": 86400
             },
+            "boundary_notify": {
+              "type": "boolean",
+              "title": "Announce when a round finishes",
+              "description": "When on, finishing a round is announced with what that round did (categories only: bash 7 times, edit 4 times). With an API key she says it out loud; without one it is text only.",
+              "x-title-i18n": {
+                "en": "Announce when a round finishes",
+                "zh-CN": "一轮跑完了要不要说"
+              },
+              "x-description-i18n": {
+                "en": "When on, finishing a round is announced with what that round did (categories only: bash 7 times, edit 4 times). With an API key she says it out loud; without one it is text only.",
+                "zh-CN": "开着的时候，一轮跑完会说一声，并带上这一轮用了什么（只报类别：bash 7 次、edit 4 次）。填了 key 就让她开口说；没填 key 只出文字。"
+              },
+              "default": true
+            },
             "fail_coalesce_seconds": {
               "type": "integer",
               "title": "Same failure not repeated within (seconds)",

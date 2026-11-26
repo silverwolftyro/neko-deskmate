@@ -847,3 +847,86 @@ def test_a_workspace_seen_later_fills_in_the_name() -> None:
                                 workspace=None))
     # 新会话没有 workspace，只能退回 agent 名
     assert notice[0].who == "c"
+
+
+# ── 「这一轮跑完了」：2026-11-26 起产品默认开口 ─────────────────────────
+#
+# 契约默认仍是关（progress.NOTIFY_DEFAULTS + test_progress.py 钉着不动），
+# 产品默认由 __init__ 从 boundary_notify 传 extra_notify_roles 进来。
+# 数据类本身保持中立——"契约默认是什么"和"这个插件默认给什么"是两件事。
+
+
+def _tracker(**kw):
+    cfg = TrackerConfig(**kw)
+    return ProgressTracker(config=cfg)
+
+
+def test_boundary_stays_quiet_under_the_bare_contract() -> None:
+    """不传 extra_notify_roles 时，契约默认（关）说了算。
+
+    这条钉的是"数据类不替产品做决定"——否则契约测试会被绕过。
+    """
+    tracker = _tracker()
+    assert tracker.feed(_boundary(at=T0 + 3600)) == []
+
+
+def test_boundary_speaks_when_the_product_opts_in() -> None:
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    out = tracker.feed(_boundary(at=T0 + 3600))
+    assert [n.role for n in out] == ["boundary"]
+    assert "这一轮跑完了" in out[0].headline
+
+
+def test_the_round_tally_lands_in_the_detail() -> None:
+    """detail 要说出这一轮用了什么——只报类别，不报内容。"""
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    tracker.feed(_action(kind="Bash"))
+    tracker.feed(_action(kind="Bash"))
+    tracker.feed(_action(kind="Edit"))
+    out = tracker.feed(_boundary(at=T0 + 3600))
+    assert "Bash 2 次" in out[0].detail
+    assert "Edit 1 次" in out[0].detail
+    assert "共 3 步" in out[0].detail
+
+
+def test_the_tally_is_ordered_by_count_not_by_name() -> None:
+    """多的在前——用户先看到它主要在干什么。"""
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    for _ in range(3):
+        tracker.feed(_action(kind="Edit"))
+    tracker.feed(_action(kind="Bash"))
+    out = tracker.feed(_boundary(at=T0 + 3600))
+    assert out[0].detail.index("Edit") < out[0].detail.index("Bash")
+
+
+def test_the_tally_resets_each_round() -> None:
+    """不清零的话，第二轮会把第一轮的账一起算上。"""
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    tracker.feed(_action(kind="Bash"))
+    first = tracker.feed(_boundary(at=T0 + 3600))
+    assert "Bash 1 次" in first[0].detail
+    second = tracker.feed(_boundary(at=T0 + 7200))
+    assert "Bash" not in second[0].detail
+
+
+def test_an_empty_kind_is_not_tallied() -> None:
+    """空 kind 表示"说不清是什么工具"，记了只会多一个没有名字的项。"""
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    tracker.feed(_action(kind=""))
+    out = tracker.feed(_boundary(at=T0 + 3600))
+    assert "次" not in out[0].detail
+    assert "共 1 步" in out[0].detail
+
+
+def test_the_tally_never_carries_command_text() -> None:
+    """**隐私红线的结构性保证**：detail 里只有类别名，没有任何路径/命令。
+
+    ``Signal`` 没有内容字段（test_progress.py 钉着），所以这里断言的是
+    "我们没把类别以外的任何东西拼进给人看的句子"。
+    """
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    tracker.feed(_action(kind="Bash"))
+    out = tracker.feed(_boundary(at=T0 + 3600))
+    text = out[0].detail
+    for banned in ("rm", "-rf", "/", "\\", ".."):
+        assert banned not in text, banned

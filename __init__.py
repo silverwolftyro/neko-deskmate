@@ -145,7 +145,7 @@ from .model_advice import (
     ModelAdvisor,
 )
 from .panel_state import build_panel_state
-from .progress import signal_from_event
+from .progress import ROLE_BOUNDARY, signal_from_event
 from .rules import (
     Coalescer,
     RuleHit,
@@ -411,6 +411,13 @@ def _tracker_config(section: dict[str, Any]) -> TrackerConfig:
             section.get("fail_coalesce_seconds"), DEFAULT_CONFIG.fail_coalesce_seconds),
         failure_confirm_seconds=_to_number(
             section.get("failure_confirm_seconds"), DEFAULT_CONFIG.failure_confirm_seconds),
+        # 「这一轮跑完了」**产品默认开口**。契约默认是关
+        # （progress.NOTIFY_DEFAULTS：知会类且最吵），2026-11-26 用户明确
+        # 要求跑完要提醒、而且要 Yui 说出来——更具体的需求覆盖那条默认。
+        # 想关：``[agent_deskmate.progress] boundary_notify = false``。
+        extra_notify_roles=frozenset(
+            {ROLE_BOUNDARY} if _to_bool(section.get("boundary_notify"), True)
+            else ()),
     )
 
 
@@ -482,6 +489,20 @@ def _advisor_from_config(config: dict[str, Any]) -> ModelAdvisor:
         # model 节只描述"连哪个模型"。拆开是为了不让一处配置管两件事。
         enabled=_to_bool(approval.get("ai_judgement"), False),
     )
+
+
+def _has_model_key(config: dict[str, Any]) -> bool:
+    """配了模型 key 吗。**``respond``（让她开口）的唯一门槛**（红线 3）。
+
+    读取顺序与 ``_advisor_from_config`` **逐字相同**：``[model] api_key``
+    优先，回退 ``[approval] api_key``。不一致的后果是"审查那边用得上、
+    语音这边说没 key"——同一份事实两个答案，而用户只会看到其中一个。
+
+    面板的「API key」指示灯也是这一份，所以三处必须同源。
+    """
+    section = _model_section(config)
+    approval = _approval_section(config)
+    return bool(str(section.get("api_key") or approval.get("api_key") or "").strip())
 
 
 def _reviewer_from_config(config: dict[str, Any]) -> AutoReviewer | None:
@@ -1356,6 +1377,8 @@ class AgentDeskmatePlugin(NekoPluginBase):
             return []
 
         mine_roots = _mine_roots(config)
+        # 有没有 key——只用来决定"跑完这条要不要让她开口"（红线 3）。
+        has_key = _has_model_key(config)
         events: list[UnifiedEvent] = []
         # B4：两个源各自兜住。任何一个失败只降级它自己，
         # 另一个源这一轮读到的事件照常播——网关库锁不该让删除播报消失。
@@ -1420,13 +1443,27 @@ class AgentDeskmatePlugin(NekoPluginBase):
                     continue
                 jobs.append(partial(broadcaster.broadcast, hit))
         for notice in notices:
+            # 「这一轮跑完了」**要 Yui 说出来**（2026-11-26 用户要求）。
+            #
+            # 其余通知跟着 Broadcaster 走，不另读配置——一处决定，避免
+            # "删除类开说、通知类不开"的半成品；也走同一个 30 秒冷却，
+            # 两条连着来第二条自动降级成 blind，不连发 respond。
+            #
+            # 跑完这条**绕过 speak 开关但保留冷却**：``broadcast_speak``
+            # 管的是"让不让猫娘接话"这个总开关（默认关），而用户要的是
+            # "跑完时提醒我"——拿一个默认关的总开关去卡一个明确要的功能，
+            # 结果是功能看起来装了、其实不响。
+            #
+            # **有没有 key 是唯一门槛**（红线 3）：``respond`` 要主模型接一轮，
+            # 没 key 就降级成 blind 只出文字——那也正是用户要的
+            # "没填 key 就提供最简单的信息"。
+            if notice.role == ROLE_BOUNDARY and has_key:
+                behavior = broadcaster.resolve_ai_behavior(force=True)
+            else:
+                behavior = broadcaster.resolve_ai_behavior()
             jobs.append(partial(broadcast_notice, self.push_message, notice,
                                 source=SOURCE, logger=self.logger,
-                                # 跟着 Broadcaster 走，不另读配置——
-                                # 一处决定，避免"删除类开说、通知类不开"的半成品。
-                                # 也走同一个冷却：两条播报连着来，第二条自动
-                                # 降级成 blind，不连发 respond。
-                                ai_behavior=broadcaster.resolve_ai_behavior()))
+                                ai_behavior=behavior))
 
         outcomes: list[str] = []
         for job in jobs:

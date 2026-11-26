@@ -28,6 +28,7 @@ from plugin.plugins.agent_deskmate import (
     MAX_PENDING_PUSHES,
     SOURCE,
     AgentDeskmatePlugin,
+    _has_model_key,
     _tracker_config,
     _tracker_section,
 )
@@ -47,7 +48,7 @@ from plugin.plugins.agent_deskmate.events import (
     UnifiedEvent,
 )
 from plugin.plugins.agent_deskmate.gated import GatedFailureLog
-from plugin.plugins.agent_deskmate.progress import Light, Role
+from plugin.plugins.agent_deskmate.progress import ROLE_BOUNDARY, Light, Role
 from plugin.plugins.agent_deskmate.tracker import Notice, ProgressTracker, TrackerConfig
 
 AGENT = "claude-code"
@@ -169,7 +170,7 @@ class _Host:
     _maybe_submit_review = AgentDeskmatePlugin._maybe_submit_review
     _run_review_batch = AgentDeskmatePlugin._run_review_batch
 
-    def __init__(self, events=(), progress=None) -> None:
+    def __init__(self, events=(), progress=None, model=None) -> None:
         self.logger = _ListLogger()
         self.pushed: list[dict] = []
         self.push_message = self._push
@@ -183,6 +184,8 @@ class _Host:
         self._tracker_cfg: TrackerConfig | None = None
         self._pending_pushes: list = []
         self._progress = progress
+        # 「跑完」要不要让她开口，唯一门槛是有没有 key（红线 3）。
+        self._model = model
         # 审批在等人的会话。None = 审批网关没起来（真插件 _approval 的初值），
         # 走 "没有阻塞" 分支——这条路径本身也要被测到。
         self._approval = None
@@ -216,7 +219,10 @@ class _Host:
         # 不显式关掉跨批合并的话，通知会被压一个窗口（默认 20s），
         # 当轮就看不到它了。想测合并窗口自己的，传 progress 时覆盖这个键。
         section.setdefault("notice_merge_seconds", 0)
-        return {"progress": section}
+        cfg = {"progress": section}
+        if self._model is not None:
+            cfg["model"] = dict(self._model)
+        return cfg
 
     def poll(self, times: int = 1) -> list[str]:
         outcomes: list[str] = []
@@ -322,25 +328,33 @@ def test_a_notice_that_cannot_be_pushed_does_not_raise() -> None:
 # ── C. 配置进状态机 ───────────────────────────────────────────────────────
 
 def test_all_five_thresholds_are_read_from_the_config() -> None:
-    """config.example.toml 的约定：每个键都必须被代码真正读取。"""
+    """config.example.toml 的约定：每个键都必须被代码真正读取。
+
+    比较式里带 ``extra_notify_roles``：产品默认把「这一轮跑完了」开着
+    （2026-11-26），所以解析结果不再等于数据类的中立默认。
+    """
     section = {"wait_escalate_seconds": 11, "unclosed_action_seconds": 22,
                "boundary_round_seconds": 33, "fail_coalesce_seconds": 44,
                "failure_confirm_seconds": 55}
     assert _tracker_config(_tracker_section({"progress": section})) == TrackerConfig(
         wait_escalate_seconds=11.0, unclosed_action_seconds=22.0,
         boundary_round_seconds=33.0, fail_coalesce_seconds=44.0,
-        failure_confirm_seconds=55.0)
+        failure_confirm_seconds=55.0,
+        extra_notify_roles=frozenset({ROLE_BOUNDARY}))
 
 
 def test_no_config_at_all_gives_the_measured_defaults() -> None:
-    assert _tracker_config(_tracker_section({})) == TrackerConfig()
+    """没有配置段时，阈值取实测默认，而「跑完了」按产品默认开着。"""
+    assert _tracker_config(_tracker_section({})) == TrackerConfig(
+        extra_notify_roles=frozenset({ROLE_BOUNDARY}))
 
 
 def test_a_bad_value_falls_back_to_the_default_instead_of_crashing() -> None:
     host = _Host(progress={"failure_confirm_seconds": "半小时",
                            "unclosed_action_seconds": None})
     host._sync_tracker_config(host.config())          # noqa: SLF001
-    assert host._tracker_cfg == TrackerConfig()       # noqa: SLF001
+    assert host._tracker_cfg == TrackerConfig(        # noqa: SLF001
+        extra_notify_roles=frozenset({ROLE_BOUNDARY}))
 
 
 def test_the_same_config_does_not_swap_the_tracker() -> None:
@@ -437,8 +451,24 @@ def test_a_round_that_ends_clears_the_orphans() -> None:
     at = _now() - 10
     host = _Host([_action_step(at, action_id="tu_1"), _boundary(at + 700)])
     host.poll()
-    assert host.pushed == []
     assert host._tracker.state_of(AGENT, "sess-1").open_actions == {}  # noqa: SLF001
+
+
+def test_a_round_that_ends_announces_itself() -> None:
+    """2026-11-26 起，「这一轮跑完了」默认开口，并带上这一轮用了什么。
+
+    契约默认是关（progress.NOTIFY_DEFAULTS），产品默认由
+    ``boundary_notify`` 传 ``extra_notify_roles`` 进来。
+    """
+    at = _now() - 10
+    host = _Host([_action_step(at, action_id="tu_1", kind="Bash"),
+                  _boundary(at + 700)])
+    host.poll()
+    assert len(host.pushed) == 1
+    text = host.pushed[0]["parts"][0]["text"]
+    assert "这一轮跑完了" in text
+    assert "共 1 步" in text
+    assert "Bash 1 次" in text
 
 
 def _boundary(at: float, session: str = "sess-1"):
@@ -966,3 +996,114 @@ def test_closing_the_window_releases_what_is_held(monkeypatch) -> None:
     host._sync_merge_window({"notice_merge_seconds": 0})
     host._poll_once(host.config())
     assert len(host.pushed) == 1
+
+
+# ── 「这一轮跑完了」的产品默认 ──────────────────────────────────────────
+
+
+def test_boundary_notify_defaults_on() -> None:
+    """产品默认开口。契约默认是关，这里反回去——见 tracker.TrackerConfig 注释。"""
+    cfg = _tracker_config({})
+    assert ROLE_BOUNDARY in cfg.extra_notify_roles
+
+
+def test_boundary_notify_can_be_turned_off() -> None:
+    """一行配置就能关掉，不用改代码。"""
+    cfg = _tracker_config({"boundary_notify": False})
+    assert ROLE_BOUNDARY not in cfg.extra_notify_roles
+
+
+def test_boundary_notify_accepts_string_false() -> None:
+    """TOML 里可能写成字符串；``_to_bool`` 管这个。"""
+    cfg = _tracker_config({"boundary_notify": "false"})
+    assert ROLE_BOUNDARY not in cfg.extra_notify_roles
+
+
+def test_a_bad_boundary_notify_value_falls_back_to_on() -> None:
+    """坏值不许让观测循环崩，也不该静默关掉一个明确要的功能。"""
+    cfg = _tracker_config({"boundary_notify": "大概吧"})
+    assert ROLE_BOUNDARY in cfg.extra_notify_roles
+
+
+def test_has_model_key_reads_model_then_approval() -> None:
+    """读取顺序必须与 ``_advisor_from_config`` 一致。
+
+    不一致的后果是"审查那边用得上、语音这边说没 key"——同一份事实两个答案。
+    """
+    assert _has_model_key({"model": {"api_key": "k"}}) is True
+    assert _has_model_key({"approval": {"api_key": "k"}}) is True
+    assert _has_model_key({"model": {"api_key": "  "}}) is False
+    assert _has_model_key({}) is False
+
+
+# ── 「跑完」要她开口：有没有 key 是唯一门槛 ─────────────────────────────
+
+
+def test_a_finished_round_speaks_when_a_key_is_set() -> None:
+    """填了 key → ``respond``，Yui 自己组织语言说"跑完了"。
+
+    这就是用户要的"有 key 可以提供大概的简单结论"——内容由主模型生成，
+    插件只给事实（谁、哪轮、几步、用了什么类别）。
+    """
+    at = _now() - 10
+    host = _Host([_action_step(at, action_id="tu_1", kind="Bash"),
+                  _boundary(at + 700)], model={"api_key": "k"})
+    host.poll()
+    assert len(host.pushed) == 1
+    assert host.pushed[0]["ai_behavior"] == "respond"
+
+
+def test_a_finished_round_is_text_only_without_a_key() -> None:
+    """没填 key → ``blind``，只出文字（红线 3：零 key 只跑 L0）。
+
+    这正是用户要的"没填 key 就提供最简单的信息"——谁的哪个会话跑完了。
+    """
+    at = _now() - 10
+    host = _Host([_action_step(at, action_id="tu_1", kind="Bash"),
+                  _boundary(at + 700)])
+    host.poll()
+    assert len(host.pushed) == 1
+    assert host.pushed[0]["ai_behavior"] == "blind"
+
+
+def test_a_finished_round_speaks_even_with_broadcast_speak_off() -> None:
+    """``broadcast_speak`` 是总开关、默认关——不许拿它卡这个功能。
+
+    拿它卡的结果是"功能装了却不响"：用户明明要求跑完要提醒。
+    """
+    at = _now() - 10
+    host = _Host([_action_step(at, action_id="tu_1", kind="Bash"),
+                  _boundary(at + 700)], model={"api_key": "k"})
+    assert host._broadcaster.speak is False          # noqa: SLF001 总开关确实关着
+    host.poll()
+    assert host.pushed[0]["ai_behavior"] == "respond"
+
+
+def test_a_finished_round_still_respects_the_cooldown() -> None:
+    """冷却照旧：两条连着来，第二条降级成 blind，不连发 respond。
+
+    宿主前端连发 respond 会坏（见 test_broadcast.py 那两条），
+    ``force`` 只绕过 speak 开关，不绕过这一条。
+    """
+    at = _now() - 10
+    host = _Host([_action_step(at, action_id="tu_1", kind="Bash"),
+                  _boundary(at + 700)], model={"api_key": "k"})
+    host.poll()
+    # 同一轮再喂一条 turn_end：冷却窗内，应该降级
+    host._transcript_adapter._events.append(_boundary(at + 1400))  # noqa: SLF001
+    host.poll()
+    assert [p["ai_behavior"] for p in host.pushed] == ["respond", "blind"]
+
+
+def test_other_notices_do_not_get_the_forced_voice() -> None:
+    """只有「跑完」被 force。失败类通知照旧看 broadcast_speak。
+
+    否则一个总开关关不掉的东西，会被另一个功能悄悄打开。
+    """
+    at = _now() - 10
+    host = _Host([_failed_step(at), _boundary(at + 700)], model={"api_key": "k"})
+    host.poll(times=3)      # 失败要过确认窗口，多跑几轮
+    for call in host.pushed:
+        if "这一轮跑完了" in call["parts"][0]["text"]:
+            continue
+        assert call["ai_behavior"] == "blind", call["parts"][0]["text"][:40]

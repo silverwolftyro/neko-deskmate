@@ -49,6 +49,17 @@ class TrackerConfig:
     unclosed_action_seconds: float = 300.0
     # 两次 boundary 间隔超过它才值得说「这一轮跑完了」（防滴答感）。
     boundary_round_seconds: float = 600.0
+    # **契约默认之外，还要开口的角色**。
+    #
+    # ``progress.NOTIFY_DEFAULTS`` 把 BOUNDARY 定为默认关，理由原话是
+    # "知会类且最吵：每一轮结束都响，正是训练用户忽略插件的那个"
+    # （``test_progress.py`` 钉着这条不动）。但 2026-11-26 用户明确要求
+    # 跑完要提醒、而且要 Yui 说出来——那是一个更具体的需求，覆盖那条默认。
+    #
+    # 默认值留空（中立）：数据类不替产品做决定，产品默认由 ``__init__``
+    # 从配置传进来。这样"契约默认是什么"和"这个插件默认给什么"是两件事，
+    # 前者有测试钉着，后者用户一行配置就能关掉。
+    extra_notify_roles: frozenset[str] = frozenset()
     # 同一 (会话, 类别) 的失败在这个窗口内合并成一条。
     fail_coalesce_seconds: float = 120.0
     # **失败确认窗口**：一次响亮失败之后，等这么久看 Agent 能不能自己恢复。
@@ -118,6 +129,13 @@ class SessionState:
     last_boundary_at: float = 0.0
     rounds: int = 0            # 单调计数，不是比例
     actions: int = 0
+    # 这一轮用过的**类别**计数（``kind → 次数``），boundary 时清零。
+    #
+    # 为什么只记类别不记内容：``progress.Signal`` 没有任何能装内容的字段，
+    # 那是隐私红线的结构性保证（``test_progress.py::test_signal_has_no_content_field``
+    # 钉着）。"它干了什么"只能由类别回答——``bash 7 次、edit 4 次``
+    # 是有信息量的概括，``rm -rf …`` 不是我们能碰的东西。
+    round_kinds: dict[str, int] = field(default_factory=dict)
     fail_streak: dict[str, int] = field(default_factory=dict)
     ok_streak: dict[str, int] = field(default_factory=dict)
     waiting_episode: float | None = None
@@ -311,6 +329,10 @@ class ProgressTracker:
 
     def _on_action(self, state: SessionState, signal: Signal) -> list[Notice]:
         state.actions += 1
+        if signal.kind:
+            # 只累类别。空 kind 不记——它表示"说不清是什么工具"，
+            # 记一个空串键只会让汇总里出现一个没有名字的项。
+            state.round_kinds[signal.kind] = state.round_kinds.get(signal.kind, 0) + 1
         if signal.action_id:
             state.open_actions[signal.action_id] = (signal.kind, signal.at)
         # 还在跑就不是"在等你"了：用户处理完了，或者它自己往下走了。
@@ -453,15 +475,28 @@ class ProgressTracker:
             state.light = Light.IDLE
             return []
 
+        # 这一轮用了什么。**只报类别**（见 SessionState.round_kinds 的说明）：
+        # 「bash 7 次、edit 4 次」是有信息量的概括，也是 Yui 开口时
+        # 唯一能凭的事实。按次数倒序，多的在前——用户先看到它主要在干什么。
+        tally = ", ".join(
+            f"{name} {count} 次"
+            for name, count in sorted(state.round_kinds.items(),
+                                      key=lambda kv: (-kv[1], kv[0]))[:4])
+        detail = f"第 {state.rounds} 轮，共 {state.actions} 步"
+        if tally:
+            detail += f"（{tally}）"
+        state.round_kinds = {}
+
         notice = self._emit(
             state, signal.at,
             role=Role.BOUNDARY, light=Light.IDLE,
             fingerprint=f"round|{state.agent}|{state.session}|{state.rounds}",
             headline=f"{self._who(state)} 这一轮跑完了",
-            detail=f"第 {state.rounds} 轮，共 {state.actions} 步",
+            detail=detail,
         )
         state.light = Light.IDLE
-        # 默认关（见 progress.NOTIFY_DEFAULTS）：这是最吵的一条。
+        # 开不开由 extra_notify_roles 决定（2026-11-26 起产品默认开）：
+        # 契约默认仍是关，见 progress.NOTIFY_DEFAULTS 与 test_progress.py。
         return [notice] if notice is not None else []
 
     def _on_waiting(self, state: SessionState, signal: Signal) -> list[Notice]:
@@ -494,7 +529,7 @@ class ProgressTracker:
         返回 None 表示"这条不该开口"。**三道闸任何一道挡住都返回 None**，
         调用方不许自己判断——否则去重逻辑会散到各处，然后某处漏掉。
         """
-        if not notify_enabled(role):
+        if not (notify_enabled(role) or role in self._config.extra_notify_roles):
             return None
 
         previous = state.fingerprints.get(fingerprint)

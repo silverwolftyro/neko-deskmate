@@ -1116,3 +1116,26 @@ def test_speak_never_raises_on_push_failure():
     spoken, precise = speak(boom, "x", source="s", logger=FakeLogger())
     assert spoken == "exception"
     assert precise == "exception"
+
+
+def test_force_skips_the_speak_switch_but_not_the_cooldown():
+    """``force=True`` 只绕过 speak 开关，**不绕过冷却**。
+
+    2026-11-26：「这一轮跑完了」要语音提醒，而 ``speak`` 是"让不让猫娘接话"
+    的总开关、默认关。拿它卡一个明确要的功能，结果是功能装了却不响。
+    但冷却仍然生效——宿主前端连发 respond 会坏（见上面两条测试）。
+    """
+    off = Broadcaster(RecordingPush(), FakeLogger(), source="s", speak=False)
+    assert off.resolve_ai_behavior(now=1000.0) == "blind"
+    assert off.resolve_ai_behavior(now=1000.0, force=True) == "respond"
+    # 冷却照旧：紧接着第二条 force 也降级
+    assert off.resolve_ai_behavior(now=1001.0, force=True) == "blind"
+    assert off.resolve_ai_behavior(now=1000.0 + RESPOND_COOLDOWN,
+                                   force=True) == "respond"
+
+
+def test_force_does_not_disturb_the_plain_path():
+    """force 只影响被 force 的那条，不把普通播报也跟着改成 respond。"""
+    b = Broadcaster(RecordingPush(), FakeLogger(), source="s", speak=False)
+    b.resolve_ai_behavior(now=1000.0, force=True)
+    assert b.resolve_ai_behavior(now=1100.0) == "blind"

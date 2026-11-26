@@ -443,7 +443,8 @@ class Broadcaster:
         """
         return "respond" if self.speak else "blind"
 
-    def resolve_ai_behavior(self, now: float | None = None) -> str:
+    def resolve_ai_behavior(self, now: float | None = None,
+                            *, force: bool = False) -> str:
         """发一条播报前问一次：这条能不能让她开口。
 
         ``speak`` 关着 → 永远 ``blind``。
@@ -452,8 +453,14 @@ class Broadcaster:
         降级不是"少个功能"：宿主前端有个弄坏了要重启整个 App 的 bug
         （见 ``RESPOND_COOLDOWN`` 的注释），而插件没有任何理由去连发。
         文字照旧上屏，用户只是这一轮听不到她说话。
+
+        ``force=True`` **只绕过 ``speak`` 开关，不绕过冷却**：
+        给"这个功能明确要她说话"的调用方用（2026-11-26：「这一轮跑完了」
+        要语音提醒）。``speak`` 是"让不让猫娘接话"的总开关、默认关，
+        拿它去卡一个明确要的功能，结果是功能装了却不响。
+        冷却仍然生效——两条连着来，第二条照旧降级成 blind。
         """
-        if not self.speak:
+        if not self.speak and not force:
             return "blind"
         stamp = time.time() if now is None else float(now)
         if stamp - self._last_respond_at < RESPOND_COOLDOWN:
