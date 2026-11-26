@@ -863,6 +863,49 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
           </Stack>
         )}
       </Card>
+      {/* B11 的账也放一份在日志页。计数器原本只在「设置」页，于是"压掉了什么"
+          在这一页完全看不见——2026-11-26 真机：用户打开日志页看到
+          「还没有记录。」，而插件刚刚静默吞了两条删除播报。
+          开关关着、又什么都没压过时不渲染，别拿一排 0 占地方。 */}
+      {state.broadcast_review === true ||
+      ((state.broadcast_review_stats || {}).suppressed || 0) > 0 ? (
+        <Card
+          title={t("panel.log.review_stats", {
+            defaultValue: "先审一遍再播（本次启动以来）",
+          })}
+        >
+          <Stack gap="sm">
+            <Text>
+              {t("panel.log.review_stats.line", {
+                defaultValue:
+                  "送审 {submitted} 条，压掉 {suppressed} 条，"
+                  + "没审成 {failed} 条，一共问了模型 {attempts} 遍。",
+                submitted: String(
+                  (state.broadcast_review_stats || {}).submitted || 0,
+                ),
+                suppressed: String(
+                  (state.broadcast_review_stats || {}).suppressed || 0,
+                ),
+                failed: String(
+                  (state.broadcast_review_stats || {}).failed || 0,
+                ),
+                attempts: String(
+                  (state.broadcast_review_stats || {}).attempts || 0,
+                ),
+              })}
+            </Text>
+            <Text>
+              {t("panel.log.review_hint", {
+                defaultValue:
+                  "上面写着「没播」的条目，就是被它压下来的播报——"
+                  + "不是出了事，是模型判了低风险、觉得不值一提。"
+                  + "最多在这里留 20 条，更早的被挤掉（插件日志里仍有全量）。"
+                  + "开关在「设置」页。",
+              })}
+            </Text>
+          </Stack>
+        </Card>
+      ) : null}
     </Stack>
   )
 

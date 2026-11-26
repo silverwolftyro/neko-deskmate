@@ -371,3 +371,92 @@ def test_speak_stays_available_once_on():
     state = _base(api_key_set=False, speak=True)
     assert state["speak"] is True
     assert state["speak_available"] is True
+
+
+# ── B11：被压掉的播报要能在「日志」页看见 ──────────────────────────────
+#
+# 2026-11-26 真机：用户打开「日志」页看到「还没有记录。」，而插件刚刚
+# 静默吞了两条删除播报。根因是 recent 只从 approvals 取——没弹卡就空着，
+# 而 B11 压掉的东西既不在这个列表、计数器又只在设置页。
+#
+# 压的时候静默是对的（B11 的目的就是少打扰），静默到无迹可查是另一回事。
+
+
+def _approval(ts: float, **kw):
+    # 字段名照 ``_approval_text`` 真正读的那几个来：tool_name / tool_summary /
+    # session_id。写成 tool / summary 会被静默忽略，文本变成"你未决定了 某个工具"
+    # ——那种桩看起来在工作，其实什么都没验。
+    row = {"created_at": ts, "state": "pending", "tool_name": "Bash",
+           "tool_summary": "审批甲", "session_id": "s", "agent": "a",
+           "request_id": "r"}
+    row.update(kw)
+    return row
+
+
+def test_suppressed_broadcasts_show_up_in_recent() -> None:
+    """压掉的播报必须出现在「最近发生」里，否则用户无从判断该不该开着它。"""
+    state = _base(review_log=[{
+        "ts": NOW - 10, "kind": "suppressed",
+        "text": "没播 · 删除文件：rm -rf build", "severity": "notice",
+        "attempts": 1,
+    }])
+    assert [r["text"] for r in state["recent"]] == ["没播 · 删除文件：rm -rf build"]
+
+
+def test_a_suppressed_entry_is_not_coloured_like_a_problem() -> None:
+    """tone 用 ``info`` 不是 warning/danger。
+
+    这条记录说的是"没有打扰你"，不是"出事了"。给它警告色，用户会以为
+    漏了什么——那就把 B11 省下来的注意力又赔进去了。
+    """
+    state = _base(review_log=[{
+        "ts": NOW, "kind": "suppressed", "text": "没播 · x", "severity": "warn",
+    }])
+    assert state["recent"][0]["tone"] == "info"
+
+
+def test_recent_mixes_approvals_and_suppressed_by_time() -> None:
+    """审批与被压掉的播报**按时间混排**，不是审批永远在上。
+
+    用户要的是"刚才发生了什么"，不是"刚才弹了几张卡"。
+    """
+    state = _base(
+        approvals=[_approval(NOW - 100)],
+        review_log=[{"ts": NOW - 1, "kind": "suppressed", "text": "没播 · 新的"},
+                    {"ts": NOW - 200, "kind": "suppressed", "text": "没播 · 旧的"}],
+    )
+    texts = [r["text"] for r in state["recent"]]
+    # 三条按时间交错：压制(NOW-1) → 审批(NOW-100) → 压制(NOW-200)。
+    # 断言写成"压制总在前面"就验不出混排了。
+    assert texts[0] == "没播 · 新的"
+    assert "审批甲" in texts[1]
+    assert texts[2] == "没播 · 旧的"
+
+
+def test_recent_is_capped_as_a_whole_list() -> None:
+    """上限管的是整份列表，不是分别管两边。
+
+    分别截断的后果：审批 5 条 + 压制 20 条 = 25 条，而这一页本该是扫一眼的。
+    """
+    from plugin.plugins.agent_deskmate.panel_state import LOG_LIMIT
+
+    state = _base(
+        approvals=[_approval(NOW - i) for i in range(APPROVAL_LIMIT)],
+        review_log=[{"ts": NOW - 1000 - i, "kind": "suppressed",
+                     "text": f"没播 · {i}"} for i in range(LOG_LIMIT)],
+    )
+    assert len(state["recent"]) == LOG_LIMIT
+
+
+def test_review_log_entries_without_text_are_dropped() -> None:
+    """空文本不进列表——它占一行却什么也不说。"""
+    state = _base(review_log=[{"ts": NOW, "kind": "suppressed", "text": ""},
+                              {"ts": NOW, "kind": "suppressed", "text": "   "}])
+    assert state["recent"] == []
+
+
+def test_no_review_log_leaves_recent_untouched() -> None:
+    """没传 review_log（老调用方）时行为不变，只是没有压制痕迹。"""
+    state = _base(approvals=[_approval(NOW)])
+    assert len(state["recent"]) == 1
+    assert "审批甲" in state["recent"][0]["text"]

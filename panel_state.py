@@ -17,6 +17,11 @@ from typing import Any
 SESSION_LIMIT = 8
 # 最近审批记录最多列几条。
 APPROVAL_LIMIT = 5
+# 「最近发生」整份列表的上限。审批与被 B11 压掉的播报**混排**后一起截断——
+# 用户要的是"刚才发生了什么"，不是"刚才弹了几张卡"。
+LOG_LIMIT = 20
+# B11 压掉播报的痕迹最多取几条（插件侧 deque 也是这么大）。
+REVIEW_LOG_LIMIT = 20
 
 
 def _short(session: str) -> str:
@@ -38,6 +43,7 @@ def build_panel_state(
     speak: bool = False,
     sessions: list[dict[str, Any]],
     approvals: list[dict[str, Any]],
+    review_log: list[dict[str, Any]] | None = None,
     now: float,
     agents: list[dict[str, Any]] | None = None,
     agent_sessions: dict[str, list[dict[str, Any]]] | None = None,
@@ -127,6 +133,31 @@ def build_panel_state(
             "tone": _approval_tone(row),
             "text": _approval_text(row),
         })
+
+    # B11 压掉的播报也进这份列表。
+    #
+    # 2026-11-26 之前这里只有审批卡片，于是"没弹卡"就等于"最近发生"空着——
+    # 真机上用户打开日志页看到「还没有记录。」，而插件刚刚静默吞了
+    # 两条删除播报，面板上一个字都不提。B11 的四个计数器在设置页，
+    # 日志页看不到，两边对不上。
+    #
+    # ** tone 用 ``info`` 而不是 warning/danger**：这条记录说的是
+    # "没有打扰你"，不是"出事了"。给它一个警告色，用户会以为漏了什么，
+    # 那就把 B11 省下来的注意力又赔进去了。
+    for row in (review_log or [])[:REVIEW_LOG_LIMIT]:
+        text = str(row.get("text") or "").strip()
+        if not text:
+            continue
+        recent.append({
+            "ts": float(row.get("ts") or 0.0),
+            "tone": "info",
+            "text": text,
+        })
+
+    # 按时间倒序，让「最近」真的是最近。审批与压制混排——
+    # 用户要的是"刚才发生了什么"，不是"刚才弹了几张卡"。
+    recent.sort(key=lambda r: r.get("ts") or 0.0, reverse=True)
+    del recent[LOG_LIMIT:]
 
     # 最近一次播报 = 所有会话的 fingerprint 计时里的最大值。
     # 取不到就留 0，面板显示"—"——不拿"最近事件"冒充"最近播报"。

@@ -885,6 +885,51 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
           </Stack>
         )}
       </Card>
+      {/* B11's ledger also lives on this tab. The counters used to sit only on
+          Settings, so "what got swallowed" was invisible here — 2026-11-26
+          real run: the user opened this tab, saw "No records yet.", while the
+          plugin had just silently dropped two delete broadcasts.
+          Hidden when the switch is off and nothing was ever suppressed. */}
+      {state.broadcast_review === true ||
+      ((state.broadcast_review_stats || {}).suppressed || 0) > 0 ? (
+        <Card
+          title={t("panel.log.review_stats", {
+            defaultValue: "Review before broadcasting (this run)",
+          })}
+        >
+          <Stack gap="sm">
+            <Text>
+              {t("panel.log.review_stats.line", {
+                defaultValue:
+                  "Submitted {submitted}, suppressed {suppressed}, "
+                  + "failed {failed}, asked the model {attempts} times.",
+                submitted: String(
+                  (state.broadcast_review_stats || {}).submitted || 0,
+                ),
+                suppressed: String(
+                  (state.broadcast_review_stats || {}).suppressed || 0,
+                ),
+                failed: String(
+                  (state.broadcast_review_stats || {}).failed || 0,
+                ),
+                attempts: String(
+                  (state.broadcast_review_stats || {}).attempts || 0,
+                ),
+              })}
+            </Text>
+            <Text>
+              {t("panel.log.review_hint", {
+                defaultValue:
+                  "Entries marked \"not broadcast\" above are the ones it "
+                  + "swallowed — nothing went wrong; the model judged them "
+                  + "low-risk and not worth your attention. Up to 20 are kept "
+                  + "here, older ones fall off (the plugin log still has all "
+                  + "of them). The switch is on the Settings tab.",
+              })}
+            </Text>
+          </Stack>
+        </Card>
+      ) : null}
     </Stack>
   )
 

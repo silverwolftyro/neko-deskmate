@@ -27,6 +27,7 @@ import os
 import queue
 import subprocess
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
@@ -186,6 +187,13 @@ MAX_PENDING_PUSHES = 50
 # 网关库锁是**持续状态**：不限制的话每 3 秒一条 warning，
 # 日志会比播报还吵，真正要看的删除记录被冲掉。
 SOURCE_ERROR_LOG_EVERY = 60.0
+
+# B11 压掉的播报在「日志」页留几条痕迹。
+# 压的时候静默是对的（B11 的目的就是少打扰），但静默到无迹可查不行：
+# 2026-11-26 真机，用户打开「日志」页看到"还没有记录。"，
+# 而插件刚刚吞了两条删除播报，面板上一个字都不提。
+# 20 条够覆盖"刚才那几下是什么"，又不至于把这一页变成第二条播报流。
+REVIEW_LOG_LIMIT = 20
 
 # scan_now 每个数据源最多回看多少条事件。只读诊断，够看出规则对不对就行。
 SCAN_EVENT_COUNT = 50
@@ -823,6 +831,12 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # 实际问模型的遍数。**单独一个计数器**：它高说明模型在格式上很挣扎，
         # 是该换模型还是该简化 prompt 的直接依据；混在 failed 里看不出来。
         self._review_attempts = 0
+        # B11 压掉了什么的**痕迹**。计数器只说"压掉几条"，不说压掉了什么——
+        # 2026-11-26 真机：用户打开「日志」页看到"还没有记录。"，
+        # 而插件刚刚静默吞了两条删除播报。压的时候静默是对的，
+        # 静默到无迹可查就是另一回事了。
+        # ``deque(maxlen=…)`` 自带淘汰，``append`` 原子，工作线程直接写不用加锁。
+        self._review_log: deque[dict[str, Any]] = deque(maxlen=REVIEW_LOG_LIMIT)
 
     # ── 生命周期 ───────────────────────────────────────────────────────────
     # startup 用 async def、shutdown 用 def，刻意对齐官方 memo_reminder 的写法：
@@ -1512,6 +1526,20 @@ class AgentDeskmatePlugin(NekoPluginBase):
             self.logger.info("审查完成（问了 %d 遍）：%d 条不播，%d 条照旧播"
                              "（累计压掉 %d）", attempts, dropped, len(survivors),
                              self._review_suppressed)
+            # 压掉了什么，留一份能在「日志」页看见的痕迹。
+            # 计数器只回答"压掉几条"，不回答"压掉了什么"——而后者才是
+            # 用户判断"该不该继续开着这个开关"的依据。
+            now = time.time()
+            for hit, keep in zip(batch, survives):
+                if keep:
+                    continue
+                self._review_log.append({
+                    "ts": now,
+                    "kind": "suppressed",
+                    "text": f"没播 · {hit.summary}",
+                    "severity": hit.severity,
+                    "attempts": attempts,
+                })
         for hit in survivors:
             self._review_survivors.put(hit)
         return survivors
@@ -2099,6 +2127,7 @@ class AgentDeskmatePlugin(NekoPluginBase):
             speak=_to_bool(approval_cfg.get("broadcast_speak"), False),
             sessions=sessions,
             approvals=approvals,
+            review_log=list(self._review_log),
             now=time.time(),
             agents=agents,
             agent_sessions=agent_sessions,

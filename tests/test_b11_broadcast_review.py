@@ -26,10 +26,12 @@ B11 问"值不值得说"），所以 prompt、解析器、失败方向全部独�
 from __future__ import annotations
 
 import json
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
 
+from plugin.plugins.agent_deskmate import REVIEW_LOG_LIMIT
 from plugin.plugins.agent_deskmate.auto_review import (
     LEGAL_COMBINATIONS,
     REVIEW_BATCH_MAX,
@@ -295,6 +297,10 @@ class _Host:
         self._review_suppressed = 0
         self._review_failed = 0
         self._review_attempts = 0
+        # B11 压掉了什么的痕迹。``_run_review_batch`` 会往里写，
+        # 所以桩必须有——漏一个属性就是 AttributeError，
+        # 而那是"桩没跟着插件方法走"的老毛病。
+        self._review_log: deque = deque(maxlen=REVIEW_LOG_LIMIT)
         # 真插件那边是 _advice_pool（max_workers=1）；这里换成记账用的假池
         self._advice_pool = _Pool()
 
@@ -673,3 +679,60 @@ def test_attempts_are_bounded() -> None:
     from plugin.plugins.agent_deskmate.auto_review import REVIEW_BATCH_ATTEMPTS
 
     assert REVIEW_BATCH_ATTEMPTS == 3
+
+
+# ── 痕迹：压掉了什么，得能在「日志」页看见 ──────────────────────────────
+#
+# 2026-11-26 真机：用户打开「日志」页看到「还没有记录。」，而插件刚刚
+# 静默吞了两条删除播报。计数器只说"压掉几条"，不说"压掉了什么"——
+# 而后者才是用户判断"该不该继续开着这个开关"的依据。
+#
+# 压的时候静默是对的（B11 的目的就是少打扰），静默到无迹可查是另一回事。
+
+
+def test_suppressed_hits_leave_a_trace() -> None:
+    """每条被压掉的播报都要在 ``_review_log`` 里留一条。"""
+    host = _bind()()
+    batch = [_hit("rm -rf src"), _hit("rm -rf build")]
+    survivors = host.run(batch, _FakeReviewer([True, False]))
+    assert survivors == [batch[0]]
+    assert len(host._review_log) == 1
+    entry = host._review_log[0]
+    assert entry["kind"] == "suppressed"
+    # 文本要能让人认出是哪一条——光有计数等于没有
+    assert entry["text"].startswith("没播")
+    assert "build" in entry["text"]
+    assert entry["severity"] == batch[1].severity
+
+
+def test_survivors_leave_no_trace() -> None:
+    """照旧播的不留痕——它已经在播报流里了，再记一遍是重复。"""
+    host = _bind()()
+    host.run([_hit("rm -rf src")], _FakeReviewer([True]))
+    assert host._review_log == deque()
+
+
+def test_a_failed_review_leaves_no_trace() -> None:
+    """审查没成时全部照旧播，没有"被压掉"这回事，也就不该有痕迹。"""
+    host = _bind()()
+    host.run([_hit("rm -rf src")], _FakeReviewer(None, "审查超时（8s）"))
+    assert host._review_log == deque()
+
+
+def test_the_review_log_is_bounded() -> None:
+    """有硬顶——否则这一页会变成第二条播报流，B11 省的眼力又赔进去。"""
+    host = _bind()()
+    reviewer = _FakeReviewer([False])
+    for i in range(REVIEW_LOG_LIMIT + 5):
+        host.run([_hit(f"rm -rf dir{i}")], reviewer)
+    assert len(host._review_log) == REVIEW_LOG_LIMIT
+    # 淘汰的是最旧的——正在发生的比一分钟前发生的更值得被看见
+    assert f"dir{REVIEW_LOG_LIMIT + 4}" in host._review_log[-1]["text"]
+    assert "dir0" not in [e["text"] for e in host._review_log]
+
+
+def test_the_attempt_count_rides_along_with_the_trace() -> None:
+    """痕迹带 attempts：同一条记录能看出它是第几遍问出来的。"""
+    host = _bind()()
+    host.run([_hit("rm -rf src")], _FakeReviewer([False], attempts=3))
+    assert host._review_log[0]["attempts"] == 3
