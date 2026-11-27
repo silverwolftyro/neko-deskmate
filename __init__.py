@@ -43,6 +43,7 @@ from plugin.sdk.plugin import (
     Ok,
     SdkError,
     lifecycle,
+    llm_tool,
     neko_plugin,
     plugin_entry,
     timer_interval,
@@ -161,6 +162,9 @@ from .rules import (
     merge_multi_delete,
 )
 from .tracker import DEFAULT_CONFIG, Notice, ProgressTracker, TrackerConfig
+from .agentquery import (TOOL_DESCRIPTION, TOOL_NAME,
+                         TOOL_PARAMETERS, TOOL_TIMEOUT,
+                         empty_answer, summarize)
 from .allowrules import (SCOPE_ALWAYS, SCOPE_SESSION, AllowRules,
                          rule_key)
 from .waiting_view import (
@@ -2170,6 +2174,61 @@ class AgentDeskmatePlugin(NekoPluginBase):
             self.logger.warning("审批结果卡片更新失败（{}）：请求 {}",
                                 exc, request.request_id)
         self._approval.mark_announced(request.request_id)
+
+    # ── 让 Yui 查问本机编码 Agent 的活动（0.6.27）─────────────────────────
+    #
+    # **为什么是 ``@llm_tool`` 而不是 ``@plugin_entry``**：主对话模型不直接调
+    # plugin_entry——那要经喵能力分派（Yui 调 dispatch_task → 喵能力侧模型挑
+    # 入口 → 才轮到我们）。本机日志佐证：Yui 的工具表里 ``agent_deskmate``
+    # 出现 0 次。而这个用例正是官方文档「克制使用」例外里那句
+    # 「**必须**让主对话模型直接调用的能力」——用户当场问、Yui 当场答。
+    #
+    # 取舍全文见 ``05-任务与实验/TASK-2026-11-27-Yui查问编码Agent活动-取舍待拍板.md``。
+    #
+    # **只收一句 question，不收 id**：``prompts_task_tools.py`` 的 docstring
+    # 写明主对话会话几轮就换一次，给它 id 它记不住。
+    #
+    # **main_server 重启后它会失效且插件探不到**（``tool_registry`` 是
+    # ``LLMSessionManager`` 的内存属性）。恢复靠重载插件——注册只在启动时
+    # 做一次。文档原话：「插件没有合规的办法探测 main_server 是否重启过」。
+
+    @llm_tool(
+        name=TOOL_NAME,
+        description=TOOL_DESCRIPTION,
+        parameters=TOOL_PARAMETERS,
+        timeout=TOOL_TIMEOUT,
+        # role=None：对所有猫娘可见。换角色不该让这个工具消失。
+    )
+    async def ask_coding_agents(self, *, question: str = "", **_):
+        """本机编码 Agent 在干什么。**只读内存，不碰 jsonl**。
+
+        v1 只用 tracker 的会话状态 + 审批快照 + 最近通知流水——这三样已经
+        覆盖"在跑 / 在等 / 刚发生"。jsonl 冷数据路径**刻意不做**：
+        "三天前干了什么"是另一个问题，需要一份懒建索引，混进来只会让这版
+        两边都验不透。
+
+        ``question`` 收下来但**不解析**——那是模型的事。我们给它事实，
+        它自己组织语言。在这儿做意图判断就等于再造一个路由器，
+        而误判的代价是 Yui 答非所问。
+        """
+        if self._approval is None and self._tracker is None:
+            return Ok({"answer": empty_answer()})
+
+        sessions = []
+        if self._tracker is not None:
+            sessions = list(self._tracker.sessions())
+        approvals = (self._approval.snapshot()
+                     if self._approval is not None else [])
+        answer = summarize(
+            sessions=sessions, approvals=approvals,
+            notices=list(self._recent_notices), now=time.time(),
+        )
+        # 一条活动都没有时，**明确说"没有"**——让 Yui 能直接答"没有"，
+        # 而不是拿着一份空摘要编。这是用户点名的验收项：误报和漏报
+        # 在这个工具上一样贵。
+        if not sessions and not approvals:
+            answer = empty_answer()
+        return Ok({"answer": answer})
 
     # ── AgentHUD 视图探针（2026-11-27，create_view 首次接入）────────────────
     #
