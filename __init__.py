@@ -161,6 +161,13 @@ from .rules import (
     merge_multi_delete,
 )
 from .tracker import DEFAULT_CONFIG, Notice, ProgressTracker, TrackerConfig
+from .waiting_view import (
+    TITLE,
+    WAITING_CSS,
+    build_waiting_html,
+    build_waiting_summary,
+    waiting_state,
+)
 from .viewcard import (
     ACTION_ALLOW,
     ACTION_CLOSE,
@@ -901,6 +908,16 @@ class AgentDeskmatePlugin(NekoPluginBase):
         self._gateway_adapter: GatewayAdapter | None = None
         self._broadcaster: Broadcaster | None = None
         self._approval: ApprovalGateway | None = None
+        # 「在等你」常驻面板（0.6.25）。``_waiting_signature`` 记上一次刷新的内容指纹，
+        # 没变就不动——年龄每秒在变，跟着刷就是每秒一次 host 投递。
+        # ``_waiting_view_id`` 是当前那个视图的 id；None 表示没有。
+        self._waiting_signature: tuple | None = None
+        self._waiting_view_id: str | None = None
+        # 「在等你」面板的总开关。**在 _poll_once 里刷新而不是 approval_tick
+        # 里读**：approval_tick 是 1 秒一轮，每轮 dump 一次配置会把
+        # ``_plugin_config()`` 的调用率翻三倍，而这个开关几年才动一次，
+        # 3 秒延迟没有可感知的影响。
+        self._waiting_view_on: bool = True
         self._hint_logged = False
         # 5b：模型建议客户端 + 跑它的线程池。advisor 为 None 表示零 key 默认态。
         self._advisor: ModelAdvisor | None = None
@@ -1520,6 +1537,10 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # ``_should_speak``），拿一个默认关的开关去卡它，结果是功能看着
         # 装了、其实不响。但**必须能一票闭嘴**——语音是整套里最侵入的一种。
         voice_on = _to_bool(_tracker_section(config).get("voice"), True)
+        # 「在等你」面板的开关。默认开——它回答的是「不确定有没有事在等我」，
+        # 而这个面板不需要 key（create_view 底层是 blind 投递，不走模型）。
+        self._waiting_view_on = _to_bool(
+            _tracker_section(config).get("waiting_view"), True)
         events: list[UnifiedEvent] = []
         # B4：两个源各自兜住。任何一个失败只降级它自己，
         # 另一个源这一轮读到的事件照常播——网关库锁不该让删除播报消失。
@@ -1813,8 +1834,67 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 await self._settle_approval_card(pending)
             for pending in self._approval.take_auto_allowed():
                 await self._announce_auto_allow(pending)
+            await self._sync_waiting_view(time.time())
         except Exception as exc:  # noqa: BLE001  一轮失败不能杀死 timer
             self.logger.warning("审批卡片处理异常（{}）：{}", type(exc).__name__, exc)
+
+    async def _sync_waiting_view(self, now: float) -> None:
+        """「在等你」常驻面板。**只读，没有按钮**——见 ``waiting_view`` 的 docstring。
+
+        挂在 ``approval_tick`` 里而不是另起一个 timer：这个面板的全部依据就是
+        审批挂起状态，而那个状态只在审批这一侧变。另起一个 timer 只会多一份
+        「什么时候该刷」的判断，而两份判断必然漂移。
+
+        三级动作：
+
+        - **N 归零** → ``close()``。常驻面板最怕变成又一块永远亮着的装饰。
+        - **计数变了** → **重新 create**。宿主语义是「关掉之后 update 不会
+          重新打开」，而用户完全可能嫌烦关掉它；计数变化是真事件，
+          值得让它再亮一次（不抢焦点，只亮圆点——0.6.24 真机实测过）。
+        - **只有分钟数变了** → ``update()``。年龄每秒在变，跟着刷就是每秒一次
+          投递；``signature()`` 已经把没变的挡掉了。
+
+        **不需要 key**：``create_view`` 底层是 ``push_message`` 的 blind 分支，
+        不走模型。所以零 key 用户也看得见这一栏——它不是"解释类功能"。
+        """
+        if self._approval is None or not self._waiting_view_on:
+            return
+        state = waiting_state(self._approval.snapshot(), now)
+        signature = state.signature()
+        if signature == self._waiting_signature:
+            return
+        previous = self._waiting_signature
+        self._waiting_signature = signature
+
+        try:
+            if state.count == 0:
+                if self._waiting_view_id is not None:
+                    await self.ctx.get_view(self._waiting_view_id).close()
+                    self.logger.info("「在等你」面板已收起（没有待决定的审批了）")
+                    self._waiting_view_id = None
+                return
+
+            html_text = build_waiting_html(state)
+            summary = build_waiting_summary(state)
+            # 计数变了才重建：见 docstring 第三条。
+            if previous is None or previous[0] != state.count \
+                    or self._waiting_view_id is None:
+                view = await self.ctx.create_view(
+                    title=TITLE, html=html_text, css=WAITING_CSS,
+                    summary=summary,
+                )
+                self._waiting_view_id = view.id
+                self.logger.info("「在等你」面板已弹出 {}（{} 条）",
+                                 view.id, state.count)
+            else:
+                await self.ctx.get_view(self._waiting_view_id).update(
+                    html=html_text, summary=summary)
+        except CardSubmissionError as exc:
+            # 面板发不出去≠审批不存在：卡片照旧弹、照旧能点。
+            # 这一栏是附赠，不能因为它发不出去就搅了主线。
+            self.logger.warning("「在等你」面板提交失败（{}）：{}",
+                                type(exc).__name__, exc)
+            self._waiting_view_id = None
 
     async def _announce_auto_allow(self, pending: Any) -> None:
         """自动放行后发一条 blind 通知（规格 §2 硬规则 4）。

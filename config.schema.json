@@ -284,6 +284,20 @@
               "default": 120,
               "minimum": 0,
               "maximum": 3600
+            },
+            "waiting_view": {
+              "type": "boolean",
+              "title": "Keep a standing 'waiting for you' panel",
+              "description": "While any approval is still undecided, a standing panel in the AgentHUD plugin-content tab reads 'N approvals waiting - oldest has waited X minutes', refreshed every minute. It closes itself once nothing is waiting. Read-only with no buttons: approve or deny from the original card in chat. Needs no API key.",
+              "x-title-i18n": {
+                "en": "Keep a standing 'waiting for you' panel",
+                "zh-CN": "「在等你」常驻面板"
+              },
+              "x-description-i18n": {
+                "en": "While any approval is still undecided, a standing panel in the AgentHUD plugin-content tab reads 'N approvals waiting - oldest has waited X minutes', refreshed every minute. It closes itself once nothing is waiting. Read-only with no buttons: approve or deny from the original card in chat. Needs no API key.",
+                "zh-CN": "只要还有没决定的审批，右侧「喵能力任务」里就常驻一行「N 个审批在等你 · 最久的已等 X 分钟」，按分钟更新；没有待决定的就自己收起。只读、没有按钮——批还是不批回聊天窗点原来的卡片。不需要 API key。"
+              },
+              "default": true
             }
           }
         },
