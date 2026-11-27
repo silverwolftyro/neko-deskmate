@@ -112,6 +112,7 @@ from .commands import (
     COMMAND_DISPLAY_MAX,
     CONCLUSION_UNSURE,
     command_length,
+    destroys_irreversible_state,
     opacity_is_the_only_reason,
 )
 from .events import (
@@ -647,7 +648,15 @@ def _reviewable_broadcast(hit: RuleHit) -> bool:
     所以：**critical 里"只因为说不清而严重"的那一类可以送审**
     （``commands.opacity_is_the_only_reason``）。有真的危险目标在里面的
     （`~` / 盘根 / 系统目录 / 工作区外）一律不给送审，规矩一格没让。
+
+    **版本控制目录同样一律不送审**（``destroys_irreversible_state``）：
+    B11 给模型的授权是"识别常规"，**不是"重新定危险"**。``rm -rf .git``
+    的严重度是 warn，而 warn 默认可送审——模型一句"常规"就能把这条压掉，
+    而被压掉的是一次不可恢复的销毁（提交历史 + 全部未提交工作）。
+    它两难（刚 clone 完删是常规），所以不升红字，但**不许没人看就过去**。
     """
+    if destroys_irreversible_state(hit.command or hit.summary):
+        return False
     if hit.severity in _REVIEWABLE_SEVERITIES:
         return True
     if hit.severity != "critical":

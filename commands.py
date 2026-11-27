@@ -551,6 +551,52 @@ def opacity_is_the_only_reason(command: str,
     return tier != TIER_EXTREME
 
 
+#: 删这些目录毁掉的是**不可恢复的状态**：版本控制目录里同时装着提交历史
+#: 和**全部未提交的工作**。后者没有任何备份——远程只有你 push 上去的那些。
+#:
+#: 为什么值得单独立一套（``_RECOVERABLE_MARKERS`` 管的是反方向）：
+#: 2026-11-27 实测，``rm -rf .git`` 的档位是 ``normal``、严重度 ``warn``、
+#: 动作类别 ``recoverable``——于是它**过得了 L2 闸门**（``irreversible``
+#: 才是那道墙），而 ``warn`` 又是**可送审**的，B11 的模型一句"常规"
+#: 就能把通知也压掉。同一条命令写成 ``rm -rf ../.git`` 却是
+#: ``extreme`` / ``critical`` / ``irreversible``，两边都拦。
+#: **同一个动作两种待遇，而更常见的那种（在当前目录）恰好是哪边都拦不住的。**
+#:
+#: 只认**目录名恰好等于**，不搞子串匹配——``_RECOVERABLE_MARKERS`` 的注释
+#: 写明了子串匹配会把 ``D:\workspace\templates\`` 一起误判，同一个错误
+#: 换到安全方向上更贵。``.gitignore`` / ``.github`` / ``git-backup`` 都不算：
+#: 删它们不毁历史。
+_IRREVERSIBLE_STATE_DIRS = frozenset({".git", ".hg", ".svn"})
+
+
+def destroys_irreversible_state(command: str) -> bool:
+    """这条命令要删版本控制目录吗。纯函数。
+
+    **按路径分量判，不按整串**：``.git``、``./.git``、``../.git``、
+    ``foo/.git``、``.git/objects`` 都算——最后一个尤其算，删对象库一样
+    毁掉整个仓库。而 ``.gitignore``、``.github``、``git`` 都不算。
+
+    两个消费方，一份事实（避免两侧漂移）：
+
+    1. ``approval._classify`` —— 把动作类别顶成 ``irreversible``，
+       于是 ``auto_decide_gate`` 的第一道墙拦住它，**不会再被自动放行**；
+    2. ``__init__._reviewable_broadcast`` —— 不许送 B11 审查，
+       **不会再被模型一句话静音**。
+
+    **刻意不动档位、不动严重度**：档位同时喂审批闸门与 B3 排序，
+    改它会让 ``rm -rf .git`` 从 warn 变 critical——而这件事是两难的
+    （刚 clone 完删它是常规，有三天未提交工作删它是灾难，规则层分不出），
+    拿【严重】去描述一件我们分不出轻重的事，正是 B8 禁止的那件事。
+    这里只关掉"没人看就让它过去"的那两条路，闸门与红字一格不让。
+    """
+    for target in delete_targets(command):
+        parts = [part for part in _norm(target).replace("/", "\\").split("\\")
+                 if part not in ("", ".")]
+        if any(part in _IRREVERSIBLE_STATE_DIRS for part in parts):
+            return True
+    return False
+
+
 def delete_tier_for_command(command: str, working_directory: str | None) -> str:
     """删除类的目标档位，**删不出目标时抬到极高危**。
 

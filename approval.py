@@ -100,6 +100,7 @@ from .commands import (
     command_length,
     conclusion_for,
     delete_targets,
+    destroys_irreversible_state,
     fact_line,
     path_is_under,
     severity_for_tier,
@@ -265,7 +266,19 @@ def _classify(command: str, working_directory: str | None
         # 删除类：目标解析不出来就抬到极高危，那条规则在 ``rules.delete_tier``
         # 里——播报与闸门共用，避免两侧漂移。
         tier = delete_tier(command, working_directory)
-        return severity_for_tier(tier), RULE_DELETE, _class_for_tier(tier), tier
+        action_class = _class_for_tier(tier)
+        # 版本控制目录：档位说不准（``.git`` 在工作区内 → normal → recoverable），
+        # 但毁掉的是不可恢复的状态。**只顶类别，不动档位不动严重度**——
+        # 详见 ``commands.destroys_irreversible_state`` 的说明。
+        #
+        # 2026-11-27 实测：不补这一行，``rm -rf .git`` 在
+        # ``auto_decide_max_severity = "warn"``（上限就允许设到 warn）下
+        # **会被自动放行**——没有卡片，Claude 直接删掉提交历史与全部
+        # 未提交工作。而同一件事写成 ``rm -rf ../.git`` 两边都拦得住。
+        if action_class != ACTION_CLASS_IRREVERSIBLE \
+                and destroys_irreversible_state(command):
+            action_class = ACTION_CLASS_IRREVERSIBLE
+        return severity_for_tier(tier), RULE_DELETE, action_class, tier
 
     # 词典认得的不可恢复动作：`git reset --hard` / `drop table` / `curl | sh`。
     # 闸门原来完全不认它们——用户看到的是"低风险"，词典说的是"找不回来"。
