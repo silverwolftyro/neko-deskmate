@@ -179,6 +179,9 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
   const [savingReview, setSavingReview] = useLocalState("saving_review", false)
   const [speakDraft, setSpeakDraft] = useLocalState("speak_draft", "")
   const [speaking, setSpeaking] = useLocalState("speaking", false)
+  // AgentHUD 视图探针（2026-11-27）。``probing`` 只防重复点——
+  // 视图由宿主管，插件不记 view_id（视图不持久化，记了下次运行也对不上）。
+  const [probing, setProbing] = useLocalState("probing", false)
   // Tabs 的 activeId 是受控的：状态页的「去声明」要能把它切到设置页。
   // （原来用 querySelector 猜 data-neko-tab，Tabs 没这个属性，点了没反应。）
   const [tab, setTab] = useLocalState("tabs:deskmate", "status")
@@ -293,6 +296,29 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
       toast.error(String(err && err.message ? err.message : err))
     } finally {
       setSpeaking(false)
+    }
+  }
+
+  // AgentHUD 视图探针。**按钮存在的理由**：宿主没有通用的「跑入口」列表，
+  // 而探针要反复触发才有意义（#2 要的就是"已有视图时再 create 一次"）。
+  // 放在自己面板里，那条实测才做得成。
+  const onViewProbe = async () => {
+    setProbing(true)
+    try {
+      const res = await props.api.call(
+        "view_probe",
+        {},
+        { userInitiated: true },
+      )
+      const msg =
+        res && typeof res === "object" && "message" in res
+          ? String((res as any).message)
+          : t("panel.settings.view_probe_done", { defaultValue: "弹了。" })
+      toast.success(msg)
+    } catch (err: any) {
+      toast.error(String(err && err.message ? err.message : err))
+    } finally {
+      setProbing(false)
     }
   }
 
@@ -786,6 +812,43 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                 })}
               />
             ) : null}
+          </Stack>
+        </Card>
+      ) : null}
+
+      {/* AgentHUD 视图调试入口（2026-11-27，ctx.create_view 首次接入）。
+          存在的理由：宿主没有通用的「跑入口」列表，而这条探针要**反复触发**
+          才有意义——要验的其中一条就是「已有视图时再 create 会怎样」。
+          放在自己面板里，那条实测才做得成。
+          它和审批卡是两条路：审批卡进聊天，视图进 AgentHUD 的插件内容页签。 */}
+      {hasAction("view_probe") ? (
+        <Card
+          title={t("panel.settings.view_probe", {
+            defaultValue: "AgentHUD 视图探针（调试）",
+          })}
+        >
+          <Stack gap="sm">
+            <Text>
+              {t("panel.settings.view_probe_help", {
+                defaultValue:
+                  "在右侧「喵能力任务」里弹一张假审批卡（允许 / 拒绝 / 关掉），"
+                  + "用来验证 ctx.create_view：视图能不能弹出、按钮回调能不能拿到 args "
+                  + "并改卡片。它不对应任何真实请求，点哪个都不会影响 Claude Code。",
+              })}
+            </Text>
+            <Button
+              onClick={onViewProbe}
+              disabled={probing}
+              label={
+                probing
+                  ? t("panel.settings.view_probe_running", {
+                      defaultValue: "弹…",
+                    })
+                  : t("panel.settings.view_probe_go", {
+                      defaultValue: "弹一个探针视图",
+                    })
+              }
+            />
           </Stack>
         </Card>
       ) : null}

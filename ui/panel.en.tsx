@@ -188,6 +188,9 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
   const [savingReview, setSavingReview] = useLocalState("saving_review", false)
   const [speakDraft, setSpeakDraft] = useLocalState("speak_draft", "")
   const [speaking, setSpeaking] = useLocalState("speaking", false)
+  // AgentHUD 视图探针（2026-11-27）。``probing`` 只防重复点——
+  // 视图由宿主管，插件不记 view_id（视图不持久化，记了下次运行也对不上）。
+  const [probing, setProbing] = useLocalState("probing", false)
   // Tabs 的 activeId 是受控的：状态页的「去声明」要能把它切到设置页。
   // （原来用 querySelector 猜 data-neko-tab，Tabs 没这个属性，点了没反应。）
   const [tab, setTab] = useLocalState("tabs:deskmate", "status")
@@ -303,6 +306,29 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
       toast.error(String(err && err.message ? err.message : err))
     } finally {
       setSpeaking(false)
+    }
+  }
+
+  // AgentHUD view probe. Why the button exists: the host has no generic
+  // "run an entry" list, and the probe only means anything when fired
+  // repeatedly (test #2 is precisely "create again while a view exists").
+  const onViewProbe = async () => {
+    setProbing(true)
+    try {
+      const res = await props.api.call(
+        "view_probe",
+        {},
+        { userInitiated: true },
+      )
+      const msg =
+        res && typeof res === "object" && "message" in res
+          ? String((res as any).message)
+          : t("panel.settings.view_probe_done", { defaultValue: "Popped." })
+      toast.success(msg)
+    } catch (err: any) {
+      toast.error(String(err && err.message ? err.message : err))
+    } finally {
+      setProbing(false)
     }
   }
 
@@ -808,6 +834,47 @@ export default function DeskmatePanel(props: PluginSurfaceProps<DeskmateState>) 
                 })}
               />
             ) : null}
+          </Stack>
+        </Card>
+      ) : null}
+
+      {/* AgentHUD view debug entry (2026-11-27, first use of ctx.create_view).
+          Why it exists: the host has no generic "run an entry" list, and this
+          probe only means anything when fired repeatedly — one of the things
+          being verified is "what happens when you create again while a view
+          already exists". Only by living in our own panel can that be tested.
+          It is a different path from approval cards: those go to chat, a view
+          goes to the AgentHUD plugin-content tab. */}
+      {hasAction("view_probe") ? (
+        <Card
+          title={t("panel.settings.view_probe", {
+            defaultValue: "AgentHUD view probe (debug)",
+          })}
+        >
+          <Stack gap="sm">
+            <Text>
+              {t("panel.settings.view_probe_help", {
+                defaultValue:
+                  "Pops a fake approval card (allow / deny / close) in the "
+                  + "Meow Task panel, to verify ctx.create_view: whether the "
+                  + "view appears and whether the button callback receives args "
+                  + "and can update the card. It maps to no real request; "
+                  + "nothing you click affects Claude Code.",
+              })}
+            </Text>
+            <Button
+              onClick={onViewProbe}
+              disabled={probing}
+              label={
+                probing
+                  ? t("panel.settings.view_probe_running", {
+                      defaultValue: "Popping…",
+                    })
+                  : t("panel.settings.view_probe_go", {
+                      defaultValue: "Pop a probe view",
+                    })
+              }
+            />
           </Stack>
         </Card>
       ) : null}

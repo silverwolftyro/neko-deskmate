@@ -74,6 +74,11 @@ def test_events_registered() -> None:
     # ``settings_set_speak`` 是第二个——切播报方式，同样只能走入口。
     # ``settings_set_broadcast_review`` 是第三个——B11 的审查开关，
     # 复用 ``[agent_deskmate.auto_review]`` 那一节，所以它写的是 enabled。
+    # ``view_probe`` / ``view_probe_decide`` / ``view_probe_close`` 是
+    # AgentHUD 视图探针（2026-11-27，``ctx.create_view`` 首次接入）。
+    # 它们是**探针不是产品功能**：一张不对应任何真实请求的假卡，
+    # 验完留着当回归基线。三个都要在这儿列出来——漏一个就说明
+    # ``actions`` 的 ``entry`` 和真正的入口对不上，按钮会点了没反应。
     assert set(registered) == {
         "startup", "shutdown", "config_change", "status", "dump_events", "scan_now",
         "watch", "approval", "approval_decide", "approval_explain",
@@ -82,6 +87,7 @@ def test_events_registered() -> None:
         "pending_list", "audit_list",
         "settings_set_roots", "settings_set_speak", "speak_test",
         "settings_set_broadcast_review",
+        "view_probe", "view_probe_decide", "view_probe_close",
     }, sorted(registered)
     assert registered["startup"].event_type == "lifecycle"
     assert registered["shutdown"].event_type == "lifecycle"

@@ -161,6 +161,20 @@ from .rules import (
     merge_multi_delete,
 )
 from .tracker import DEFAULT_CONFIG, Notice, ProgressTracker, TrackerConfig
+from .viewcard import (
+    ACTION_ALLOW,
+    ACTION_CLOSE,
+    ACTION_DENY,
+    ENTRY_VIEW_CLOSE,
+    ENTRY_VIEW_DECIDE,
+    ENTRY_VIEW_PROBE,
+    VIEW_CSS,
+    build_closed_html,
+    build_probe_result_html,
+    build_view_actions,
+    build_view_html,
+    new_probe_id,
+)
 from .warncount import COUNTS_FILENAME
 
 
@@ -2051,6 +2065,144 @@ class AgentDeskmatePlugin(NekoPluginBase):
             self.logger.warning("审批结果卡片更新失败（{}）：请求 {}",
                                 exc, request.request_id)
         self._approval.mark_announced(request.request_id)
+
+    # ── AgentHUD 视图探针（2026-11-27，create_view 首次接入）────────────────
+    #
+    # **这三个入口是探针，不是产品功能。** 它们验证的是宿主 11-27 新增的
+    # ``ctx.create_view()``：视图弹不弹得出来、按钮回调拿不拿得到 args、
+    # 关掉之后 update 会不会把视图重新拉出来。验完就留着——它无害
+    # （一张不对应任何真实请求的假卡），而且是以后真做 AgentHUD 时的回归基线。
+    #
+    # 和审批卡那条路的区别，一句话：**审批卡进聊天，视图进 AgentHUD 的
+    # 插件内容页签**。所以它不继承审批卡的任何状态——没有 pending、
+    # 没有回填、没有到期。用户点哪个都只是改这张卡自己。
+    #
+    # 三处 id 必须完全一致（``actions`` 的 ``entry`` / ``@ui.action(id=)`` /
+    # ``@plugin_entry(id=)``），对不上就是按钮点了没反应。
+    #
+    # ⚠️ **插在这里的教训**：这三个入口原本插在 ``approval_decide`` 的装饰器
+    # 与它的 ``async def`` 之间，结果那对装饰器落到了 ``view_probe`` 头上——
+    # ``view_probe`` 的 meta.id 变成 ``approval_decide``，而真正的
+    # ``approval_decide`` 一个装饰器都没有。表现是「view_probe 没注册」
+    # 加「审批按钮莫名其妙还能用」。**往装饰器堆旁边插代码，先看一眼
+    # 装饰器归属哪个 def。**
+
+    @ui.action(id=ENTRY_VIEW_PROBE, label=tr(
+        "entry.view_probe.name", default="AgentHUD 视图探针"))
+    @plugin_entry(
+        id=ENTRY_VIEW_PROBE,
+        name=tr("entry.view_probe.name", default="AgentHUD 视图探针"),
+        description=tr(
+            "entry.view_probe.description",
+            default="在 AgentHUD 的插件内容页签里弹一张假审批卡（允许 / 拒绝 / "
+                    "关掉），用来验证 ctx.create_view：视图能不能弹出、按钮回调"
+                    "能不能拿到 args 并改卡片。不对应任何真实请求，点哪个都不"
+                    "影响 Claude Code。",
+        ),
+    )
+    async def view_probe(self, _ctx: dict | None = None):
+        """弹探针视图。**每调一次换一个新 view_id**（宿主语义：替换旧实例）。"""
+        probe_id = new_probe_id()
+        try:
+            view = await self.ctx.create_view(
+                title="同桌猫 · 视图探针",
+                html=build_view_html(probe_id),
+                css=VIEW_CSS,
+                actions=build_view_actions(probe_id),
+                summary=f"AgentHUD 视图探针 {probe_id}",
+            )
+        except CardSubmissionError as exc:
+            # 提交失败≠没执行：宿主本地队列拒了它。探针要把这个分清楚，
+            # 不然"没弹出来"会被误读成"create_view 不好使"。
+            self.logger.warning("视图探针提交失败（{}）：{}",
+                                type(exc).__name__, exc)
+            return Err(SdkError(f"视图没提交成功：{exc}"))
+        self.logger.info("视图探针已弹出 {}（探针 {}）", view.id, probe_id)
+        return Ok({"message": f"探针视图已弹出（编号 {probe_id}）",
+                   "view_id": view.id})
+
+    @ui.action(id=ENTRY_VIEW_DECIDE, label=tr(
+        "entry.view_probe_decide.name", default="探针按钮回调"))
+    @plugin_entry(
+        id=ENTRY_VIEW_DECIDE,
+        name=tr("entry.view_probe_decide.name", default="探针按钮回调"),
+        description=tr(
+            "entry.view_probe_decide.description",
+            default="视图探针上「允许 / 拒绝」的落点：把收到的参数原样回显到"
+                    "同一张视图上。正常不会手动调用它。",
+        ),
+    )
+    async def view_probe_decide(self, probe_id: str, decision: str,
+                                _ctx: dict):
+        """按钮回调。**这条就是用户要验的第三条**：args 到不到得了、能不能改卡。
+
+        ``_ctx`` 由宿主给，视图回调里带 ``view_id`` 与 ``lanlan_name``。
+        ``get_view()`` 只恢复发送句柄、不读内容——所以改卡片靠的是
+        ``update()``，而句柄必须从回调里拿（插件自己不记 view_id：
+        视图不持久化，记了下次运行也对不上）。
+        """
+        view_id = _ctx.get("view_id") if isinstance(_ctx, dict) else None
+        if not view_id:
+            # 宿主没给 view_id：这是契约被破坏，不是"视图关了"。
+            # 明确报出来，别让按钮显示一个莫名的成功。
+            self.logger.warning("视图回调没拿到 view_id（_ctx={}）",
+                                sorted(_ctx) if isinstance(_ctx, dict) else _ctx)
+            return Err(SdkError("宿主没给 view_id，改不了这张卡"))
+        lanlan = _ctx.get("lanlan_name") if isinstance(_ctx, dict) else None
+        try:
+            view = self.ctx.get_view(view_id, target_lanlan=lanlan)
+            await view.update(
+                html=build_probe_result_html(probe_id=probe_id, decision=decision,
+                                       view_id=view_id,
+                                       lanlan_name=lanlan or ""),
+                summary=f"探针 {probe_id}：{decision}",
+                # actions={} 清空按钮——和审批卡"已决定"同一个形状：
+                # 决定完了还留着一排可点的按钮，用户会以为还能改。
+                actions={},
+            )
+        except CardSubmissionError as exc:
+            self.logger.warning("视图探针更新失败（{}）：{}",
+                                type(exc).__name__, exc)
+            return Err(SdkError(f"参数收到了，但卡片没改成：{exc}"))
+        self.logger.info("视图探针回调 {}：decision={} probe={}",
+                         view_id, decision, probe_id)
+        return Ok({"message": f"已{decision}，卡片已更新"})
+
+    @ui.action(id=ENTRY_VIEW_CLOSE, label=tr(
+        "entry.view_probe_close.name", default="关掉探针视图"))
+    @plugin_entry(
+        id=ENTRY_VIEW_CLOSE,
+        name=tr("entry.view_probe_close.name", default="关掉探针视图"),
+        description=tr(
+            "entry.view_probe_close.description",
+            default="视图探针上「关掉」的落点：结束这次显示实例，验证 close "
+                    "之后的 update 不会把视图重新拉出来。",
+        ),
+    )
+    async def view_probe_close(self, probe_id: str, _ctx: dict):
+        """``close()`` 结束的是**这次显示实例**，不是插件业务。
+
+        宿主语义：关掉之后 ``update()`` 照旧提交得动，但**不会重新打开**
+        也不会抢焦点。这条探针顺手验这件事——先 close 再 update 一行字，
+        用户看不到那行字就说明语义和我们理解的一致。
+        """
+        view_id = _ctx.get("view_id") if isinstance(_ctx, dict) else None
+        if not view_id:
+            return Err(SdkError("宿主没给 view_id，关不掉这张卡"))
+        lanlan = _ctx.get("lanlan_name") if isinstance(_ctx, dict) else None
+        try:
+            view = self.ctx.get_view(view_id, target_lanlan=lanlan)
+            await view.close()
+            # close 之后照样发一次 update：**看不到才对**。
+            # 看得到就说明宿主会因 update 重新打开，那我们对语义的理解是错的。
+            await view.update(html=build_closed_html(probe_id),
+                              summary=f"探针 {probe_id}：已关掉")
+        except CardSubmissionError as exc:
+            self.logger.warning("视图探针关闭失败（{}）：{}",
+                                type(exc).__name__, exc)
+            return Err(SdkError(f"没关成：{exc}"))
+        self.logger.info("视图探针已关闭 {}（探针 {}）", view_id, probe_id)
+        return Ok({"message": "已关掉"})
 
     @ui.action(id="approval_decide", label=tr("entry.approval_decide.name", default="审批决定"))
     @plugin_entry(
