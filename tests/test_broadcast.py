@@ -1119,6 +1119,58 @@ def test_speak_never_raises_on_push_failure():
     assert precise == "exception"
 
 
+def test_speak_logs_what_it_said_on_success():
+    """念成功了**必须留一行日志**。
+
+    0.6.15 漏的就是这条：``push_text`` 只在失败时记日志，而
+    ``broadcast_notice`` 早在 0.6.14 就补了成功那一行——新增的
+    ``speak()`` 这条路没跟上。后果 2026-11-27 真机实测：Yui 确实开口
+    说了「这一轮跑完了」，插件日志里一个字都没有，
+    「语音线到底生没生效」只能靠用户截图确认。
+    用户原话：「这个暂时没办法做确认」。
+    """
+    log = FakeLogger()
+    speak(_Rec(), "claude-code 这一轮跑完了，共 2 步，主要是 Bash。",
+          source="s", logger=log, tag="boundary",
+          keep="第 1 轮，共 2 步 · 会话 xxxxxxxx")
+
+    said = [line for _, line in log.lines if line.startswith("已念")]
+    assert len(said) == 1, log.lines
+    assert "claude-code 这一轮跑完了" in said[0]
+    assert "boundary" in said[0]
+    assert "留底" in said[0]
+
+
+def test_speak_logs_the_no_key_case_too():
+    """没念**也要记**，且和"没走到这条路"区分得开。
+
+    否则「无 key 所以没出声」与「压根没执行」在日志里长得一模一样，
+    排查时只能靠猜——而这两件事的修法完全相反。
+    """
+    log = FakeLogger()
+    speak(_Rec(), "x", source="s", logger=log, tag="boundary",
+          ai_behavior="blind")
+
+    lines = [line for _, line in log.lines if line.startswith("未念")]
+    assert len(lines) == 1, log.lines
+    assert "只出文字" in lines[0]
+    # 不能同时记成"已念"——那会让人以为她开口了
+    assert not [line for _, line in log.lines if line.startswith("已念")]
+
+
+def test_speak_does_not_log_success_when_the_push_failed():
+    """推失败了就**不记"已念"**——那是一次撒谎。
+
+    失败本身由 ``push_text`` 记（它失败时记），这里只保证成功那条不虚发。
+    """
+    def boom(**kw):
+        raise RuntimeError("宿主不在")
+
+    log = FakeLogger()
+    speak(boom, "x", source="s", logger=log, tag="boundary")
+    assert not [line for _, line in log.lines if line.startswith("已念")]
+
+
 def test_force_skips_the_speak_switch_but_not_the_cooldown():
     """``force=True`` 只绕过 speak 开关，**不绕过冷却**。
 

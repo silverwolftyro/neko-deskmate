@@ -857,10 +857,16 @@ def speak(push: Callable[..., dict], text: str, *, source: str, logger: Any,
     if ai_behavior != "respond":
         # 没配 key（或调用方明确不要）：只发留底，不起了。
         # 红线 3——零 key 只跑 L0，而 respond 要主模型接一轮。
-        return "skipped", push_text(
+        kept = push_text(
             push, record, source=source, priority=priority, logger=logger,
             tag=tag, ai_behavior="blind",
         )
+        # **没念也要记**：否则"没 key 所以没出声"和"压根没走到这条路"
+        # 在日志里长得一模一样——2026-11-27 真机上「跑完提醒到底响没响」
+        # 就是这么变成查不了的（用户原话：「这个暂时没办法做确认」）。
+        logger.info("未念 [{}] 无 key 或明确不要，只出文字（留底 {} 字）",
+                    tag, len(record))
+        return "skipped", kept
 
     # ① 先发"念"。顺序照侦查笔记结论 5 实证过的形状，不无故调换。
     spoken = push_text(
@@ -873,7 +879,15 @@ def speak(push: Callable[..., dict], text: str, *, source: str, logger: Any,
         visibility=[],
     )
     # ② 再发留底。精确文字永远靠这条，语音只能算附赠。
-    return spoken, push_text(
+    kept = push_text(
         push, record, source=source, priority=priority, logger=logger,
         tag=tag, ai_behavior="blind",
     )
+    # 念成功了才记。**这条是 0.6.15 漏的**：``push_text`` 只在失败时记日志，
+    # 而 ``broadcast_notice`` 早在 0.6.14 就补了成功那一行
+    # （「已播通知 [key/behavior]」）——新增的 ``speak()`` 这条路没跟上。
+    # 后果：2026-11-27 真机上 Yui 确实开口说了"这一轮跑完了"，
+    # 插件日志里却一个字都没有，"语音线到底生没生效"只能靠用户截图确认。
+    if spoken == "sent":
+        logger.info("已念 [{}] {}（留底 {} 字）", tag, text, len(record))
+    return spoken, kept
