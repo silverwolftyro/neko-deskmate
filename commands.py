@@ -78,6 +78,10 @@ UNKNOWN_CONSEQUENCE = "看不出这一步最坏会怎样"
 #
 # 目标档位（B2 表 + B8 的「范围未知」档）：
 TIER_RECOVERABLE = "recoverable"   # 删了重建得回来：依赖 / 构建产物 / 缓存
+#: 动作类别：不可恢复。**定义在这儿而不是 approval.py**——规则表（``allowrules``）
+#: 也要读它，而那个模块不能 import approval（会成环）。放叶子模块，两个消费方
+#: 拿同一个值，不会各写一份字面量然后漂移。
+ACTION_CLASS_IRREVERSIBLE = "irreversible"
 TIER_NORMAL = "normal"             # 工作区内的其他路径
 TIER_EXTREME = "extreme"           # 工作区外 / 家目录 / 盘根 / 系统目录 / 目标不可解析
 TIER_UNKNOWN = "unknown"           # 解析不出目标、效果说不清（删除类会再抬到极高危）

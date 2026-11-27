@@ -194,6 +194,9 @@ class _Host:
         self._tracker = ProgressTracker()
         self._tracker_cfg: TrackerConfig | None = None
         self._pending_pushes: list = []
+        # 0.6.26 任务卡的"最近发生"流水。真插件 __init__ 建它，
+        # 这里手搭一份——少一个属性就是 27 个测试一起红。
+        self._recent_notices: deque = deque(maxlen=5)
         self._progress = progress
         # 「跑完」要不要让她开口，唯一门槛是有没有 key（红线 3）。
         self._model = model

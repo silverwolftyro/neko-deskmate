@@ -85,7 +85,10 @@ from pydantic import BaseModel, Field, ValidationError
 # redact 只有一份，在 broadcast 里（A 批 A4：三条出口共用一套形状）。
 # 审批自己不再长第二套——两套脱敏规则等于没有规则。
 from .broadcast import redact
+from .allowrules import (SCOPE_ALWAYS, SCOPE_SESSION, AllowRules,
+                        rule_key)
 from .commands import (
+    ACTION_CLASS_IRREVERSIBLE,
     COMMAND_DISPLAY_MAX,
     CONCLUSION_ALLOW,
     CONCLUSION_UNSURE,
@@ -121,8 +124,9 @@ DECIDED_BY_USER = "user"                # 用户点了 → 回填
 DECIDED_BY_EXPIRED = "expired"          # 我们先到期 → **不回填、不记成拒绝**
 DECIDED_BY_HOST_TIMEOUT = "host_timeout"  # 连接被宿主断开 → **不回填**
 DECIDED_BY_AI = "ai"                    # L2 自动放行 → 回填，但必须可审计
+DECIDED_BY_RULE = "rule"                  # 用户点过「始终允许/这件事里都允许」→ 回填
 # 只出现在 kind="authorization" 的审计行上：那是"谁确认了授权"，
-# 不是一次审批决定。决定类的 decided_by 永远只有上面四个值。
+# 不是一次审批决定。决定类的 decided_by 永远只有上面几个值。
 DECIDED_BY_AUTHORIZATION = "authorization"
 
 # ── 显式授权（规格 §2 硬规则 2） ────────────────────────────────────────────
@@ -201,7 +205,8 @@ AUTO_DECIDE_VALUES = (AUTO_OFF, AUTO_LOW_RISK_ONLY)
 # `auto_decide_max_severity = "critical"` 就被 L2 自动放行了。按类别排，
 # 新规则只要声明自己"不可恢复"就自动继承排除，不需要有人记得改门控。
 ACTION_CLASS_RECOVERABLE = "recoverable"      # 可恢复：删了重建得回来
-ACTION_CLASS_IRREVERSIBLE = "irreversible"    # 不可恢复：删盘 / 格式化 / 引导项…
+# 不可恢复类。**定义在 commands.py**——allowrules 也要读它，而那个模块
+# 不能 import 本模块（会成环）。放叶子模块两个消费方拿同一个值。
 # 只列"不可恢复"这一类。**未判定时按可恢复算**——宁可漏，不可错杀，
 # 与闸门"精度优先"同向；这也意味着将来新规则要显式声明自己不可恢复。
 IRREVERSIBLE_CLASSES = frozenset({ACTION_CLASS_IRREVERSIBLE})
@@ -1808,6 +1813,9 @@ class ApprovalGateway:
         # B9 自动审查档。**默认 None**：没接审查器时这条路整个不存在，
         # 不是"接了但每次都失败"。接不接由 __init__ 的装配决定（配置 + 四样齐）。
         self._reviewer = reviewer
+        # 「这件事里都允许」/「始终允许」的规则表（0.6.26）。放 gateway 而不是
+        # 插件：``submit()`` 要读它，而那条路只有 gateway 在里面。
+        self._allow_rules = AllowRules()
         self._lock = threading.Lock()
         self._records: dict[tuple[str, str], PendingApproval] = {}
         self._audit: list[AuditRecord] = []
@@ -1984,6 +1992,11 @@ class ApprovalGateway:
         # 放在锁外：判断后端可能慢（网络），不能堵住 resolve / HUD / 建卡。
         self._maybe_auto_allow(record)
 
+        # 用户点过的「始终允许 / 这件事里都允许」（0.6.26）命中就直接放行。
+        # 放在 L2 之后：两者独立，但规则是用户显式授权，比模型判断更硬；
+        # L2 已经放过的话 record 已了结，这儿不会再撞。
+        self._maybe_allow_by_rule(record)
+
         record.event.wait(timeout=self._timeout_seconds)
 
         with self._lock:
@@ -2027,6 +2040,89 @@ class ApprovalGateway:
         return result
 
     # ── L2 自动放行（事件发生时；规格 §2 硬规则 2/3/4） ─────────────────────
+
+    def _maybe_allow_by_rule(self, record: PendingApproval) -> bool:
+        """用户点过的「始终允许 / 这件事里都允许」命中 → 直接放行。
+
+        **只有 allow 一条路**：规则是"别再问了"，不是"替我拒绝"。
+        没命中就什么都不做，请求留给用户，走到期。
+
+        **irreversible 类永不进表**（那道墙在 ``allowrules.rule_key`` 里），
+        所以点十次「始终允许」也只是那一次放行，下一次照旧问。
+        这是这个项目已成文的一条：「高风险永远呈现」。
+        """
+        key = rule_key(
+            _command_of_record(record),
+            action_class=record.action_class, rule=record.rule)
+        scope = self._allow_rules.hit(
+            key, agent=record.request.agent, session=record.request.session_id)
+        if scope is None:
+            return False
+        return self._auto_allow_by_rule(record, scope, key)
+
+    def _auto_allow_by_rule(self, record: PendingApproval, scope: str,
+                            key: object) -> bool:
+        """按规则放行。**不发卡片，但必须留痕**——看不见的放行等于后门。
+
+        留痕两条：审计（``audit_rows`` 看得见）与一条通知（
+        ``take_auto_allowed`` 取走，由插件的 approval timer 发）。
+        通知里写明"凭你之前点的什么"，不然用户只会看到"它自己跑了"。
+        """
+        with self._lock:
+            if record.decided_by is not None:
+                return False
+            record.decision = APPROVE_ALLOW
+            record.decided_by = DECIDED_BY_RULE
+            record.auto = True            # 不弹卡片，走通知那条路
+            record.judge_reason = (
+                f"你之前点了「{'始终允许' if scope == SCOPE_ALWAYS else '这件事里都允许'}」")
+            record.event.set()
+        self._logger.info(
+            "按用户规则放行（{}）：请求 {}（{}）", scope,
+            record.request.request_id, key.describe() if key else "")
+        return True
+
+    def grant_rule(self, request_id: str, scope: str) -> str:
+        """用户在卡片上点了「始终允许 / 这件事里都允许」：记一条规则。
+
+        返回 ``resolved`` / ``already-resolved`` / ``expired`` / ``unknown``，
+        与 ``resolve`` 同一套——按钮的落点先 ``resolve`` 再调这个，
+        所以重复点击只有第一次算数（幂等由 resolve 保证）。
+
+        **规则在 resolve 之后写**：请求已经解决才记"下次别再问"。
+        顺序反了会出现"卡片点了没用、规则却记上了"。
+        """
+        if scope not in (SCOPE_SESSION, SCOPE_ALWAYS):
+            return "unknown"
+        with self._lock:
+            target = None
+            for record in self._records.values():
+                if record.request.request_id == request_id:
+                    target = record
+                    break
+        if target is None:
+            return "unknown"
+        if target.decided_by == DECIDED_BY_EXPIRED:
+            return "expired"
+        if target.decided_by is None:
+            # 卡片还没决定就记规则 = 替用户决定。调用方必须先 resolve。
+            return "unknown"
+        key = rule_key(
+            _command_of_record(target),
+            action_class=target.action_class, rule=target.rule)
+        if key is None:
+            # 不可恢复类 / 认不出目标：**不记**。调用方照常放行这一次，
+            # 但下次照旧问——那道墙不许一个按钮绕过去。
+            self._logger.info(
+                "请求 {} 不够格记规则（类别 {}），只放行这一次",
+                request_id, target.action_class)
+            return "resolved"
+        self._allow_rules.grant(
+            key, scope, agent=target.request.agent,
+            session=target.request.session_id)
+        self._logger.info("记下一条{}规则：{}（请求 {}）", scope,
+                          key.describe(), request_id)
+        return "resolved"
 
     def _maybe_auto_allow(self, record: PendingApproval) -> bool:
         """门控 + 后端都过，才替用户点一次"允许"。返回是否自动放行了。

@@ -161,12 +161,16 @@ from .rules import (
     merge_multi_delete,
 )
 from .tracker import DEFAULT_CONFIG, Notice, ProgressTracker, TrackerConfig
+from .allowrules import (SCOPE_ALWAYS, SCOPE_SESSION, AllowRules,
+                         rule_key)
 from .waiting_view import (
     TITLE,
+    WaitingState,
     WAITING_CSS,
+    build_waiting_actions,
     build_waiting_html,
     build_waiting_summary,
-    waiting_state,
+    session_cards,
 )
 from .viewcard import (
     ACTION_ALLOW,
@@ -913,6 +917,13 @@ class AgentDeskmatePlugin(NekoPluginBase):
         # ``_waiting_view_id`` 是当前那个视图的 id；None 表示没有。
         self._waiting_signature: tuple | None = None
         self._waiting_view_id: str | None = None
+        # 「这件事里都允许」/「始终允许」的规则表（0.6.26）。**内存，不落盘**：
+        # "永远不再问"是安全决策，让它跨会话活得走用户签字那套，而这个按钮没有。
+        # 重启即丢 = 重启后重新问一遍，那是安全的失败方向。
+        self._allow_rules = AllowRules()
+        # 最近几条通知，喂 AgentHUD 任务卡的"最近发生"那一块。
+        # **只存 Notice**（detail 本来就是类别级、不含命令行），不存命令原文。
+        self._recent_notices: deque = deque(maxlen=5)
         # 「在等你」面板的总开关。**在 _poll_once 里刷新而不是 approval_tick
         # 里读**：approval_tick 是 1 秒一轮，每轮 dump 一次配置会把
         # ``_plugin_config()`` 的调用率翻三倍，而这个开关几年才动一次，
@@ -1630,6 +1641,9 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 jobs.append(partial(broadcaster.broadcast,
                                     _downgrade_unconfirmed_critical(hit)))
         for notice in notices:
+            # 任务卡的"最近发生"那一块。**只存 headline**（它本来就是类别级、
+            # 不含命令行），不存命令原文——隐私红线在那儿，面板再方便也不绕。
+            self._recent_notices.append(notice.headline)
             # 要不要**让 Yui 开口念**——一处决定，见 ``_should_speak``。
             #
             # 这三类（跑完 / 出事 / 在等）**绕过 ``broadcast_speak`` 但保留
@@ -1859,7 +1873,16 @@ class AgentDeskmatePlugin(NekoPluginBase):
         """
         if self._approval is None or not self._waiting_view_on:
             return
-        state = waiting_state(self._approval.snapshot(), now)
+        # 会话状态来自 tracker（谁在跑、灯是什么、这一轮用了什么），
+        # 待决审批来自 gateway（谁在等）。两侧各管一半，拼起来才是那张卡。
+        tracker_sessions = []
+        if self._tracker is not None:
+            tracker_sessions = list(self._tracker.sessions())
+        state = WaitingState(
+            cards=session_cards(approvals=self._approval.snapshot(),
+                                sessions=tracker_sessions, now=now),
+            notices=tuple(self._recent_notices),
+        )
         signature = state.signature()
         if signature == self._waiting_signature:
             return
@@ -1882,13 +1905,15 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 view = await self.ctx.create_view(
                     title=TITLE, html=html_text, css=WAITING_CSS,
                     summary=summary,
+                    actions=build_waiting_actions(state),
                 )
                 self._waiting_view_id = view.id
                 self.logger.info("「在等你」面板已弹出 {}（{} 条）",
                                  view.id, state.count)
             else:
                 await self.ctx.get_view(self._waiting_view_id).update(
-                    html=html_text, summary=summary)
+                    html=html_text, summary=summary,
+                    actions=build_waiting_actions(state))
         except CardSubmissionError as exc:
             # 面板发不出去≠审批不存在：卡片照旧弹、照旧能点。
             # 这一栏是附赠，不能因为它发不出去就搅了主线。
@@ -2294,11 +2319,30 @@ class AgentDeskmatePlugin(NekoPluginBase):
                     "Claude Code。正常不会手动调用它。",
         ),
     )
-    async def approval_decide(self, request_id: str, decision: str, _ctx: dict):
-        """卡片按钮的落点。幂等：重复点击只有第一次算数。"""
+    async def approval_decide(self, request_id: str, decision: str, _ctx: dict,
+                              *, scope: str = "once"):
+        """卡片按钮的落点。幂等：重复点击只有第一次算数。
+
+        ``scope`` 是 AgentHUD 任务卡那四个按钮带来的（0.6.26）：
+
+        - ``once`` —— 只这一次（默认，聊天里那张卡一直是这个）
+        - ``session`` —— 这件事里都允许：同会话同形状的下次不问了
+        - ``always`` —— 始终允许：同形状的以后不问了
+
+        **规则在 resolve 之后写**：请求已经解决才记"下次别再问"。
+        顺序反了会出现"卡片点了没用、规则却记上了"。
+
+        规则表只收可恢复类——`~` / 盘根 / 系统目录 / 工作区外 / 无界通配符 /
+        `.git` 一律不进（`allowrules.rule_key` 里那道墙）。所以对那些点
+        「始终允许」，这一次照旧放行，下一次照旧问。
+        """
         if self._approval is None:
             return Err(SdkError("审批服务未运行"))
         outcome = self._approval.resolve(request_id, decision, decided_by=DECIDED_BY_USER)
+        if outcome == "resolved" and decision == APPROVE_ALLOW:
+            # 只在真的解决了之后记。``grant_rule`` 自己还会再判一次类别，
+            # 不够格的它会原样返回 resolved——那正是"放行但不记"。
+            self._approval.grant_rule(request_id, scope)
         if outcome == "unknown":
             return Err(SdkError("找不到这个审批请求（可能已过期并被清理）"))
         if outcome == "expired":
