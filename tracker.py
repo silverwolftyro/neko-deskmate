@@ -155,6 +155,17 @@ class SessionState:
     # **失败不立刻播**——先看 Agent 能不能自己恢复（见 config 里的实测依据）。
     # 任何一次成功都会把整个表清空：它在往前走，就不是卡住。
     pending_failures: dict[str, list] = field(default_factory=dict)
+    # 刚跑完的那一轮的快照：(轮号, 步数, {类别: 次数}, 结束时刻)。
+    # None = 没有待报的一轮。
+    #
+    # **为什么要有它**：turn_end 是每一轮 assistant 回合结束都会发的，
+    # 不是任务结束。2026-11-27 真机：用户还在跑，Yui 却说「已经跑完闲着啦」
+    # ——因为每一轮结束都把灯设成 IDLE。用户原话：「不可能跑完一条你就死了，
+    # 需要整体跑完才算结束」。
+    #
+    # 所以改成：边界只记账，「跑完了」那条通知等会话真安静下来再发。
+    # 计数器当场清掉（否则和下一轮混），内容留在这儿给那时候用。
+    last_round: tuple | None = None
     # 已经为"未回包"开过口的 action_id。每个未闭环 action 最多一次。
     unclosed_reported: set[str] = field(default_factory=set)
     # 指纹 → 上次播报时间。去重只此一处。
@@ -339,7 +350,70 @@ class ProgressTracker:
 
         # 待确认的失败：过了确认窗口还没恢复的，这才开口。
         notices.extend(self._confirm_failures(state, now))
+        notices.extend(self._settle_finished_round(state, now))
         return notices
+
+    def _settle_finished_round(self, state: SessionState,
+                               now: float) -> list[Notice]:
+        """会话真安静下来了，才说「这一轮跑完了」。
+
+        **这是 2026-11-27 那次误报的修法。** 原先每一轮 ``turn_end`` 都发一条
+        「这一轮跑完了」并把灯按成 IDLE，结果用户还在跑的时候 Yui 说
+        「已经跑完闲着啦」。用户原话：「不可能跑完一条你就死了，
+        需要整体跑完才算结束」。
+
+        Claude Code 不发射「任务结束」，唯一能用的判据就是**安静多久**。
+        门槛用 ``boundary_round_seconds``——配置里它的语义本来就是
+        「两轮之间安静这么久算上一轮结束了」（见 config.example.toml），
+        不用另立一个。
+
+        三条限定：
+
+        1. **只在灯还亮着的时候过渡**。IDLE 是目标态；WAITING / ERROR 有
+           自己的语义（在等人 / 出事了），不该被"安静"覆盖。
+        2. **每条只报一次**。``_emit`` 的指纹带轮号，天然去重；
+           报过就把 ``last_round`` 清掉，下一轮结束再攒一条。
+        3. **灯按灭之后再安静也不会重播**——``last_round`` 已经没了。
+        """
+        if state.last_round is None:
+            return []
+        if state.light in (Light.IDLE, Light.WAITING, Light.ERROR):
+            return []
+        rounds, actions, ranked, ended_at = state.last_round
+        # **按 last_event_at 判，不按 ended_at**。两者在边界那一刻相等，
+        # 但之后每来一个新动作 last_event_at 就往前走而 ended_at 不动——
+        # 按 ended_at 判会出现"第二轮跑了十分钟，第一轮的跑完了才姗姗来迟"。
+        # 按 last_event_at 判等价于"整整 600 秒一个事件都没有"，
+        # 那才是"整体跑完了"唯一能用的判据。
+        if now - state.last_event_at < self._config.boundary_round_seconds:
+            return []
+
+        # 先清后发：发不出去（被去重挡了）也不该赖在原地，
+        # 否则下一轮又要从头判一次。
+        state.last_round = None
+        state.light = Light.IDLE
+
+        tally = ", ".join(f"{name} {count} 次"
+                          for name, count in ranked[:4])
+        detail = f"第 {rounds} 轮，共 {actions} 步"
+        if tally:
+            detail += f"（{tally}）"
+        short = state.session[:8] if state.session else ""
+        if short:
+            detail += f" · 会话 {short}"
+        notice = self._emit(
+            state, now,
+            role=Role.BOUNDARY, light=Light.IDLE,
+            fingerprint=f"round|{state.agent}|{state.session}|{rounds}",
+            # **agent 放在目录前面**。对"跑完了"这件事，先问的是"谁跑的"——
+            # 尤其是多个 Agent 同时在看时。
+            headline=f"{state.agent} · {self._who(state)} 这一轮跑完了",
+            detail=detail,
+            spoken=_spoken_line(state.agent, actions, ranked),
+        )
+        # 开不开由 extra_notify_roles 决定（2026-11-26 起产品默认开）：
+        # 契约默认仍是关，见 progress.NOTIFY_DEFAULTS 与 test_progress.py。
+        return [notice] if notice is not None else []
 
     def _on_action(self, state: SessionState, signal: Signal) -> list[Notice]:
         state.actions += 1
@@ -473,7 +547,6 @@ class ProgressTracker:
         return notices
 
     def _on_boundary(self, state: SessionState, signal: Signal) -> list[Notice]:
-        state.rounds += 1
         cfg = self._config
         # 间隔不够就不说。防"滴答感"：低于 boundary_round_seconds
         # 的"跑完了"是噪音，不是进度。
@@ -484,13 +557,26 @@ class ProgressTracker:
 
         # 这一轮结束了：还没闭环的动作是孤儿，别让它们在超时后
         # 变成"未回包"假警报——那一轮已经翻篇了。
+        # **这几行与"要不要播"无关**：状态清扫永远做，通知可以不放。
         state.open_actions.clear()
         state.waiting_episode = None
         state.waiting_escalated = False
 
-        if not quiet_enough:
-            state.light = Light.IDLE
+        # 一个工具调用都没有的一轮（纯文字回合）**不算一轮，也不播**。
+        #
+        # 2026-11-27 真机抓到：15:58:28 播了一条
+        # 「claude-code 这一轮跑完了，共 0 步。」——那一轮零个工具调用，
+        # 这句话不传递任何信息，而它每次纯文字回合都会响一次。
+        # 用户对这一条的原话是「别让我麻木」：一个确定性噪音源，
+        # 每响一次就把真正有内容的那几条往下推一分。
+        #
+        # **rounds 也不递增**：否则"第 N 轮"会把空轮也算进去，
+        # 下一个有内容的通知会说"第 5 轮"而用户只见过 3 条。
+        if state.actions <= 0:
+            # 不设 IDLE：这一轮刚结束，下一轮可能下一秒就开始。
             return []
+
+        state.rounds += 1
 
         # 这一轮用了什么。**只报类别**（见 SessionState.round_kinds 的说明）：
         # 「bash 7 次、edit 4 次」是有信息量的概括，也是 Yui 开口时
@@ -513,20 +599,26 @@ class ProgressTracker:
         spoken = _spoken_line(state.agent, state.actions, ranked)
         state.round_kinds = {}
 
-        notice = self._emit(
-            state, signal.at,
-            role=Role.BOUNDARY, light=Light.IDLE,
-            fingerprint=f"round|{state.agent}|{state.session}|{state.rounds}",
-            # **agent 放在目录前面**。``_who`` 优先给 workspace（"用户认识目录"），
-            # 但对"跑完了"这件事，先问的是"谁跑的"——尤其是多个 Agent 同时在看时。
-            headline=f"{state.agent} · {self._who(state)} 这一轮跑完了",
-            detail=detail,
-            spoken=spoken,
-        )
-        state.light = Light.IDLE
-        # 开不开由 extra_notify_roles 决定（2026-11-26 起产品默认开）：
-        # 契约默认仍是关，见 progress.NOTIFY_DEFAULTS 与 test_progress.py。
-        return [notice] if notice is not None else []
+        # **只记账，不设灯、不发通知**——那一轮结束了不等于任务结束了。
+        #
+        # 2026-11-27 真机：每一轮结束都发一条「这一轮跑完了」并把灯设成 IDLE，
+        # 结果用户还在跑的时候 Yui 说「已经跑完闲着啦」。用户原话：
+        # 「不可能跑完一条你就死了，需要整体跑完才算结束」。
+        #
+        # Claude Code 不发射「任务结束」这种事件，唯一能用的判据是
+        # **会话安静下来了**。而 boundary_round_seconds 的配置语义本来就是
+        # 「两轮之间安静这么久算上一轮结束了」（见 config.example.toml）
+        # ——门槛是现成的，不用另立一个。
+        #
+        # 通知由 _tick_one 的安静过渡发，见那儿。
+        # ``ranked`` 是 ``sorted()`` 出来的新 list，清 round_kinds 不影响它，
+        # 所以直接存快照（**存 list 不存 dict**——``_spoken_line`` 要
+        # ``ranked[0][0]`` 这种下标访问，dict 会炸 unhashable slice）。
+        state.last_round = (state.rounds, state.actions, tuple(ranked),
+                            signal.at)
+        state.round_kinds = {}
+        # 灯不设 IDLE：真正闲着是由 _tick_one 按时间判的。
+        return []
 
     def _on_waiting(self, state: SessionState, signal: Signal) -> list[Notice]:
         # 每个"等你" episode 只报一次。已经在等就不是新 episode。

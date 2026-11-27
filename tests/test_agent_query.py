@@ -71,9 +71,10 @@ def test_the_tool_registers_with_the_right_shape() -> None:
     # 名字要能直接拼进 callback URL 路径段
     import re
     assert re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", meta.name)
-    # 描述里必须把边界说死
-    assert "不是喵能力" in TOOL_DESCRIPTION
+    # 描述里必须把边界说死：不抢 query_tasks 的活，也别说自己全能
     assert "闲聊不调" in TOOL_DESCRIPTION
+    assert "只看得到 Claude Code" in TOOL_DESCRIPTION
+    assert "query_tasks" in TOOL_DESCRIPTION
     # 只收一句话，不收 id——主对话会话几轮就换一次，给它 id 它记不住
     assert set(TOOL_PARAMETERS["properties"]) == {"question"}
     assert TOOL_PARAMETERS["properties"]["question"]["type"] == "string"
@@ -147,10 +148,23 @@ def test_nothing_at_all_says_so_plainly() -> None:
     assert "没有在跑" in text
 
 
-def test_empty_answer_is_a_single_plain_sentence() -> None:
+def test_empty_answer_says_what_it_cannot_see() -> None:
+    """空答案必须自带范围。
+
+    2026-11-27 真机：用户问「有没有在等我」，工具答"没有"，
+    而当时屏幕上排着 6 个**喵能力**的审批卡——那些走 NekoPower 委托系统，
+    我们的网关看不见。答案是"限定范围内正确、作为一般回答是误导的"。
+
+    所以空答案得说清"我看不见什么"，Yui 才不会过度泛化。
+    """
     answer = empty_answer()
     assert "没有" in answer
-    assert len(answer) < 60, "空答案也要短——它是要被念出来的"
+    assert "看不见" in answer
+    assert "喵能力" in answer
+
+
+def test_empty_answer_stays_short() -> None:
+    assert len(empty_answer()) < 80, "空答案也要短——它是要被念出来的"
 
 
 def test_only_settled_approvals_counts_as_nothing() -> None:
@@ -177,6 +191,7 @@ def test_sessions_carry_a_short_id_so_two_are_tellable_apart() -> None:
 
 def test_sessions_report_categories_only() -> None:
     text = _run(sessions=[_session(kinds={"Bash": 7, "Edit": 4})])
+    assert "我这边看得见的 Claude Code" in text
     assert "Bash 7 次" in text
     assert "Edit 4 次" in text
     # 不该出现命令原文
@@ -218,7 +233,8 @@ def test_an_idle_but_recent_session_is_still_listed() -> None:
 def test_pending_approvals_are_listed_with_how_long() -> None:
     text = _run(sessions=[_session()],
                 approvals=[_approval(summary="Bash: rm -rf build/", age=180)])
-    assert "1 个审批在等你" in text
+    # 带范围限定：用户问"有没有在等我"时，答案要说清是哪边的审批
+    assert "1 个 Claude Code 的审批在等你" in text
     assert "3 分钟" in text
 
 

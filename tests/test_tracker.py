@@ -61,6 +61,16 @@ def _confirm(tracker: ProgressTracker, at: float = T0) -> list:
     return tracker.tick(at + 121)
 
 
+def _settle(tracker: ProgressTracker, at: float = T0) -> list:
+    """把时钟推过「安静多久算上一轮结束」，取那时才发的跑完通知。
+
+    2026-11-27 起，「这一轮跑完了」不再由 turn_end 触发，而是等会话真安静
+    下来才发——原先每一轮结束都发，用户还在跑的时候 Yui 却说「已经跑完
+    闲着啦」。用户原话：「不可能跑完一条你就死了，需要整体跑完才算结束」。
+    """
+    return tracker.tick(at + 601)
+
+
 # ── 1. 默认静默 ──────────────────────────────────────────────────────────
 
 def test_a_fresh_tracker_stays_silent_on_healthy_events() -> None:
@@ -738,6 +748,9 @@ def test_boundary_returns_to_idle() -> None:
     tracker = ProgressTracker()
     tracker.feed(_action(at=T0))
     tracker.feed(_boundary(at=T0 + 10))
+    # 刚结束一轮**不按灯**——下一轮可能下一秒就开始（2026-11-27 误报的修法）
+    assert tracker.counts()["running"] == 1
+    _settle(tracker, T0 + 10)
     assert tracker.counts()["idle"] == 1
 
 
@@ -872,7 +885,9 @@ def test_boundary_stays_quiet_under_the_bare_contract() -> None:
 
 def test_boundary_speaks_when_the_product_opts_in() -> None:
     tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
-    out = tracker.feed(_boundary(at=T0 + 3600))
+    tracker.feed(_action(at=T0))
+    tracker.feed(_boundary(at=T0 + 3600))
+    out = _settle(tracker, T0 + 3600)
     assert [n.role for n in out] == ["boundary"]
     assert "这一轮跑完了" in out[0].headline
 
@@ -883,7 +898,8 @@ def test_the_round_tally_lands_in_the_detail() -> None:
     tracker.feed(_action(kind="Bash"))
     tracker.feed(_action(kind="Bash"))
     tracker.feed(_action(kind="Edit"))
-    out = tracker.feed(_boundary(at=T0 + 3600))
+    tracker.feed(_boundary(at=T0 + 3600))
+    out = _settle(tracker, T0 + 3600)
     assert "Bash 2 次" in out[0].detail
     assert "Edit 1 次" in out[0].detail
     assert "共 3 步" in out[0].detail
@@ -895,7 +911,8 @@ def test_the_tally_is_ordered_by_count_not_by_name() -> None:
     for _ in range(3):
         tracker.feed(_action(kind="Edit"))
     tracker.feed(_action(kind="Bash"))
-    out = tracker.feed(_boundary(at=T0 + 3600))
+    tracker.feed(_boundary(at=T0 + 3600))
+    out = _settle(tracker, T0 + 3600)
     assert out[0].detail.index("Edit") < out[0].detail.index("Bash")
 
 
@@ -903,17 +920,20 @@ def test_the_tally_resets_each_round() -> None:
     """不清零的话，第二轮会把第一轮的账一起算上。"""
     tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
     tracker.feed(_action(kind="Bash"))
-    first = tracker.feed(_boundary(at=T0 + 3600))
+    tracker.feed(_boundary(at=T0 + 3600))
+    first = _settle(tracker, T0 + 3600)
     assert "Bash 1 次" in first[0].detail
-    second = tracker.feed(_boundary(at=T0 + 7200))
-    assert "Bash" not in second[0].detail
+    # 第二轮没有新动作 → 一条都不该有（0 步的回合不播）
+    tracker.feed(_boundary(at=T0 + 7200))
+    assert _settle(tracker, T0 + 7200) == []
 
 
 def test_an_empty_kind_is_not_tallied() -> None:
     """空 kind 表示"说不清是什么工具"，记了只会多一个没有名字的项。"""
     tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
     tracker.feed(_action(kind=""))
-    out = tracker.feed(_boundary(at=T0 + 3600))
+    tracker.feed(_boundary(at=T0 + 3600))
+    out = _settle(tracker, T0 + 3600)
     assert "次" not in out[0].detail
     assert "共 1 步" in out[0].detail
 
@@ -926,7 +946,8 @@ def test_the_tally_never_carries_command_text() -> None:
     """
     tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
     tracker.feed(_action(kind="Bash"))
-    out = tracker.feed(_boundary(at=T0 + 3600))
+    tracker.feed(_boundary(at=T0 + 3600))
+    out = _settle(tracker, T0 + 3600)
     text = out[0].detail
     for banned in ("rm", "-rf", "/", "\\", ".."):
         assert banned not in text, banned
@@ -965,7 +986,8 @@ def test_the_boundary_notice_carries_a_spoken_line() -> None:
     """notice 上要带口语句，否则调用方只能退回 headline（那带路径）。"""
     tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
     tracker.feed(_action(kind="Bash"))
-    out = tracker.feed(_boundary(at=T0 + 3600))
+    tracker.feed(_boundary(at=T0 + 3600))
+    out = _settle(tracker, T0 + 3600)
     assert out[0].spoken
     assert "\\" not in out[0].spoken
     assert "Bash" in out[0].spoken
@@ -975,8 +997,82 @@ def test_the_detail_still_has_everything_the_voice_left_out() -> None:
     """语音省掉的，留底一条不少——路径、会话 id、分类计数都在 detail 里。"""
     tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
     tracker.feed(_action(kind="Bash"))
-    out = tracker.feed(_boundary(at=T0 + 3600))
+    tracker.feed(_boundary(at=T0 + 3600))
+    out = _settle(tracker, T0 + 3600)
     assert "Bash 1 次" in out[0].detail
     assert "会话 " in out[0].detail
     assert WD in out[0].headline                 # 目录仍在 headline（给人看）
     assert WD not in out[0].spoken               # 但不在语音里
+
+
+# ── 2026-11-27：「跑完了」改由安静触发，不再由每一轮结束触发 ──────────
+#
+# 真机原文：用户还在跑，Yui 却说「已经跑完闲着啦」。
+# 用户原话：「不可能跑完一条你就死了，需要整体跑完才算结束」。
+# 根因是每一轮 turn_end 都把灯按成 IDLE，而 turn_end 是每轮都发的。
+
+def test_a_turn_ending_does_not_make_the_session_idle() -> None:
+    """一轮结束**不按灯**——下一轮可能下一秒就开始。"""
+    tracker = ProgressTracker()
+    tracker.feed(_action(at=T0))
+    tracker.feed(_boundary(at=T0 + 10))
+    assert tracker.counts()["idle"] == 0, "一轮刚结束就被当成闲着了"
+    assert tracker.counts()["running"] == 1
+
+
+def test_the_finished_notice_waits_for_the_session_to_go_quiet() -> None:
+    """通知等真安静下来才发，门槛就是 boundary_round_seconds。"""
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    tracker.feed(_action(at=T0))
+    tracker.feed(_boundary(at=T0 + 10))
+    assert tracker.tick(T0 + 500) == [], "还没安静够就报完了"
+    out = tracker.tick(T0 + 700)
+    assert [n.role for n in out] == ["boundary"]
+
+
+def test_a_new_action_after_a_boundary_holds_the_notice_back() -> None:
+    """边界之后又来新动作 → 那条"跑完了"要一直等着。
+
+    这条是那个漏洞的回归：第一版按**边界的时刻**判安静，
+    于是第二轮跑到一半时第一轮的"跑完了"才来。
+    按 ``last_event_at`` 判才等价于"整整 600 秒一个事件都没有"。
+    """
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    tracker.feed(_action(at=T0))
+    tracker.feed(_boundary(at=T0 + 10))
+    # 第二轮开始了。**两个动作都要闭环**，否则未回包检查会插一条
+    # OUTCOME 通知进来，把这条测试要断言的边界通知挤掉。
+    tracker.feed(_action(action_id="tu_2", at=T0 + 400))
+    tracker.feed(_ok(action_id="tu_2", at=T0 + 450))
+    tracker.feed(_action(action_id="tu_3", at=T0 + 500))
+    tracker.feed(_ok(action_id="tu_3", at=T0 + 550))
+    # 距第一轮边界已经 690 秒，但距最后一个事件只有 150 秒
+    assert tracker.tick(T0 + 700) == [], "第二轮还在跑就报第一轮跑完了"
+    out = tracker.tick(T0 + 1200)
+    assert [n.role for n in out] == ["boundary"]
+
+
+def test_the_finished_notice_fires_once_then_the_light_is_idle() -> None:
+    """报过一次就按灯，之后不会再报同一条。"""
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    tracker.feed(_action(at=T0))
+    tracker.feed(_boundary(at=T0 + 10))
+    assert len(tracker.tick(T0 + 700)) == 1
+    assert tracker.counts()["idle"] == 1
+    assert tracker.tick(T0 + 2000) == [], "报过了还在报"
+
+
+def test_a_new_round_after_settling_reports_again() -> None:
+    """真跑完一轮之后又开新一轮：那条路还是通的。"""
+    tracker = _tracker(extra_notify_roles=frozenset({"boundary"}))
+    tracker.feed(_action(at=T0))
+    tracker.feed(_boundary(at=T0 + 10))
+    assert len(tracker.tick(T0 + 700)) == 1
+
+    tracker.feed(_action(at=T0 + 800))
+    tracker.feed(_action(at=T0 + 900))
+    tracker.feed(_boundary(at=T0 + 1000))
+    assert tracker.tick(T0 + 1500) == []
+    out = tracker.tick(T0 + 1700)
+    assert [n.role for n in out] == ["boundary"]
+    assert "第 2 轮" in out[0].detail

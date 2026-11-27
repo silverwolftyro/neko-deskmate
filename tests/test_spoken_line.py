@@ -129,10 +129,12 @@ def test_the_agent_name_is_separated_by_a_space() -> None:
 # ── 3. 三个角色各自真的产出了念白 ───────────────────────────────────────
 
 def test_boundary_speaks_the_round_summary() -> None:
-    _, notices = _run(
+    # at 要传边界那一刻：安静窗口从那儿起算。
+    _, notices = _settled(
         _action(action_id="tu_1", kind="Bash"),
         _ok(at=T0 + 1, action_id="tu_1"),
         _boundary(at=T0 + 2),
+        at=T0 + 2,
     )
     boundary = [n for n in notices if n.role == Role.BOUNDARY]
     assert len(boundary) == 1
@@ -254,6 +256,17 @@ def _tick(tracker: ProgressTracker, at: float) -> list[Notice]:
 def _run(*signals) -> tuple[ProgressTracker, list[Notice]]:
     tracker = _speaking()
     return tracker, _feed(tracker, *signals)
+
+
+def _settled(*signals, at: float = T0) -> tuple[ProgressTracker, list[Notice]]:
+    """喂完之后把时钟推过安静窗口，取那时才发的「跑完了」通知。
+
+    2026-11-27 起那条通知不再由 turn_end 触发——用户原话：
+    「不可能跑完一条你就死了，需要整体跑完才算结束」。
+    """
+    tracker = _speaking()
+    out = _feed(tracker, *signals)
+    return tracker, out + tracker.tick(at + 601)
 
 
 def _drive_every_role() -> list[Notice]:

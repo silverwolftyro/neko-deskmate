@@ -464,7 +464,7 @@ def test_a_round_that_ends_clears_the_orphans() -> None:
     对照 ``test_an_action_that_never_comes_back_is_reported``：同一个动作，
     没有那条 turn_end 就会响，有了它就不响。两条放在一起才证明"清空"真发生了。
     """
-    at = _now() - 10
+    at = _now() - 1400
     host = _Host([_action_step(at, action_id="tu_1"), _boundary(at + 700)])
     host.poll()
     assert host._tracker.state_of(AGENT, "sess-1").open_actions == {}  # noqa: SLF001
@@ -476,7 +476,7 @@ def test_a_round_that_ends_announces_itself() -> None:
     契约默认是关（progress.NOTIFY_DEFAULTS），产品默认由
     ``boundary_notify`` 传 ``extra_notify_roles`` 进来。
     """
-    at = _now() - 10
+    at = _now() - 1400
     host = _Host([_action_step(at, action_id="tu_1", kind="Bash"),
                   _boundary(at + 700)])
     host.poll()
@@ -1085,7 +1085,7 @@ def test_a_finished_round_speaks_when_a_key_is_set() -> None:
     给 ``broadcast_notice`` 直接传 respond 是错的形状——原文会推上 chat，
     "她说的"和"原文"各出现一次（0.6.13 真机：没有结束播报，一半因为这个）。
     """
-    at = _now() - 10
+    at = _now() - 1400
     host = _Host([_action_step(at, action_id="tu_1", kind="Bash"),
                   _boundary(at + 700)], model={"api_key": "k"})
     host.poll()
@@ -1107,7 +1107,7 @@ def test_a_finished_round_is_text_only_without_a_key() -> None:
 
     这正是用户要的"没填 key 就提供最简单的信息"——谁的哪个会话跑完了。
     """
-    at = _now() - 10
+    at = _now() - 1400
     host = _Host([_action_step(at, action_id="tu_1", kind="Bash"),
                   _boundary(at + 700)])
     host.poll()
@@ -1120,7 +1120,7 @@ def test_a_finished_round_speaks_even_with_broadcast_speak_off() -> None:
 
     拿它卡的结果是"功能装了却不响"：用户明明要求跑完要提醒。
     """
-    at = _now() - 10
+    at = _now() - 1400
     host = _Host([_action_step(at, action_id="tu_1", kind="Bash"),
                   _boundary(at + 700)], model={"api_key": "k"})
     assert host._broadcaster.speak is False          # noqa: SLF001 总开关确实关着
@@ -1128,26 +1128,27 @@ def test_a_finished_round_speaks_even_with_broadcast_speak_off() -> None:
     assert host.pushed[0]["ai_behavior"] == "respond"
 
 
-def test_a_finished_round_still_respects_the_cooldown() -> None:
-    """冷却照旧：两条连着来，第二条降级成 blind，不连发 respond。
+def test_a_duplicate_turn_end_produces_nothing() -> None:
+    """已经报过"跑完了"，再喂一条 turn_end（中间没有新动作）不该再报。
 
-    宿主前端连发 respond 会坏（见 test_broadcast.py 那两条），
-    ``force`` 只绕过 speak 开关，不绕过这一条。
+    2026-11-27 改了触发条件之后这条才成立：通知由「会话安静下来」发，
+    发完灯就按灭，而 ``_settle_finished_round`` 只在灯还亮着时过渡。
+    同一个回合重复的 turn_end 不是新的一轮。
+
+    冷却本身还在（``broadcast.resolve_ai_behavior`` 的 30 秒窗），
+    由 test_broadcast.py::test_force_skips_the_speak_switch_but_not_the_cooldown
+    直接覆盖——那条不依赖这条路径。
     """
-    at = _now() - 10
+    at = _now() - 1400
     host = _Host([_action_step(at, action_id="tu_1", kind="Bash"),
                   _boundary(at + 700)], model={"api_key": "k"})
     host.poll()
-    # 同一轮再喂一条 turn_end：冷却窗内，应该降级
+    first = list(host.pushed)
+    assert len(first) == 2, first          # respond 指示 + blind 留底
+
     host._transcript_adapter._events.append(_boundary(at + 1400))  # noqa: SLF001
     host.poll()
-    behaviors = [p["ai_behavior"] for p in host.pushed]
-    # 第一条跑完：speak() 的一对——respond 指示（不上屏）+ blind 留底
-    assert behaviors[:2] == ["respond", "blind"]
-    # 第二条跑完：冷却窗内，降级成 broadcast_notice 的 blind，只一条
-    assert behaviors[2:] == ["blind"]
-    # 关键：respond 只有一次，没有连发
-    assert behaviors.count("respond") == 1
+    assert host.pushed == first, "重复的 turn_end 又报了一次"
 
 
 def test_a_confirmed_failure_speaks_too() -> None:
@@ -1297,7 +1298,7 @@ def test_the_spoken_line_and_the_record_are_different_texts() -> None:
     用户原话：「他把这句话读出来了，他真就读出来了」
     「特别是直接读路径，那个更不应该」。
     """
-    at = _now() - 10
+    at = _now() - 1400
     host = _Host([_action_step(at, action_id="tu_1", kind="Bash",
                                working_directory=r"D:proj"),
                   _boundary(at + 700)], model={"api_key": "k"})

@@ -54,10 +54,11 @@ TOOL_NAME = "ask_coding_agents"
 #: 给模型看的描述。**窄是故意的**：``query_tasks`` 已经在答"在办什么"，
 #: 两条工具挨得太近就会互相误调。所以这里把边界说到不留缝。
 TOOL_DESCRIPTION = (
-    "查问用户自己电脑上开着的编码 Agent（Claude Code 等）在跑什么、"
-    "跑完了没有、有没有在等人、刚才出了什么事。"
-    "只用于用户问自己机器上的外部编码 Agent 的项目与进展；"
-    "不是喵能力/使魔的任务系统，闲聊不调。"
+    "查问用户自己电脑上开着的 Claude Code 在跑什么、跑完了没有、"
+    "有没有在等人、刚才出了什么事。"
+    "**目前只看得到 Claude Code**——喵能力/使魔那些任务它看不见，"
+    "那些要用 query_tasks 问。"
+    "只用于用户问自己机器上的 Claude Code 项目与进展；闲聊不调。"
 )
 
 TOOL_PARAMETERS = {
@@ -148,7 +149,7 @@ def summarize(*, sessions: list, approvals: list, notices: list,
     active.sort(key=lambda s: -float(getattr(s, "last_event_at", 0) or 0))
 
     if active:
-        lines.append(f"有 {len(active)} 个编码 Agent 会话有活动：")
+        lines.append(f"我这边看得见的 Claude Code 会话，有 {len(active)} 个有活动：")
         for state in active[:5]:
             agent = str(getattr(state, "agent", "") or "未知")
             light = _light_of(state)
@@ -170,12 +171,12 @@ def summarize(*, sessions: list, approvals: list, notices: list,
                 bit += f"，这一轮 {tally}"
             lines.append(bit)
     else:
-        lines.append("本机现在没有在跑的编码 Agent 会话。")
+        lines.append("我这边没有在跑的 Claude Code 会话。")
 
     # ── 在等人的 ──
     if pending:
         lines.append("")
-        lines.append(f"有 {len(pending)} 个审批在等你：")
+        lines.append(f"有 {len(pending)} 个 Claude Code 的审批在等你：")
         for row in pending[:5]:
             text = _scrub(str(row.get("tool_summary") or ""), home)
             age = now - float(row.get("created_at") or now)
@@ -206,4 +207,5 @@ def empty_answer() -> str:
     **必须明确说"没有"**：让 Yui 能直接答"没有"，而不是拿着一份空摘要编。
     这是用户点名的验收项之一——误报和漏报在这个工具上一样贵。
     """
-    return "本机现在没有在跑的编码 Agent 会话，也没有在等的审批。"
+    return ("我这边没有在跑的 Claude Code 会话，也没有在等的审批。"
+            "喵能力/使魔那边的任务我看不见，要那些得另问。")
