@@ -75,9 +75,14 @@ def test_the_tool_registers_with_the_right_shape() -> None:
     assert "闲聊不调" in TOOL_DESCRIPTION
     assert "只看得到 Claude Code" in TOOL_DESCRIPTION
     assert "query_tasks" in TOOL_DESCRIPTION
-    # **还得拦住 dispatch_task**。2026-11-27 真机：问「在干嘛」她派了任务，
-    # 因为宿主 DISPATCH_TOOL_DESCRIPTION 原话是「查资料、看状态也算」。
-    assert "不要为此派任务" in TOOL_DESCRIPTION
+    # **还得拦住 dispatch_task，并且点名数据源**。
+    # 2026-11-27 真机三轮：问「刚才」用这个工具；问「在干嘛」派任务
+    # （0.6.29 加了「不要为此派任务」，没用）；再问「刚才都在干什么」
+    # 又派任务，而派的活是读 ~/.claude/projects——**正是这个工具的数据源**。
+    # 所以她不是更信任 dispatch_task，是不知道这工具背后已经读了什么。
+    # 描述必须把数据源点名，她才知道那够不够。
+    assert "不要派任务" in TOOL_DESCRIPTION
+    assert ".claude" in TOOL_DESCRIPTION, "没点名数据源"
     # 只收一句话，不收 id——主对话会话几轮就换一次，给它 id 它记不住
     assert set(TOOL_PARAMETERS["properties"]) == {"question"}
     assert TOOL_PARAMETERS["properties"]["question"]["type"] == "string"
