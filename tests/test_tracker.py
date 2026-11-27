@@ -936,7 +936,7 @@ def test_the_tally_never_carries_command_text() -> None:
 #
 # 2026-11-26 真机：Yui 把整条通知原文念了出来——
 # 「claude-code · D:\workspace\…\agent_deskmate 这一轮跑完了
-#  第 1 轮，共 2 步（Bash 2 次） · 会话 7a75d333」。
+#  第 1 轮，共 2 步（Bash 2 次） · 会话 xxxxxxxx」。
 # 用户原话：「他把这句话读出来了，他真就读出来了」
 # 「特别是直接读路径，那个更不应该」。
 #

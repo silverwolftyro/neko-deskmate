@@ -66,28 +66,37 @@ def _iso(at: float) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
 
 
-def _step(at: float, *, event: str, ok: bool | None, session: str = "sess-1",
-          action_id: str = "tu_1", kind: str = "Bash",
+def _step(at: float, *, event: str, is_error: bool | None,
+          session: str = "sess-1", action_id: str = "tu_1", kind: str = "Bash",
           working_directory: str | None = None) -> UnifiedEvent:
-    """一步的统一事件。``ok=None`` 表示推不出成败（会被契约层丢掉）。"""
+    """一步的统一事件。``is_error=None`` 表示推不出成败（会被契约层丢掉）。
+
+    参数名就叫 ``is_error``，**不叫 ``ok``**：2026-11-27 发现这里原来叫
+    ``ok`` 而值直接填进 ``UnifiedEvent.is_error``，于是
+    ``_failed_step`` 写 ``ok=True``、``_ok_step`` 写 ``ok=False``——
+    两个 helper 产出的事件其实是对的，但每个读它的人都要在脑子里转一次
+    否定。安全测试里多一层否定，就是多一个看错的机会。
+    """
     return UnifiedEvent(
         agent=AGENT, session=session, event=event, tool=kind,
-        summary="工具执行失败" if ok else "工具执行完成",
-        ts=_iso(at), tool_use_id=action_id, is_error=ok, command=f"{kind} x",
+        summary="工具执行失败" if is_error else "工具执行完成",
+        ts=_iso(at), tool_use_id=action_id, is_error=is_error, command=f"{kind} x",
         working_directory=working_directory,
     )
 
 
 def _failed_step(at: float, **kwargs) -> UnifiedEvent:
-    return _step(at, event=EVENT_TOOL_RESULT, ok=True, **kwargs)
+    """一次失败：``is_error=True``。"""
+    return _step(at, event=EVENT_TOOL_RESULT, is_error=True, **kwargs)
 
 
 def _ok_step(at: float, **kwargs) -> UnifiedEvent:
-    return _step(at, event=EVENT_TOOL_RESULT, ok=False, **kwargs)
+    """一次成功：``is_error=False``。"""
+    return _step(at, event=EVENT_TOOL_RESULT, is_error=False, **kwargs)
 
 
 def _action_step(at: float, **kwargs) -> UnifiedEvent:
-    return _step(at, event=EVENT_TOOL_USE, ok=None, **kwargs)
+    return _step(at, event=EVENT_TOOL_USE, is_error=None, **kwargs)
 
 
 class _ListLogger:
@@ -427,7 +436,7 @@ def test_zeroing_the_confirmation_window_announces_at_once() -> None:
 def test_an_event_the_contract_layer_drops_finds_no_tracker_state() -> None:
     """推不出成败的 outcome（is_error=None）必须被契约层丢掉——
     猜 True 压掉真失败，猜 False 造假警报，两条都不如丢。"""
-    host = _Host([_step(_now() - 300, event=EVENT_TOOL_RESULT, ok=None)])
+    host = _Host([_step(_now() - 300, event=EVENT_TOOL_RESULT, is_error=None)])
     host.poll()
     assert host.pushed == []
     # counts() 恒返回四盏灯，全 0 才算"这个会话根本没进状态机"
@@ -1138,18 +1147,60 @@ def test_a_finished_round_still_respects_the_cooldown() -> None:
     assert behaviors.count("respond") == 1
 
 
-def test_other_notices_do_not_get_the_forced_voice() -> None:
-    """只有「跑完」被 force。失败类通知照旧看 broadcast_speak。
+def test_a_confirmed_failure_speaks_too() -> None:
+    """出事也要念——2026-11-27 起语音线覆盖三类，不只「跑完」。
 
-    否则一个总开关关不掉的东西，会被另一个功能悄悄打开。
+    问卷两条核心痛点是「出错发现晚」和「不知道进度」。跑完那条 0.6.14
+    就做了，出事这条一直只出文字——痛点只兑现了一半，这里补上。
+
+    **时间必须是 -300 不是 -10**：失败要过确认窗口（默认 120 秒）才播，
+    而 ``poll(times=N)`` 只是连着跑 N 轮、**不推进时钟**。时间不够的话
+    这条断言会在一个空集合上通过——0.6.20 及之前那条
+    ``test_other_notices_do_not_get_the_forced_voice`` 正是这么空的，
+    它声称"失败类不 force"，其实一条失败通知都没采到。
     """
-    at = _now() - 10
-    host = _Host([_failed_step(at), _boundary(at + 700)], model={"api_key": "k"})
-    host.poll(times=3)      # 失败要过确认窗口，多跑几轮
+    at = _now() - 300
+    host = _Host([_failed_step(at)], model={"api_key": "k"})
+    host.poll()
+    assert len(host.pushed) == 2, host.pushed      # speak() 的一对
+    assert host.pushed[0]["ai_behavior"] == "respond"
+    assert "出事" in host.pushed[0]["parts"][0]["text"] \
+        or "出事" in host.pushed[1]["parts"][0]["text"]
+
+
+def test_voice_off_silences_every_spoken_role() -> None:
+    """``[agent_deskmate.progress].voice = false`` 一票让语音全闭嘴。
+
+    这是唯一的总开关。`06-随手笔记/待处理命题.md` §2 明写：
+    「语音最容易造成麻痹——一旦无法静音/无法分级，用户会直接关掉整个功能」。
+    跑完 / 出事 / 在等三条都 bypass 了 ``broadcast_speak``，所以必须另有
+    一个能一并关掉它们的口子，否则"能关"是假的。
+    """
+    at = _now() - 300
+    host = _Host([_failed_step(at), _boundary(at + 700)],
+                 model={"api_key": "k"}, progress={"voice": False})
+    host.poll()
+    assert host.pushed, "关的是语音，不是通知——文字照旧要出"
     for call in host.pushed:
-        if "这一轮跑完了" in call["parts"][0]["text"]:
-            continue
         assert call["ai_behavior"] == "blind", call["parts"][0]["text"][:40]
+
+
+def test_voice_off_still_writes_the_text() -> None:
+    """关语音只关嘴，不关播报——用户要的是"别念"，不是"别告诉我"。"""
+    at = _now() - 300
+    host = _Host([_failed_step(at)], progress={"voice": False})
+    host.poll()
+    assert len(host.pushed) == 1
+    assert "出事" in host.pushed[0]["parts"][0]["text"]
+
+
+def test_voice_defaults_to_on() -> None:
+    """默认开。拿一个默认关的开关卡一个明确要的功能，
+    结果是功能看着装了、其实不响——0.6.14 已经踩过一遍。"""
+    at = _now() - 300
+    host = _Host([_failed_step(at)], model={"api_key": "k"})
+    host.poll()
+    assert host.pushed[0]["ai_behavior"] == "respond"
 
 
 # ── 一条命令多个删除：没有审查时才合成 ─────────────────────────────────
@@ -1239,7 +1290,7 @@ def test_the_spoken_line_and_the_record_are_different_texts() -> None:
 
     0.6.15 及之前，``_speak_notice`` 把 ``notice.lines()`` 同时当台词和留底，
     于是 Yui 把「claude-code · D:\workspace\…gent_deskmate 这一轮跑完了
-    第 1 轮，共 2 步（Bash 2 次） · 会话 7a75d333」整条念了出来。
+    第 1 轮，共 2 步（Bash 2 次） · 会话 xxxxxxxx」整条念了出来。
     用户原话：「他把这句话读出来了，他真就读出来了」
     「特别是直接读路径，那个更不应该」。
     """

@@ -4,7 +4,7 @@ r"""临时目录降档 + `%VAR%` 逃逸封堵（2026-11-26 第七条误报）。
 
 **第七条误报**：删临时文件被顶【严重】。
 
-    【严重】删除文件：rm -f "C:/Users/alpha/AppData/Local/Temp/a.tmp"
+    【严重】删除文件：rm -f "C:/Users/someuser/AppData/Local/Temp/a.tmp"
 
 档位判定本身没错——`AppData\Local\Temp` 确实在工作区外。但 **extreme 的
 存在理由是"破坏面没有边界"**（家目录 / 盘根 / 系统目录），临时目录的破坏面
@@ -76,8 +76,16 @@ def _severity(command: str) -> str:
     "%TEMP%",
     "%TEMP%" + BS + "x",
     "%TMP%",
-    "C:/Users/alpha/AppData/Local/Temp/a.tmp",
-    "C:" + BS + "Users" + BS + "alpha" + BS + "AppData" + BS + "Local" + BS + "Temp",
+    "C:/Users/someuser/AppData/Local/Temp/a.tmp",
+    # 同一路径的反斜杠形状。**两边必须用同一个占位用户名**：
+    # 这条用例断言"两种分隔符判出同一档"，名字不一致就变成在测两件事。
+    #
+    # 占位为什么叫 ``someuser`` 而不是 ``<user>``：**``<`` 和 ``>`` 是 shell
+    # 重定向运算符**。写 ``rm -rf C:/Users/<user>/…``，分词器会把
+    # ``C:/Users/`` 当成删除目标、后面整段当成重定向，于是档位从
+    # recoverable 变 extreme——2026-11-27  scrub 用户名时踩过一次，
+    # 三条用例同时红。**凡是要拼进命令字符串的占位，都不能带 shell 元字符。**
+    "C:" + BS + "Users" + BS + "someuser" + BS + "AppData" + BS + "Local" + BS + "Temp",
     "/tmp/x",
     "/tmp",
     "/var/tmp/y",
@@ -92,7 +100,7 @@ def test_os_temp_directories_are_recoverable(target: str) -> None:
 
 def test_both_slash_styles_agree() -> None:
     """两种斜杠必须是同一个答案——同一条命令两种 verdict 是这个项目的病。"""
-    forward = "C:/Users/alpha/AppData/Local/Temp/x"
+    forward = "C:/Users/someuser/AppData/Local/Temp/x"
     backward = forward.replace("/", BS)
     assert _tier(f"rm -rf {forward}") == _tier(f"rm -rf {backward}")
     assert _tier(f"rm -rf {forward}") == TIER_RECOVERABLE

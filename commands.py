@@ -595,7 +595,7 @@ def _is_system_path(target: str) -> bool:
 #:
 #: 2026-11-26 第七条误报。实测我自己删临时文件被顶【严重】：
 #:
-#:     【严重】删除文件：rm -f "C:/Users/alpha/AppData/Local/Temp/…"
+#:     【严重】删除文件：rm -f "C:/Users/<user>/AppData/Local/Temp/…"
 #:
 #: 档位判定本身没错——`AppData\Local\Temp` 确实在工作区外，于是
 #: `_tier_of_one` 给它 EXTREME。但 **extreme 的存在理由是"破坏面没有边界"**

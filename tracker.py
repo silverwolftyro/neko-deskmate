@@ -108,7 +108,7 @@ class Notice:
     #
     # 2026-11-26 真机：她把 ``headline + detail`` 整条念了出来——
     # 「claude-code · D:\\workspace\\…\\agent_deskmate 这一轮跑完了
-    #  第 1 轮，共 2 步（Bash 2 次） · 会话 7a75d333」。
+    #  第 1 轮，共 2 步（Bash 2 次） · 会话 xxxxxxxx」。
     # 用户原话：「他把这句话读出来了，他真就读出来了」
     # 「特别是直接读路径，那个更不应该」。
     #
@@ -330,6 +330,9 @@ class ProgressTracker:
                              f"|{state.waiting_episode:g}"),
                 headline=f"{self._who(state)} 还在等你",
                 detail=f"已经 {_elapsed(now - state.waiting_episode)}，它完全停着",
+                spoken=self._says(
+                    state,
+                    f"还在等你，已经 {_elapsed(now - state.waiting_episode)}。"),
             )
             if notice is not None:
                 notices.append(notice)
@@ -432,6 +435,8 @@ class ProgressTracker:
                 headline=f"{self._who(state)} 在兜圈子",
                 detail=f"{kind or '同一步'} 连续失败 {streak_n} 次，"
                        "它可能在原地打转",
+                spoken=self._says(
+                    state, f"在兜圈子，同一步连着失败 {streak_n} 次。"),
                 kind=kind,
             )
             if notice is not None:
@@ -460,6 +465,7 @@ class ProgressTracker:
                 window=cfg.fail_coalesce_seconds,
                 headline=f"{self._who(state)} 出事了",
                 detail=f"{kind or '有一步'} 执行失败，它没自己恢复",
+                spoken=self._says(state, "出事了，它没自己恢复。"),
                 kind=kind,
             )
             if notice is not None:
@@ -535,6 +541,9 @@ class ProgressTracker:
             fingerprint=f"wait|{state.agent}|{state.session}",
             headline=f"{self._who(state)} 在等你",
             detail=signal.reason or "它停在那儿，需要你处理才能继续",
+            # 原因**刻意不进语音**：它是自由文本（审批那条路会带 judge_reason），
+            # 长度与内容都不可控，而念出来的东西必须短。要原因去看聊天文字。
+            spoken=self._says(state, "在等你，它停住了。"),
         )
         return [notice] if notice is not None else []
 
@@ -543,6 +552,23 @@ class ProgressTracker:
     def _who(self, state: SessionState) -> str:
         """指名。用户认识目录，不认识 UUID。"""
         return state.workspace or state.agent
+
+    def _says(self, state: SessionState, what: str) -> str:
+        """给 Yui 念的那一句里的**主语**。只要 agent 名，不要路径。
+
+        ``_who`` 优先给 workspace，那是给**眼睛**的——2026-11-26 真机证明
+        路径念出来是灾难（用户原话：「特别是直接读路径，那个更不应该」）。
+        所以语音侧另走一份：只有 agent 名，最多加一句它自己的话。
+
+        ``what`` 是那句自己的话，**调用方负责保证它短、没有路径、没有 UUID**。
+
+        中间那个空格是**刻意的**：agent 名（`claude-code`）和后面的中文之间
+        没有分词，TTS 会把两者粘成一个词——0.6.21 出包前跑了一遍原句预览，
+        打出来是「claude-code出事了」，才补上。``_spoken_line``（跑完那条）
+        一直有这个空格，两边要对上。
+        """
+        who = state.agent or "它"
+        return f"{who} {what}"
 
     def _emit(self, state: SessionState, at: float, *, role: Role,
               light: Light, fingerprint: str, headline: str, detail: str,
@@ -591,7 +617,7 @@ def _spoken_line(agent: str, steps: int, ranked: list[tuple[str, int]]) -> str:
     2026-11-26 真机：她把 ``headline + detail`` 整条念了出来——
 
         「claude-code · D:\\workspace\\…\\agent_deskmate 这一轮跑完了
-          第 1 轮，共 2 步（Bash 2 次） · 会话 7a75d333」
+          第 1 轮，共 2 步（Bash 2 次） · 会话 xxxxxxxx」
 
     用户原话：「他把这句话读出来了，他真就读出来了」
     「但是这么大、这么长一段，而且对于人类来说难以使用和读取的信息，
