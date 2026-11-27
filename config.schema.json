@@ -239,6 +239,20 @@
               },
               "default": true
             },
+            "voice": {
+              "type": "boolean",
+              "title": "Let her say it out loud",
+              "description": "Master switch for Yui's voice. On: a finished round, a failure it did not recover from, and 'it is waiting for you' are spoken aloud (still written to chat either way). Off: everything is text only. Speaking needs an API key; without one it is text only regardless.",
+              "x-title-i18n": {
+                "en": "Let her say it out loud",
+                "zh-CN": "让 Yui 开口说"
+              },
+              "x-description-i18n": {
+                "en": "Master switch for Yui's voice. On: a finished round, a failure it did not recover from, and 'it is waiting for you' are spoken aloud (still written to chat either way). Off: everything is text only. Speaking needs an API key; without one it is text only regardless.",
+                "zh-CN": "Yui 语音的总开关。开着：一轮跑完了、出事没自己好、它停下来等你了——这三类会念出来（念不念都照样写进聊天）。关着：一律只出文字。开口需要 key，没填 key 时无论如何只出文字。"
+              },
+              "default": true
+            },
             "fail_coalesce_seconds": {
               "type": "integer",
               "title": "Same failure not repeated within (seconds)",

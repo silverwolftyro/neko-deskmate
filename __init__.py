@@ -148,7 +148,8 @@ from .model_advice import (
     ModelAdvisor,
 )
 from .panel_state import build_panel_state
-from .progress import ROLE_BOUNDARY, signal_from_event
+from .progress import (ROLE_BOUNDARY, ROLE_OUTCOME, ROLE_WAITING, Light,
+                       signal_from_event)
 from .rules import (
     Coalescer,
     RuleHit,
@@ -454,6 +455,43 @@ def _tracker_config(section: dict[str, Any]) -> TrackerConfig:
             {ROLE_BOUNDARY} if _to_bool(section.get("boundary_notify"), True)
             else ()),
     )
+
+
+def _should_speak(notice: Notice) -> bool:
+    """这条通知值不值得让 Yui 开口念一遍。纯函数，单测直接打表。
+
+    2026-11-27 按 `06-随手笔记/待处理命题.md` §2 那张**已经定稿**的表落地。
+    那张表的原则是「按值不值得打断人分，不按事件多少分」，只给三类：
+
+    - **项目出节点**——这一轮跑完了（boundary）、出事了（outcome 失败）。
+      问卷两条核心痛点「不知道进度」「出错发现晚」的直接兑现。
+    - **要你动手**——它停下来等你了（waiting）。
+
+    ⚠️ **waiting 今天没有任何事件源**：``progress._ROLE_FOR_EVENT`` 只映射
+    tool_use / turn_end / error / tool_result，没有一条进 waiting。所以
+    ``tracker._on_waiting`` 目前只能被测试直接喂 Signal 触发，真机上
+    「在等你」一条都产不出来。它留在 ``SPOKEN_ROLES`` 里是对的——
+    状态机支持这个角色，等哪天接上源（审批挂起时 Claude 正被卡住，
+    那是天经地义的一个源），语音侧不用再改一遍。但**别在文档里把它
+    写成已有功能**。
+
+    ``action`` **刻意不在里面**：每一步工具调用都念一句就是滴答式播报，
+      问卷补充槽原话「被 review / CI 反复唤醒烧钱」。语音比卡片侵入性高
+      一个量级，所以宁可漏一念，不可多一念。
+
+    outcome 额外挡一道灯：今天 outcome 的通知**全是**失败（成功的 outcome
+    不产通知，见 ``tracker._on_outcome``），但不靠这个隐含前提——哪天加了
+    "成功也播一条"，它不该自动开始念。
+    """
+    if notice.role not in SPOKEN_ROLES:
+        return False
+    if notice.role == ROLE_OUTCOME and notice.light is not Light.ERROR:
+        return False
+    return True
+
+
+#: 要让 Yui 念出来的角色。见 ``_should_speak``。
+SPOKEN_ROLES = frozenset({ROLE_BOUNDARY, ROLE_OUTCOME, ROLE_WAITING})
 
 
 # 「调用结果码 → 卡片展示状态」的显式映射。
@@ -1452,8 +1490,13 @@ class AgentDeskmatePlugin(NekoPluginBase):
             return []
 
         mine_roots = _mine_roots(config)
-        # 有没有 key——只用来决定"跑完这条要不要让她开口"（红线 3）。
+        # 有没有 key——只用来决定"要不要让她开口"（红线 3）。
         has_key = _has_model_key(config)
+        # 「让不让 Yui 开口」的总开关（``[agent_deskmate.progress].voice``）。
+        # **默认开**：跑完/出事/在等这三类是用户明确要的功能（见
+        # ``_should_speak``），拿一个默认关的开关去卡它，结果是功能看着
+        # 装了、其实不响。但**必须能一票闭嘴**——语音是整套里最侵入的一种。
+        voice_on = _to_bool(_tracker_section(config).get("voice"), True)
         events: list[UnifiedEvent] = []
         # B4：两个源各自兜住。任何一个失败只降级它自己，
         # 另一个源这一轮读到的事件照常播——网关库锁不该让删除播报消失。
@@ -1543,18 +1586,18 @@ class AgentDeskmatePlugin(NekoPluginBase):
                 jobs.append(partial(broadcaster.broadcast,
                                     _downgrade_unconfirmed_critical(hit)))
         for notice in notices:
-            # 「这一轮跑完了」**要 Yui 说出来**（2026-11-26 用户要求）。
+            # 要不要**让 Yui 开口念**——一处决定，见 ``_should_speak``。
             #
-            # 其余通知跟着 Broadcaster 走，不另读配置——一处决定，避免
-            # "删除类开说、通知类不开"的半成品；也走同一个 30 秒冷却，
-            # 两条连着来第二条自动降级成 blind，不连发 respond。
+            # 这三类（跑完 / 出事 / 在等）**绕过 ``broadcast_speak`` 但保留
+            # 30 秒冷却**：那个开关管的是"让不让猫娘接话"这个总开关（默认关），
+            # 而这三条是用户明确要的功能——拿一个默认关的总开关去卡一个明确
+            # 要的功能，结果是功能看着装了、其实不响（0.6.14 已经踩过一遍）。
             #
-            # 跑完这条**绕过 speak 开关但保留冷却**：``broadcast_speak``
-            # 管的是"让不让猫娘接话"这个总开关（默认关），而用户要的是
-            # "跑完时提醒我"——拿一个默认关的总开关去卡一个明确要的功能，
-            # 结果是功能看起来装了、其实不响。
+            # **能不能关**：``[agent_deskmate.progress].voice``，默认开。
+            # 语音是整套里最侵入的一种，`待处理命题` §2 明写"一旦无法静音，
+            # 用户会直接关掉整个功能"——所以必须留一个能一票闭嘴的开关。
             #
-            # **有没有 key 是唯一门槛**（红线 3）：``respond`` 要主模型接一轮，
+            # **有没有 key 是唯一硬门槛**（红线 3）：``respond`` 要主模型接一轮，
             # 没 key 就降级成 blind 只出文字——那也正是用户要的
             # "没填 key 就提供最简单的信息"。
             #
@@ -1564,10 +1607,10 @@ class AgentDeskmatePlugin(NekoPluginBase):
             # "让她把这段念出来"（respond 指示配 visibility=[]，另发 blind 留底）。
             # 真机上"没有结束播报"有一半是这个形状问题：通知确实发了，
             # 但发成一条主语是文件路径的静默聊天行。
-            behavior = broadcaster.resolve_ai_behavior(
-                force=(notice.role == ROLE_BOUNDARY and has_key))
-            if notice.role == ROLE_BOUNDARY and has_key \
-                    and behavior == "respond":
+            wants_speak = _should_speak(notice)
+            speakable = wants_speak and has_key and voice_on
+            behavior = broadcaster.resolve_ai_behavior(force=speakable)
+            if speakable and behavior == "respond":
                 jobs.append(partial(_speak_notice, self.push_message, notice,
                                     source=SOURCE, logger=self.logger))
             else:

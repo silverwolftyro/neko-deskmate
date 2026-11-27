@@ -161,17 +161,66 @@ def test_dry_run_writes_nothing(tmp_path: Path) -> None:
     assert package.read_bytes() == original
 
 
-def test_backup_is_written_once(tmp_path: Path) -> None:
+def _force_hash_mismatch(monkeypatch) -> None:
+    """让 metadata.toml 里回填的 hash 故意错一位，逼出独立校验失败那条路。"""
+    monkeypatch.setattr(
+        "tools.host_meta_compat._replace_hash_line",
+        lambda text, new: re.sub(
+            r'(hash\s*=\s*")[0-9a-fA-F]{64}(")',
+            r"\g<1>" + "f" * 64 + r"\g<2>",
+            text,
+            count=1,
+        ),
+    )
+
+
+def test_backup_is_removed_after_success(tmp_path: Path) -> None:
+    """成功后备份必须消失。
+
+    2026-11-27 从"留着"改成"成功后删"：备份是 schema 5 的包，装上去卡片
+    按钮全 404，是个地雷；而发布归档的 README 一直要求"归档前把它移走"，
+    于是每次打包都要额外跑一条删除命令。真机上那条命令被同桌猫判成
+    【严重】删除文件（路径在工作目录外），一晚上响了四次。
+    让工具自己收摊，比让使用者记得收摊可靠。
+    """
+    package = _make_package(tmp_path / "pkg.neko-plugin", schema=5)
+    downgrade(package, 4)
+    assert not (tmp_path / "pkg.neko-plugin.pre-schema-downgrade").exists()
+
+
+def test_backup_survives_failed_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """校验不过时备份必须留下——那时它是唯一的回滚材料。"""
     package = _make_package(tmp_path / "pkg.neko-plugin", schema=5)
     original = package.read_bytes()
-    downgrade(package, 4)
     backup = tmp_path / "pkg.neko-plugin.pre-schema-downgrade"
+
+    _force_hash_mismatch(monkeypatch)
+    with pytest.raises(RuntimeError, match="payload hash 不自洽"):
+        downgrade(package, 4)
+
     assert backup.is_file()
     assert backup.read_bytes() == original
 
-    # 第二次（已是 noop）不许覆盖备份。
-    downgrade(package, 3)
-    assert backup.read_bytes() == original
+
+def test_pre_existing_backup_survives_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """已有备份不许被这次运行覆盖——它可能是上一次失败留下的回滚材料。
+
+    成功路径下备份会被删掉，所以"没被覆盖"只能在失败路径上观测：
+    校验不过 + 已有备份 → 内容必须还是原来那份。
+    """
+    package = _make_package(tmp_path / "pkg.neko-plugin", schema=5)
+    backup = tmp_path / "pkg.neko-plugin.pre-schema-downgrade"
+    backup.write_bytes(b"earlier-failed-run")
+
+    _force_hash_mismatch(monkeypatch)
+    with pytest.raises(RuntimeError):
+        downgrade(package, 4)
+
+    assert backup.read_bytes() == b"earlier-failed-run"
 
 
 def test_other_files_are_untouched(tmp_path: Path) -> None:
